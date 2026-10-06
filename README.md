@@ -728,7 +728,10 @@ so deliberate small-buffer policies retain window precision while large-BDP
 connections can use their full automatic maximum. Calling `SetReadBuffer` or
 `SetWriteBuffer` locks that side to the application value and disables its
 automatic growth, matching the user-locked behavior of operating-system TCP
-stacks. Automatic growth follows application-consumed and acknowledged bytes
+stacks. A scaled receive window that was already advertised may temporarily
+admit at most one scale quantum of additional bytes while that promise is
+consumed; this bounded protocol remainder is separate from automatic buffer
+growth. Automatic growth follows application-consumed and acknowledged bytes
 per RTT rather than queue size or cwnd alone, so short-RTT scheduler batches do
 not inflate buffers. `SetCongestionControl`,
 `SetCongestionControlFactory`, `SetMaximumPacingRate`, and `SetTrafficClass`
@@ -981,6 +984,12 @@ accessors, so sampler internals can evolve without changing controller code.
 retransmission callbacks and is required by custom pacers. A controller may
 attach a 64-bit `PacketState` value to each transmission generation; TCP
 returns it unchanged through the selected delivery-rate sample.
+`CongestionRateSample.PacketLossEvidenceValid` reports whether that selected
+generation may be used for loss attribution; a SACK-covered generation keeps
+its `PacketState` but returns false. A true result only excludes that SACK
+ambiguity; it does not imply that `PacketState` is present, that `Valid()` is
+true, that transmission events were enabled, or that retransmission
+attribution is otherwise unambiguous.
 `CongestionControlFeatureLossEvents` additionally retains that value until the
 generation is proven lost and reports per-generation SACK, RACK, RTO, and
 tail-loss-probe recovery events. `CongestionRateSample.TailLossProbeACK`
@@ -1094,8 +1103,12 @@ sequence, recent time period, and negotiated options. A valid final ACK
 reconstructs the conservative MSS and authenticated negotiated options. If the
 SYN lacks Timestamp, the cookie SYN-ACK does not negotiate SACK or window
 scaling. If that ACK lacks Timestamp, the restored connection disables
-Timestamp, SACK, window scaling, and ECN. Forged or expired cookies do not
-allocate a connection.
+Timestamp, SACK, window scaling, and ECN. A Timestamp-bearing ACK with a zero
+TSecr is accepted as a stateless cookie compatibility case; RFC 7323's
+unsigned field alone cannot distinguish a zero-valued echo from a stripped
+echo. Cookie authentication still restores SACK, scaling, and ECN when they
+were negotiated. This is more permissive than Linux's conservative zero-echo
+fallback. Forged or expired cookies do not allocate a connection.
 
 Validated ICMP Packet Too Big errors maintain a bounded, expiring destination
 PMTU cache. Error type/code combinations and quoted TCP sequence spans are

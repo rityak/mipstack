@@ -84,6 +84,7 @@ type CongestionRateSample struct {
 	smoothedRTT         time.Duration
 	ackTime             time.Time
 	ackStamp            tcpDeliveryTimestamp
+	lossEvidenceInvalid bool
 	lastSent            monotonicStamp
 	lastEnd, lastOrder  uint32
 	applicationLimited  bool
@@ -168,6 +169,18 @@ func (s *CongestionRateSample) Valid() bool { return s.valid }
 // not request transmission events or the range predates a controller change.
 func (s *CongestionRateSample) PacketState() uint64 { return s.packetState }
 
+// PacketLossEvidenceValid reports whether the selected transmission's loss
+// snapshot can be used to attribute newly observed loss to that transmission.
+// TCP returns false when delivery selected a generation already covered by
+// SACK; its PacketState remains available for other congestion-control uses.
+// Samples assembled without a SACK marker report true. A true result only
+// excludes this SACK ambiguity; it does not imply that PacketState is present,
+// that Valid reports true, that transmission events were enabled, or that a
+// retransmission has no other attribution ambiguity.
+func (s *CongestionRateSample) PacketLossEvidenceValid() bool {
+	return !s.lossEvidenceInvalid
+}
+
 // tcpDeliveryRateEstimator owns Linux-style connection delivery accounting.
 // Model-based controllers embed it so the TCP actor can build one common rate
 // sample without depending on an algorithm's private path model.
@@ -209,6 +222,7 @@ func (s *tcpDeliveryRateSample) observe(segment sentTCPSegment) {
 	s.schedulerLimited = segment.state.has(sentTCPSegmentDeliverySchedulerLimited)
 	s.retransmitted = segment.isRetransmitted()
 	s.packetState = segment.congestionPacketState
+	s.lossEvidenceInvalid = segment.state.has(sentTCPSegmentSACKed)
 }
 
 // finishRateSample advances delivery accounting and validates the sample using

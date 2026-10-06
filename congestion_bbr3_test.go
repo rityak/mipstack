@@ -262,6 +262,67 @@ func TestBBR3ACKWithoutDeliveryDoesNotInventProbeLoss(t *testing.T) {
 	}
 }
 
+func TestBBR3SACKDeliveryDoesNotUseStaleProbeSnapshot(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	bbr := newBBR3CongestionControl()
+	bbr.mode, bbr.probePhase = bbrProbeBandwidth, bbr3ProbeUp
+	bbr.fullBandwidthReached, bbr.probeSamples = true, true
+	bbr.minimumRTT, bbr.minimumRTTStamp = 10*time.Millisecond, now
+	bbr.bandwidthHigh[1], bbr.probeStarted = 1_000_000, now
+	bbr.inflightHigh = 10_000
+	bbr.lost = 1000
+	sample := tcpDeliveryRateSample{ackTime: now, priorInFlight: 20_000, inFlight: 20_000, smoothedRTT: 10 * time.Millisecond}
+	sample.observe(sentTCPSegment{
+		state:                 sentTCPSegmentTransmitted | sentTCPSegmentSACKed,
+		congestionPacketState: bbr3EncodePacketState(&CongestionState{BytesInFlight: 18_000}, mss),
+		hostQueue:             packetQueueTicket{queuedAt: 1},
+		delivery:              tcpDeliverySnapshot{firstSent: 1, deliveredStamp: 1},
+	})
+	if sample.PacketLossEvidenceValid() {
+		t.Fatal("SACK-selected transmission retained loss evidence")
+	}
+	_, _ = bbr.onRateSample(20_000, mss, &sample)
+	if !bbr.probeSamples || bbr.probePhase != bbr3ProbeUp || bbr.inflightHigh != 19_000 {
+		t.Fatalf("SACK-selected transmission feedback = samples %t phase %s inflight_hi %d, want no loss response and 19000 upper bound", bbr.probeSamples, bbr.probePhase.String(), bbr.inflightHigh)
+	}
+}
+
+func TestTCPSACKPreservesCongestionTransmissionState(t *testing.T) {
+	segment := sentTCPSegment{
+		sequence: 100, end: 200,
+		state:                 sentTCPSegmentInitialState(false, false, false, false),
+		congestionPacketState: 0x1234,
+	}
+	outstanding, _, _, newInformation, _, newlySACKed := applyTCPSACK(
+		[]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}}, time.Time{},
+	)
+	if !newInformation || len(outstanding) != 1 {
+		t.Fatalf("SACK application = information %t ranges %d", newInformation, len(outstanding))
+	}
+	if !outstanding[0].state.has(sentTCPSegmentSACKed) {
+		t.Fatal("SACKed range did not enter the scoreboard")
+	}
+	if outstanding[0].congestionPacketState != 0x1234 {
+		t.Fatalf("SACKed congestion transmission state = %#x, want original", outstanding[0].congestionPacketState)
+	}
+	if len(newlySACKed) != 1 || newlySACKed[0].congestionPacketState != 0x1234 || !newlySACKed[0].state.has(sentTCPSegmentSACKed) {
+		t.Fatalf("SACK delivery sample state = %#v, want original metadata and SACK mark", newlySACKed)
+	}
+
+	// A retransmission is a new generation and may install fresh controller
+	// metadata without being confused with the SACKed transmission.
+	outstanding[0].state.set(sentTCPSegmentSACKed, false)
+	outstanding[0].advanceTransmissionGeneration()
+	if !outstanding[0].state.has(sentTCPSegmentTransmitted) || !outstanding[0].state.has(sentTCPSegmentRetransmitted) || outstanding[0].congestionPacketState != 0x1234 {
+		t.Fatalf("retransmission generation = state %#x metadata %#x", outstanding[0].state, outstanding[0].congestionPacketState)
+	}
+	outstanding[0].congestionPacketState = 0x5678
+	if outstanding[0].congestionPacketState != 0x5678 {
+		t.Fatal("retransmission did not accept fresh controller metadata")
+	}
+}
+
 func TestBBR3LossRoundAdvancesIndependently(t *testing.T) {
 	bbr := newBBR3CongestionControl()
 	bbr.lossRoundDelivered = 100

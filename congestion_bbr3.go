@@ -481,7 +481,7 @@ func (b *bbr3CongestionControl) checkStartupLoss(sample *tcpDeliveryRateSample, 
 	if sample.losses != 0 && b.lossEventsInRound < 15 {
 		b.lossEventsInRound++
 	}
-	if b.lossRoundStart && sample.fastRecovery && b.lossEventsInRound >= bbr3FullLossEvents && b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
+	if sample.PacketLossEvidenceValid() && b.lossRoundStart && sample.fastRecovery && b.lossEventsInRound >= bbr3FullLossEvents && b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
 		b.fullBandwidthReached = true
 		upper := b.quantizeWindowAt(b.modelWindowForBandwidth(b.maximumBandwidth(), 1, mss), mss, false)
 		if uint64(b.latestInflight) > upper {
@@ -629,12 +629,15 @@ func (b *bbr3CongestionControl) adaptUpperBounds(sample *tcpDeliveryRateSample, 
 			return true
 		}
 	}
-	if b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
+	if sample.PacketLossEvidenceValid() && b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
 		if b.probeSamples {
 			b.handleInflightTooHigh(packet.inflight, packet.applicationLimited, window, mss, sample.ackTime)
 		}
 		return false
 	}
+	// A SACK-selected transmission is not valid probe-loss evidence, but its
+	// tx.in_flight remains a safe delivered upper-bound observation. Linux BBRv3
+	// therefore still admits it when growing inflight_hi.
 	if b.inflightHigh != 0 && packet.inflight > b.inflightHigh {
 		b.inflightHigh = packet.inflight
 	}

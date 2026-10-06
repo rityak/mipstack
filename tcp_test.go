@@ -1491,7 +1491,7 @@ func TestTCPWriteToKeepsDirectChunkStableWhileReceiving(t *testing.T) {
 				t.Fatalf("first direct WriteTo chunk = %q", payload)
 			}
 			second := []byte("second")
-			if accepted := connection.appendReadBuffer(second, second, 0); accepted != len(second) {
+			if accepted := connection.appendReadBuffer(second, second, 0, 0); accepted != len(second) {
 				t.Fatalf("concurrent receive accepted %d bytes", accepted)
 			}
 			if string(payload) != "first" {
@@ -1509,7 +1509,7 @@ func TestTCPReadBufferAdoptsOwnedPayload(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := []byte("data")
 	payload = payload[:len(payload):len(payload)]
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("appendReadBuffer accepted %d bytes, want %d", accepted, len(payload))
 	}
 	if &connection.readBuffer.chunks[0][0] != &payload[0] {
@@ -1524,7 +1524,7 @@ func TestTCPReadBufferAdoptsOwnedPayload(t *testing.T) {
 func TestTCPReadCrossesReceiveChunks(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	for _, payload := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
-		if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 			t.Fatalf("accepted %d of %d bytes", accepted, len(payload))
 		}
 	}
@@ -1570,7 +1570,7 @@ func TestTCPReadWithBufferAllocatesOnlyForAvailableData(t *testing.T) {
 		t.Fatal("buffer callback ran before data was available")
 	case <-time.After(20 * time.Millisecond):
 	}
-	if accepted := connection.appendReadBuffer([]byte("hello world"), []byte("hello world"), 0); accepted != len("hello world") {
+	if accepted := connection.appendReadBuffer([]byte("hello world"), []byte("hello world"), 0, 0); accepted != len("hello world") {
 		t.Fatalf("accepted = %d, want %d", accepted, len("hello world"))
 	}
 	var readResult struct {
@@ -1600,7 +1600,7 @@ func TestTCPReadWithBufferAllocatesOnlyForAvailableData(t *testing.T) {
 func TestTCPReadWithBufferEmptyBufferDoesNotConsume(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := []byte("preserved")
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
 	}
 	callbackCalls := 0
@@ -1622,7 +1622,7 @@ func TestTCPReadWithBufferEmptyBufferDoesNotConsume(t *testing.T) {
 func TestTCPReadWithBufferReportsFullQueuedSize(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := bytes.Repeat([]byte{'x'}, 64*1024+1)
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
 	}
 	var sizeHint int
@@ -1638,7 +1638,7 @@ func TestTCPReadWithBufferReportsFullQueuedSize(t *testing.T) {
 func TestTCPReadWithBufferCrossesReceiveChunks(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	for _, payload := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
-		if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 			t.Fatalf("accepted %d of %d bytes", accepted, len(payload))
 		}
 	}
@@ -1686,7 +1686,7 @@ func TestTCPReadWithBufferTerminalStatesDoNotCallCallback(t *testing.T) {
 func TestTCPReadWithBufferExpiredDeadlineDoesNotCallCallback(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := []byte("deadline data")
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
 	}
 	if err := connection.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
@@ -1712,7 +1712,7 @@ func TestTCPReadWithBufferExpiredDeadlineDoesNotCallCallback(t *testing.T) {
 func TestTCPReadWithBufferDataPrecedesEOF(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := []byte("data")
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
 	}
 	connection.mu.Lock()
@@ -1741,7 +1741,7 @@ func TestTCPReadWithBufferDataPrecedesEOF(t *testing.T) {
 func TestTCPReadWithBufferCallbackRunsOutsideConnectionLock(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := []byte("callback")
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
 	}
 	buffer := []byte(nil)
@@ -1763,7 +1763,7 @@ func TestTCPReadWithBufferCallbackRunsOutsideConnectionLock(t *testing.T) {
 func TestTCPReadWithBufferCallbackCanRaceCloseRead(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := []byte("callback close")
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
 	}
 	entered := make(chan struct{})
@@ -3370,7 +3370,7 @@ func TestTCPCloseReadKeepsReceiveWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := []byte("discarded peer data")
-	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0, 0); accepted != len(payload) {
 		t.Fatalf("discarded bytes accepted = %d, want %d", accepted, len(payload))
 	}
 	if window := connection.receiveWindow(0, true); window == 0 {
@@ -3647,6 +3647,108 @@ func TestTCPResetPreservesZeroWindowAdmission(t *testing.T) {
 	}
 	if n, err := connection.Read(got[:]); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
 		t.Fatalf("Read after empty RST at zero window = %d, %v, want ECONNRESET", n, err)
+	}
+}
+
+// TestTCPActiveHandshakeReopensScaledZeroWindow verifies that an active
+// handshake does not leave a sub-quantum receive buffer permanently closed.
+// The final ACK is allowed to round down to zero by RFC 7323; ESTABLISHED must
+// publish the first quantized window so a peer can send without waiting for a
+// persist-probe cycle.
+func TestTCPActiveHandshakeReopensScaledZeroWindow(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.35")
+	remote := netip.MustParseAddr("192.0.2.36")
+	link := &testPacketLink{
+		local: local, remote: remote, echoTCP: true,
+		outbound: make(chan []byte, 32), tcp: make(map[uint16]*testTCPPeer),
+		done: make(chan struct{}),
+	}
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		MTU:            1400,
+		TCP:            TCPSocketDefaults{ReceiveBuffer: 1, MaximumReceiveBuffer: 2 * 1024 * 1024},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		_ = stack.Close()
+		t.Fatal(err)
+	}
+	link.stack = stack
+	go link.run()
+	t.Cleanup(func() {
+		_ = stack.Close()
+		<-link.done
+	})
+
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8035))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	t.Cleanup(func() { _ = connection.Close() })
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		window := link.lastClientWindow
+		link.mu.Unlock()
+		return window != 0
+	})
+	if info := tcpConnection.Info(); info.ReceiveWindow == 0 || info.ReceiveWindowScale == 0 {
+		t.Fatalf("active handshake receive window = %d, scale = %d; want a quantized non-zero window", info.ReceiveWindow, info.ReceiveWindowScale)
+	}
+
+	link.mu.Lock()
+	peer := link.tcp[tcpConnection.key.local.Port()]
+	if peer == nil {
+		link.mu.Unlock()
+		t.Fatal("TCP peer state was not created")
+	}
+	sequence, acknowledgement := peer.serverNext, peer.clientNext
+	link.mu.Unlock()
+	info := tcpConnection.Info()
+	if info.ReceiveWindowScale == 0 {
+		t.Fatalf("active handshake receive scale = %d, want non-zero", info.ReceiveWindowScale)
+	}
+	quantum := 1 << info.ReceiveWindowScale
+	firstPayload := bytes.Repeat([]byte{'x'}, quantum)
+	link.mu.Lock()
+	zeroWindowACKs := link.clientACKs
+	link.mu.Unlock()
+	if err := link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence, acknowledgement, TCPFlagACK|TCPFlagPSH, 65535, nil, firstPayload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return tcpConnection.Info().ReceiveWindow == 0
+	})
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs > zeroWindowACKs && link.lastClientWindow == 0
+	})
+	if buffered := tcpConnection.Info().ReceiveBufferSize; buffered != quantum {
+		t.Fatalf("scaled zero-window buffered bytes = %d, want %d", buffered, quantum)
+	}
+	if err := tcpConnection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tcpConnection.Read(firstPayload); n != quantum || err != nil || !bytes.Equal(firstPayload, bytes.Repeat([]byte{'x'}, quantum)) {
+		t.Fatalf("data after scaled zero-window admission = %d, %v", n, err)
+	}
+	link.mu.Lock()
+	openedWindowACKs := link.clientACKs
+	link.mu.Unlock()
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs > openedWindowACKs && link.lastClientWindow != 0
+	})
+	secondPayload := bytes.Repeat([]byte{'y'}, quantum)
+	if err := link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence+uint32(quantum), acknowledgement, TCPFlagACK|TCPFlagPSH, 65535, nil, secondPayload); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tcpConnection.Read(secondPayload); n != quantum || err != nil || !bytes.Equal(secondPayload, bytes.Repeat([]byte{'y'}, quantum)) {
+		t.Fatalf("data after scaled zero-window reopening = %d, %v", n, err)
 	}
 }
 
@@ -4204,7 +4306,7 @@ func TestTCPReceiveWindowPreservesRightEdge(t *testing.T) {
 	window := newTCPReceiveWindow(receiveNext, 65535, true, false, windowScale)
 	want := uint16(int(tcpReceiveCapacity) >> windowScale)
 	initialRight := window.right
-	proposed, proposedRight := window.next(receiveNext, tcpReceiveCapacity, 0)
+	proposed, proposedRight, _ := window.next(receiveNext, tcpReceiveCapacity, 0)
 	if proposed != want {
 		t.Fatalf("proposed scaled window = %d, want %d", proposed, want)
 	}
@@ -4213,7 +4315,7 @@ func TestTCPReceiveWindowPreservesRightEdge(t *testing.T) {
 	}
 	window.right = proposedRight
 	right := window.right
-	got, nextRight := window.next(receiveNext, tcpReceiveCapacity/2, 0)
+	got, nextRight, _ := window.next(receiveNext, tcpReceiveCapacity/2, 0)
 	if got != want {
 		t.Fatalf("window after out-of-order storage = %d, want %d", got, want)
 	}
@@ -4221,7 +4323,7 @@ func TestTCPReceiveWindowPreservesRightEdge(t *testing.T) {
 		t.Fatalf("proposed right edge moved from %d to %d", right, nextRight)
 	}
 	advanced := receiveNext + 1380
-	got, _ = window.next(advanced, tcpReceiveCapacity-1380, 0)
+	got, _, _ = window.next(advanced, tcpReceiveCapacity-1380, 0)
 	if advertisedRight := advanced + uint32(got)<<windowScale; tcpSequenceLess(advertisedRight+uint32(1<<windowScale)-1, right) {
 		t.Fatalf("scaled right edge shrank from %d to %d", right, advertisedRight)
 	}
@@ -4537,15 +4639,124 @@ func TestTCPReceiveWindowAvoidsSillyWindowGrowth(t *testing.T) {
 	const receiveNext = uint32(100)
 	window := newTCPReceiveWindow(receiveNext, 1000, false, false, 0)
 	advanced := receiveNext + 1000
-	if got, _ := window.next(advanced, 499, tcpReceiveWindowIncrease(1000, 600)); got != 0 {
+	if got, _, _ := window.next(advanced, 499, tcpReceiveWindowIncrease(1000, 600)); got != 0 {
 		t.Fatalf("sub-threshold reopened window = %d, want 0", got)
 	}
-	if got, _ := window.next(advanced, 500, tcpReceiveWindowIncrease(1000, 600)); got != 500 {
+	if got, _, _ := window.next(advanced, 500, tcpReceiveWindowIncrease(1000, 600)); got != 500 {
 		t.Fatalf("threshold reopened window = %d, want 500", got)
 	}
 	maximumInt := int(^uint(0) >> 1)
 	if got, want := tcpReceiveWindowIncrease(maximumInt, maximumInt), maximumInt/2+maximumInt%2; got != want {
 		t.Fatalf("maximum-capacity threshold = %d, want %d", got, want)
+	}
+}
+
+func TestTCPReceiveWindowReopensScaledZeroWindow(t *testing.T) {
+	const (
+		receiveNext = uint32(100)
+		mss         = 28
+		shift       = uint8(8)
+		quantum     = uint32(1) << shift
+	)
+	window := newTCPReceiveWindow(receiveNext, 0, true, false, shift)
+	if got, _, reserve := window.next(receiveNext, mss-1, mss); got != 0 || reserve != 0 {
+		t.Fatalf("sub-MSS scaled zero-window proposal = %d/%d, want 0/0", got, reserve)
+	}
+	got, right, reserve := window.next(receiveNext, mss, mss)
+	if got != 1 || right != receiveNext+quantum || reserve != uint16(quantum-uint32(mss)) {
+		t.Fatalf("scaled zero-window proposal = %d/%d/%d, want 1/%d/%d", got, right, reserve, receiveNext+quantum, quantum-uint32(mss))
+	}
+	partial := newTCPReceiveWindow(receiveNext, 0, true, false, shift)
+	partial.right = receiveNext + quantum - 1
+	got, quantumRight, quantumReserve := partial.next(receiveNext, mss, mss)
+	if got != 1 || quantumRight != receiveNext+quantum || quantumReserve != uint16(quantum-uint32(mss)) {
+		t.Fatalf("partially consumed scaled zero-window proposal = %d/%d/%d, want 1/%d/%d", got, quantumRight, quantumReserve, receiveNext+quantum, quantum-uint32(mss))
+	}
+	// A common scale has a quantum smaller than one MSS. The wire window can
+	// still be zero when the application frees a full SWS threshold, because
+	// the old right edge may leave only the tail of that quantum. The reopen
+	// rule must key off the quantized wire window, not available < quantum.
+	common := newTCPReceiveWindow(receiveNext, 0, true, false, 5)
+	common.right = receiveNext + 31
+	got, commonRight, commonReserve := common.next(receiveNext, 1460, 1460)
+	if got != 1 || commonRight != receiveNext+32 || commonReserve != 0 {
+		t.Fatalf("common-scale zero-window proposal = %d/%d/%d, want 1/%d/0", got, commonRight, commonReserve, receiveNext+32)
+	}
+	if window.right != receiveNext || window.quantumReserve != 0 {
+		t.Fatal("uncommitted scaled zero-window proposal changed state")
+	}
+
+	// Once the ACK carrying the one-quantum window is committed, the reserve
+	// admits the complete advertised sequence space without changing the
+	// configured receive capacity or accumulating on later packets.
+	window.right, window.quantumReserve = quantumRight, quantumReserve
+	connection := &TCPConn{receiveCapacity: mss}
+	payload := make([]byte, quantum)
+	next := receiveNext
+	pieces := []tcpReceivedPiece(nil)
+	bytes := 0
+	if delivered, closed := connection.receiveTCPData(receiveNext, payload, false, quantum, quantumReserve, &next, &pieces, &bytes); !delivered || closed {
+		t.Fatalf("quantum receive = delivered %t closed %t", delivered, closed)
+	}
+	if next != receiveNext+quantum || connection.readBuffer.size != int(quantum) {
+		t.Fatalf("quantum receive state = next %d buffer %d", next, connection.readBuffer.size)
+	}
+	if accepted := connection.appendReadBuffer([]byte{1}, []byte{1}, 0, quantumReserve); accepted != 0 {
+		t.Fatalf("post-quantum receive accepted %d bytes, want 0", accepted)
+	}
+	// Repeated in-order packets must consume the single advertised quantum,
+	// not reopen another one merely because the same reserve is passed through
+	// the hot receive path.
+	stream := &TCPConn{receiveCapacity: mss}
+	streamNext := receiveNext
+	var streamPieces []tcpReceivedPiece
+	streamBytes := 0
+	for index := uint32(0); index < quantum; index++ {
+		if delivered, closed := stream.receiveTCPData(streamNext, []byte{byte(index)}, false, quantum-(streamNext-receiveNext), quantumReserve, &streamNext, &streamPieces, &streamBytes); !delivered || closed {
+			t.Fatalf("quantum stream packet %d = delivered %t closed %t", index, delivered, closed)
+		}
+	}
+	if streamNext != receiveNext+quantum || stream.readBuffer.size != int(quantum) {
+		t.Fatalf("quantum stream state = next %d buffer %d, want %d/%d", streamNext, stream.readBuffer.size, receiveNext+quantum, quantum)
+	}
+	if delivered, closed := stream.receiveTCPData(streamNext, []byte{1}, false, 0, quantumReserve, &streamNext, &streamPieces, &streamBytes); delivered || closed {
+		t.Fatalf("post-quantum stream packet = delivered %t closed %t, want false/false", delivered, closed)
+	}
+	// An out-of-order range is admitted against the same bound and promoted
+	// after its gap arrives; it must not gain a second reserve during promote.
+	outOfOrderConnection := &TCPConn{receiveCapacity: mss}
+	outOfOrderNext := receiveNext
+	var outOfOrder []tcpReceivedPiece
+	outOfOrderBytes := 0
+	gap := quantum / 2
+	if delivered, closed := outOfOrderConnection.receiveTCPData(receiveNext+gap, []byte{1}, false, quantum, quantumReserve, &outOfOrderNext, &outOfOrder, &outOfOrderBytes); delivered || closed {
+		t.Fatalf("out-of-order quantum packet = delivered %t closed %t", delivered, closed)
+	}
+	if delivered, closed := outOfOrderConnection.receiveTCPData(receiveNext, make([]byte, gap), false, quantum, quantumReserve, &outOfOrderNext, &outOfOrder, &outOfOrderBytes); !delivered || closed {
+		t.Fatalf("gap-filling quantum packet = delivered %t closed %t", delivered, closed)
+	}
+	if outOfOrderNext != receiveNext+gap+1 || outOfOrderConnection.readBuffer.size != int(gap+1) {
+		t.Fatalf("promoted quantum state = next %d buffer %d, want %d/%d", outOfOrderNext, outOfOrderConnection.readBuffer.size, receiveNext+gap+1, gap+1)
+	}
+	if delivered, closed := outOfOrderConnection.receiveTCPData(outOfOrderNext, make([]byte, quantum-gap-1), false, quantum-(outOfOrderNext-receiveNext), quantumReserve, &outOfOrderNext, &outOfOrder, &outOfOrderBytes); !delivered || closed {
+		t.Fatalf("remaining quantum packet = delivered %t closed %t", delivered, closed)
+	}
+	if delivered, closed := outOfOrderConnection.receiveTCPData(outOfOrderNext, []byte{1}, false, 0, quantumReserve, &outOfOrderNext, &outOfOrder, &outOfOrderBytes); delivered || closed {
+		t.Fatalf("post-promote quantum packet = delivered %t closed %t", delivered, closed)
+	}
+	if delivered, closed := outOfOrderConnection.receiveTCPData(outOfOrderNext, nil, true, 0, quantumReserve, &outOfOrderNext, &outOfOrder, &outOfOrderBytes); !delivered || !closed {
+		t.Fatalf("zero-window FIN = delivered %t closed %t, want true/true", delivered, closed)
+	}
+	baselineSize := unsafe.Sizeof(struct {
+		right uint32
+		shift uint8
+	}{})
+	if got := unsafe.Sizeof(window); got != baselineSize {
+		t.Fatalf("tcpReceiveWindow size = %d, want %d", got, baselineSize)
+	}
+	maximum := newTCPReceiveWindow(receiveNext, 0, true, false, tcpMaximumWindowScale)
+	if got, _, reserve := maximum.next(receiveNext, 1, 1); got != 1 || reserve != uint16((uint32(1)<<tcpMaximumWindowScale)-1) {
+		t.Fatalf("maximum-scale reserve = %d/%d, want one quantum/%d", got, reserve, uint16((uint32(1)<<tcpMaximumWindowScale)-1))
 	}
 }
 
@@ -4564,7 +4775,7 @@ func TestTCPWindowUpdatePromotesContiguousData(t *testing.T) {
 	if n, err := connection.Read(buffer); err != nil || n != 4 || string(buffer) != "full" {
 		t.Fatalf("Read = %d, %v, %q; want 4, nil, full", n, err, buffer)
 	}
-	if delivered, closed := connection.promoteTCPReceived(&receiveNext, &outOfOrder, &outOfOrderBytes); !delivered || closed {
+	if delivered, closed := connection.promoteTCPReceived(0, &receiveNext, &outOfOrder, &outOfOrderBytes); !delivered || closed {
 		t.Fatalf("promoteTCPReceived = %t, %t; want true, false", delivered, closed)
 	}
 	if receiveNext != 104 || len(outOfOrder) != 0 || outOfOrderBytes != 0 {
@@ -9608,10 +9819,10 @@ func TestTCPOutOfOrderEarlierFINWins(t *testing.T) {
 	receiveWindow := uint32(1000)
 	var pieces []tcpReceivedPiece
 	bytes := 0
-	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 200, nil, nil, true, &pieces, &bytes) {
+	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 0, 200, nil, nil, true, &pieces, &bytes) {
 		t.Fatal("later out-of-order FIN was not retained")
 	}
-	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 150, nil, nil, true, &pieces, &bytes) {
+	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 0, 150, nil, nil, true, &pieces, &bytes) {
 		t.Fatal("earlier out-of-order FIN was not retained")
 	}
 	if len(pieces) != 1 || pieces[0].sequence != 150 || !pieces[0].fin {
@@ -9625,7 +9836,7 @@ func TestTCPOutOfOrderFINCompactsTruncatedRange(t *testing.T) {
 	copy(owner, "abcdefghijklmnopqrstuvwxyz")
 	pieces := []tcpReceivedPiece{{sequence: 104, payload: owner}}
 	bytes := len(owner)
-	if !connection.storeTCPOutOfOrder(100, 64, 106, nil, nil, true, &pieces, &bytes) {
+	if !connection.storeTCPOutOfOrder(100, 64, 0, 106, nil, nil, true, &pieces, &bytes) {
 		t.Fatal("earlier FIN was not retained")
 	}
 	if len(pieces) != 1 || !pieces[0].fin || string(pieces[0].payload) != "ab" ||
@@ -9642,13 +9853,13 @@ func TestTCPOutOfOrderFINWaitsForSequenceGap(t *testing.T) {
 	receiveNext := uint32(100)
 	var pieces []tcpReceivedPiece
 	outOfOrderBytes := 0
-	if delivered, closed := connection.receiveTCPData(104, []byte("ef"), true, 32, &receiveNext, &pieces, &outOfOrderBytes); delivered || closed {
+	if delivered, closed := connection.receiveTCPData(104, []byte("ef"), true, 32, 0, &receiveNext, &pieces, &outOfOrderBytes); delivered || closed {
 		t.Fatalf("out-of-order data plus FIN = delivered %t closed %t", delivered, closed)
 	}
 	if receiveNext != 100 || connection.readBuffer.size != 0 {
 		t.Fatalf("gapped receive state = next %d buffer %q", receiveNext, testTCPReadBufferBytes(&connection.readBuffer))
 	}
-	if delivered, closed := connection.receiveTCPData(100, []byte("abcd"), false, 32, &receiveNext, &pieces, &outOfOrderBytes); !delivered || !closed {
+	if delivered, closed := connection.receiveTCPData(100, []byte("abcd"), false, 32, 0, &receiveNext, &pieces, &outOfOrderBytes); !delivered || !closed {
 		t.Fatalf("gap completion = delivered %t closed %t", delivered, closed)
 	}
 	if receiveNext != 107 || string(testTCPReadBufferBytes(&connection.readBuffer)) != "abcdef" || len(pieces) != 0 || outOfOrderBytes != 0 {
@@ -10762,13 +10973,13 @@ func TestTCPOutOfOrderOverlapPreservesFirstData(t *testing.T) {
 	outOfOrder := []tcpReceivedPiece{{sequence: 104, payload: []byte("old")}}
 	outOfOrderBytes := 3
 	incoming := []byte("abcdef")
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 102, incoming, incoming, false, &outOfOrder, &outOfOrderBytes) {
+	if !connection.storeTCPOutOfOrder(receiveNext, 32, 0, 102, incoming, incoming, false, &outOfOrder, &outOfOrderBytes) {
 		t.Fatal("overlapping segment added no new data")
 	}
 	if len(outOfOrder) != 3 || outOfOrderBytes != 6 {
 		t.Fatalf("out-of-order state = %d pieces, %d bytes; want 3, 6", len(outOfOrder), outOfOrderBytes)
 	}
-	if delivered, closed := connection.receiveTCPData(100, []byte("00"), false, 32, &receiveNext, &outOfOrder, &outOfOrderBytes); !delivered || closed {
+	if delivered, closed := connection.receiveTCPData(100, []byte("00"), false, 32, 0, &receiveNext, &outOfOrder, &outOfOrderBytes); !delivered || closed {
 		t.Fatalf("receiveTCPData = %t, %t; want true, false", delivered, closed)
 	}
 	if got := string(testTCPReadBufferBytes(&connection.readBuffer)); got != "00aboldf" {
@@ -10782,7 +10993,7 @@ func TestTCPOutOfOrderAdoptsCompleteOwnedRange(t *testing.T) {
 	payload = payload[:len(payload):len(payload)]
 	var pieces []tcpReceivedPiece
 	bytes := 0
-	if !connection.storeTCPOutOfOrder(100, 32, 104, payload, payload, false, &pieces, &bytes) {
+	if !connection.storeTCPOutOfOrder(100, 32, 0, 104, payload, payload, false, &pieces, &bytes) {
 		t.Fatal("out-of-order payload was not retained")
 	}
 	if len(pieces) != 1 || &pieces[0].payload[0] != &payload[0] {
@@ -10797,7 +11008,7 @@ func TestTCPOutOfOrderCompactsPartialOwnedRange(t *testing.T) {
 	payload := owner[28:]
 	var pieces []tcpReceivedPiece
 	bytes := 0
-	if !connection.storeTCPOutOfOrder(100, 32, 104, payload, owner, false, &pieces, &bytes) {
+	if !connection.storeTCPOutOfOrder(100, 32, 0, 104, payload, owner, false, &pieces, &bytes) {
 		t.Fatal("partial out-of-order payload was not retained")
 	}
 	if len(pieces) != 1 || string(pieces[0].payload) != "tail" || &pieces[0].payload[0] == &owner[28] || cap(pieces[0].payload) != len(pieces[0].payload) {
@@ -10812,7 +11023,7 @@ func TestTCPPromoteCompactsPartiallyDeliveredRange(t *testing.T) {
 	pieces := []tcpReceivedPiece{{sequence: 100, payload: owner[:4]}}
 	bytes := 4
 	receiveNext := uint32(100)
-	if delivered, closed := connection.promoteTCPReceived(&receiveNext, &pieces, &bytes); !delivered || closed {
+	if delivered, closed := connection.promoteTCPReceived(0, &receiveNext, &pieces, &bytes); !delivered || closed {
 		t.Fatalf("partial promotion = delivered %t closed %t", delivered, closed)
 	}
 	if receiveNext != 102 || bytes != 2 || len(pieces) != 1 || string(pieces[0].payload) != "ta" ||
@@ -10829,11 +11040,11 @@ func TestTCPOutOfOrderUsesPromisedWindow(t *testing.T) {
 	var outOfOrder []tcpReceivedPiece
 	outOfOrderBytes := 0
 	first := []byte("first")
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 120, first, first, false, &outOfOrder, &outOfOrderBytes) {
+	if !connection.storeTCPOutOfOrder(receiveNext, 32, 0, 120, first, first, false, &outOfOrder, &outOfOrderBytes) {
 		t.Fatal("first out-of-order range was rejected")
 	}
 	edge := []byte("edge")
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 128, edge, edge, false, &outOfOrder, &outOfOrderBytes) {
+	if !connection.storeTCPOutOfOrder(receiveNext, 32, 0, 128, edge, edge, false, &outOfOrder, &outOfOrderBytes) {
 		t.Fatal("range at the promised right edge was rejected after buffer use")
 	}
 	if outOfOrderBytes != 9 {
@@ -11935,7 +12146,7 @@ func TestTCPACKPolicy(t *testing.T) {
 	state.quickACKBudget = 2
 	state.ackPending = true
 	state.receiveNext++
-	state.commitAcknowledgment(512, state.receiveWindowState.right, false)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, 0, false)
 	if state.quickACKBudget != 1 || state.ackPending {
 		t.Fatalf("committed ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
@@ -11948,18 +12159,18 @@ func TestTCPACKPolicy(t *testing.T) {
 	state.ackPending = true
 	state.outOfOrder = []tcpReceivedPiece{{sequence: state.receiveNext + 1, payload: []byte{1}}}
 	state.peerSACK = false
-	state.commitAcknowledgment(512, state.receiveWindowState.right, false)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, 0, false)
 	if state.ackPending || state.quickACKBudget != 1 {
 		t.Fatalf("non-SACK ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
 	state.quickACKBudget = 2
 	state.ackPending = true
 	state.peerSACK = true
-	state.commitAcknowledgment(512, state.receiveWindowState.right, false)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, 0, false)
 	if !state.ackPending || state.quickACKBudget != 2 {
 		t.Fatalf("omitted SACK ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
-	state.commitAcknowledgment(512, state.receiveWindowState.right, true)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, 0, true)
 	if state.ackPending || state.quickACKBudget != 1 {
 		t.Fatalf("selective ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
@@ -13937,7 +14148,7 @@ func FuzzTCPOutOfOrderRanges(f *testing.F) {
 				payload[index] = events[offset+3] + byte(index)
 			}
 			connection.storeTCPOutOfOrder(
-				receiveNext, uint32(capacity), receiveNext+distance, payload, payload,
+				receiveNext, uint32(capacity), 0, receiveNext+distance, payload, payload,
 				events[offset+4]&1 != 0, &pieces, &outOfOrderBytes,
 			)
 			check()
@@ -14682,7 +14893,7 @@ func BenchmarkTCPApplicationRead(b *testing.B) {
 							if mode == "Read" {
 								for iteration := 0; iteration < b.N; iteration++ {
 									for _, chunk := range chunks {
-										if accepted := connection.appendReadBuffer(chunk, chunk, 0); accepted != len(chunk) {
+										if accepted := connection.appendReadBuffer(chunk, chunk, 0, 0); accepted != len(chunk) {
 											b.Fatalf("accepted %d of %d bytes", accepted, len(chunk))
 										}
 									}
@@ -14707,7 +14918,7 @@ func BenchmarkTCPApplicationRead(b *testing.B) {
 
 							for iteration := 0; iteration < b.N; iteration++ {
 								for _, chunk := range chunks {
-									if accepted := connection.appendReadBuffer(chunk, chunk, 0); accepted != len(chunk) {
+									if accepted := connection.appendReadBuffer(chunk, chunk, 0, 0); accepted != len(chunk) {
 										b.Fatalf("accepted %d of %d bytes", accepted, len(chunk))
 									}
 								}

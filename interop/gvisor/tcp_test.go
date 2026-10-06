@@ -608,7 +608,7 @@ func TestTCPHighFrequencyTimestampInterop(t *testing.T) {
 // connections can complete through a mipstack SYN-cookie when a middlebox
 // removes Timestamp from the SYN or final ACK, or clears the final TSecr.
 // The first half-open handshake fills the SYN backlog; the second is validated
-// from the wire and restores only the extensions proved by the received options.
+// from the wire and restores extensions proved by the cookie and final ACK.
 func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 	scenarios := []struct {
 		name             string
@@ -616,6 +616,7 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 		wantTimestamp    bool
 		wantWindowScale  bool
 		wantPeerScale    uint8
+		wantSACK         bool
 		wantReceiveScale bool
 		stripSYN         bool
 	}{
@@ -623,7 +624,7 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 		{name: "missing-timestamp", rewrite: stripTCPTimestamp},
 		{name: "zero-tsecr", rewrite: func(packet []byte) bool {
 			return rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 0 })
-		}, wantTimestamp: true, wantWindowScale: true, wantReceiveScale: true},
+		}, wantTimestamp: true, wantWindowScale: true, wantPeerScale: 7, wantSACK: true, wantReceiveScale: true},
 	}
 	for scenarioIndex, scenario := range scenarios {
 		scenarioIndex, scenario := scenarioIndex, scenario
@@ -742,7 +743,7 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					defer accepted.Close()
 					connection := accepted.(*mipstack.TCPConn)
 					info := connection.Info()
-					if info.State != mipstack.TCPStateEstablished || info.Timestamps != scenario.wantTimestamp || info.SACK ||
+					if info.State != mipstack.TCPStateEstablished || info.Timestamps != scenario.wantTimestamp || info.SACK != scenario.wantSACK ||
 						info.WindowScaling != scenario.wantWindowScale || info.PeerWindowScale != scenario.wantPeerScale ||
 						(!scenario.wantReceiveScale && info.ReceiveWindowScale != 0) ||
 						(scenario.wantReceiveScale && info.ReceiveWindowScale == 0) {

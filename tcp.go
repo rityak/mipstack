@@ -226,9 +226,13 @@ const (
 	tcpDefaultKeepAliveInterval = 75 * time.Second
 	// tcpDefaultKeepAliveCount bounds unanswered probes.
 	tcpDefaultKeepAliveCount = 9
+	// tcpMaximumWindowScale is the RFC 7323 wire limit. It also bounds the
+	// temporary receive-window quantum reserve to one scale quantum minus one
+	// byte, so a zero-window reopening cannot create unbounded overcommit.
+	tcpMaximumWindowScale = 14
 	// tcpMaximumScaledWindow is the largest receive window representable by
 	// TCP's 16-bit window and maximum negotiated scale.
-	tcpMaximumScaledWindow = uint32(65535) << 14
+	tcpMaximumScaledWindow = uint32(65535) << tcpMaximumWindowScale
 	// tcpPLPMTUProbeThreshold matches Linux's default binary-search stopping
 	// interval. Smaller packet-size gains do not justify another loss probe.
 	tcpPLPMTUProbeThreshold = 8
@@ -748,8 +752,14 @@ type TCPConnInfo struct {
 	// MaximumSendBuffer is the automatic send-buffer tuning ceiling.
 	MaximumSendBuffer int
 	// ReceiveBufferSize is the number of application bytes waiting to be read.
+	// While a scaled zero-window reopening is in flight, it can temporarily
+	// include at most one less than a receive-window scale quantum beyond
+	// ReceiveBufferCapacity so the peer can consume the window it was
+	// explicitly promised.
 	ReceiveBufferSize int
-	// ReceiveBufferCapacity is the current receive-buffer limit.
+	// ReceiveBufferCapacity is the current nominal receive-buffer limit. A
+	// scaled zero-window reopening may temporarily admit the bounded quantum
+	// remainder described by ReceiveBufferSize above.
 	ReceiveBufferCapacity int
 	// MaximumReceiveBuffer is the automatic receive-buffer tuning ceiling.
 	MaximumReceiveBuffer int
@@ -1177,8 +1187,9 @@ var tcpZeroWindowProbe = [...]byte{0}
 // peer. Buffer occupancy may reduce newly available space, but it must not
 // move an already advertised right edge backwards.
 type tcpReceiveWindow struct {
-	right uint32
-	shift uint8
+	right          uint32
+	shift          uint8
+	quantumReserve uint16
 }
 
 // newTCPReceiveWindow starts with the last window sent during the handshake
@@ -1188,6 +1199,9 @@ func newTCPReceiveWindow(receiveNext uint32, initial uint16, scaled, initialScal
 	initialBytes := uint32(initial)
 	window := tcpReceiveWindow{}
 	if scaled {
+		if scale > tcpMaximumWindowScale {
+			scale = tcpMaximumWindowScale
+		}
 		window.shift = scale
 	}
 	if initialScaled {
@@ -1205,15 +1219,17 @@ func tcpReceiveWindowScaleFor(maximum int) uint8 {
 		return 0
 	}
 	var scale uint8
-	for scale < 14 && uint64(65535)<<scale < uint64(maximum) {
+	for scale < tcpMaximumWindowScale && uint64(65535)<<scale < uint64(maximum) {
 		scale++
 	}
 	return scale
 }
 
-// next returns the wire window that would be advertised with the currently
-// available storage, without committing that promise until a segment is sent.
-func (w *tcpReceiveWindow) next(receiveNext uint32, available, minimumIncrease int) (uint16, uint32) {
+// next returns the wire window, right edge, and bounded capacity reserve that
+// would be advertised with the currently available storage. The reserve is at
+// most one RFC 7323 scale quantum minus one byte and is never auto-tuned. The
+// candidate is not committed until the carrying packet is sent successfully.
+func (w *tcpReceiveWindow) next(receiveNext uint32, available, minimumIncrease int) (uint16, uint32, uint16) {
 	if available < 0 {
 		available = 0
 	}
@@ -1221,8 +1237,10 @@ func (w *tcpReceiveWindow) next(receiveNext uint32, available, minimumIncrease i
 	if uint64(available) > uint64(maximum) {
 		available = int(maximum)
 	}
-	desired := receiveNext + uint32(available>>w.shift)<<w.shift
+	quantum := uint32(1) << w.shift
+	desired := receiveNext + uint32(available>>w.shift)*quantum
 	right := w.right
+	reserve := w.quantumReserve
 	if tcpSequenceGreater(desired, right) {
 		increase := desired - right
 		if minimumIncrease < 0 {
@@ -1230,12 +1248,41 @@ func (w *tcpReceiveWindow) next(receiveNext uint32, available, minimumIncrease i
 		}
 		if increase >= uint32(minimumIncrease) {
 			right = desired
+			reserve = 0
+		}
+	}
+	// RFC 1122/RFC 9293 defines the receiver SWS threshold as the smaller of
+	// half the buffer and one expected segment. RFC 7323 floors the wire window
+	// to a scale quantum, so threshold-sized progress can still encode as zero
+	// even when storage is available. In that zero-window case (including a
+	// partially consumed prior quantum), MIPStack advertises one quantum and
+	// accounts for its bounded remainder; this is an implementation-level
+	// overcommit, not an RFC requirement. Ordinary windows retain the
+	// exact-capacity, rounded-down fast path.
+	if w.shift != 0 && minimumIncrease > 0 && available >= minimumIncrease {
+		advertisedBytes := uint32(0)
+		if !tcpSequenceLess(right, receiveNext) {
+			advertisedBytes = right - receiveNext
+		}
+		if advertisedBytes < quantum {
+			candidateRight := receiveNext + quantum
+			if tcpSequenceGreater(candidateRight, right) {
+				right = candidateRight
+				if uint32(available) < quantum {
+					reserve = uint16(quantum - uint32(available))
+				} else {
+					reserve = 0
+				}
+			}
 		}
 	}
 	if tcpSequenceLess(right, receiveNext) {
-		return 0, right
+		return 0, right, 0
 	}
-	return uint16((right - receiveNext) >> w.shift), right
+	if right == receiveNext {
+		reserve = 0
+	}
+	return uint16((right - receiveNext) >> w.shift), right, reserve
 }
 
 // size returns the receive sequence space covered by prior advertisements.
@@ -2135,7 +2182,7 @@ func (s *tcpEstablishedState) finish() {
 	c := s.connection
 	if c.takeAbortReset() {
 		sequence := tcpAcceptableSendSequence(s.sendUnacknowledged, s.sendNext, s.peerWindow, s.peerScale)
-		window, _ := s.nextAdvertisedReceiveWindow()
+		window, _, _ := s.nextAdvertisedReceiveWindow()
 		_ = c.sendAbortReset(sequence, s.receiveNext, window)
 	}
 	info := s.tcpInfo()
@@ -2498,7 +2545,7 @@ func (s *tcpEstablishedState) tcpInfo() TCPConnInfo {
 // nextAdvertisedReceiveWindow derives the next RFC window and right edge from
 // current contiguous and out-of-order receive occupancy. Publication commits
 // the returned edge through commitAcknowledgment.
-func (s *tcpEstablishedState) nextAdvertisedReceiveWindow() (uint16, uint32) {
+func (s *tcpEstablishedState) nextAdvertisedReceiveWindow() (uint16, uint32, uint16) {
 	available, capacity := s.connection.receiveSpace(s.outOfOrderBytes)
 	return s.receiveWindowState.next(s.receiveNext, available, tcpReceiveWindowIncrease(capacity, s.receiveMSS))
 }
@@ -2759,14 +2806,16 @@ func (s *tcpEstablishedState) observeSentData(sentAt monotonicStamp) {
 }
 
 // commitAcknowledgment records an ACK carried by a successfully queued packet.
-// right is the receive-window edge calculated for that packet; selective
+// right is the receive-window edge calculated for that packet; reserve is the
+// bounded extra storage promised by a scaled zero-window reopening; selective
 // reports that current SACK/DSACK state was encoded. A retransmission without
 // those options must not suppress the later SACK ACK.
-func (s *tcpEstablishedState) commitAcknowledgment(window uint16, right uint32, selective bool) {
+func (s *tcpEstablishedState) commitAcknowledgment(window uint16, right uint32, reserve uint16, selective bool) {
 	pending := s.ackPending
 	selectivePending := s.peerSACK && (len(s.outOfOrder) != 0 || s.haveRecentDSACK)
 	satisfied := selective || !selectivePending
 	s.receiveWindowState.right = right
+	s.receiveWindowState.quantumReserve = reserve
 	s.lastACKSent = s.receiveNext
 	s.lastAdvertisedWindow = window
 	if pending && satisfied && s.quickACKBudget != 0 {
@@ -3109,7 +3158,7 @@ func (s *tcpEstablishedState) drainPersistOutput(first tcpOutputReservation) (*p
 	if !available {
 		return nil, nil
 	}
-	window, right := s.nextAdvertisedReceiveWindow()
+	window, right, reserve := s.nextAdvertisedReceiveWindow()
 	var payload tcpPayloadView
 	payload.setBytes(tcpZeroWindowProbe[:])
 	// Linux probes with already acknowledged sequence space. Consuming a new
@@ -3122,7 +3171,7 @@ func (s *tcpEstablishedState) drainPersistOutput(first tcpOutputReservation) (*p
 		return nil, err
 	}
 	s.sendTimer.persistHostQueueToken = published.hostQueue.token
-	s.commitAcknowledgment(window, right, false)
+	s.commitAcknowledgment(window, right, reserve, false)
 	c.stack.stats.tcpZeroWindowProbes.Add(1)
 	// Retry accounting and backoff advance only for a published probe. A
 	// capacity shortage cannot consume either budget or shorten the interval.
@@ -3306,7 +3355,7 @@ func (s *tcpEstablishedState) recoveryOutputReady() bool {
 // and delayed-ACK bookkeeping only after packet publication succeeds.
 func (s *tcpEstablishedState) sendACKAt(sequence uint32, reservation tcpOutputReservation) error {
 	options, dsackSent := s.sackOptions(0)
-	window, right := s.nextAdvertisedReceiveWindow()
+	window, right, reserve := s.nextAdvertisedReceiveWindow()
 	var payload tcpPayloadView
 	if _, err := s.connection.publishReservedPayloadForMTU(sequence, s.receiveNext, TCPFlagACK, window, options, &payload, false, s.connection.mtu, reservation, tcpOutputSequenceRange{}); err != nil {
 		return err
@@ -3314,7 +3363,7 @@ func (s *tcpEstablishedState) sendACKAt(sequence uint32, reservation tcpOutputRe
 	if dsackSent {
 		s.haveRecentDSACK = false
 	}
-	s.commitAcknowledgment(window, right, len(options) != 0)
+	s.commitAcknowledgment(window, right, reserve, len(options) != 0)
 	return nil
 }
 
@@ -3330,14 +3379,14 @@ func (s *tcpEstablishedState) sendACK(reservation tcpOutputReservation) error {
 // local device pressure must not block the connection actor.
 func (s *tcpEstablishedState) trySendACKAt(sequence uint32) {
 	options, dsackSent := s.sackOptions(0)
-	window, right := s.nextAdvertisedReceiveWindow()
+	window, right, reserve := s.nextAdvertisedReceiveWindow()
 	if err := s.connection.trySendSegmentWithOptions(sequence, s.receiveNext, TCPFlagACK, window, options); err != nil {
 		return
 	}
 	if dsackSent {
 		s.haveRecentDSACK = false
 	}
-	s.commitAcknowledgment(window, right, len(options) != 0)
+	s.commitAcknowledgment(window, right, reserve, len(options) != 0)
 }
 
 // trySendACK makes one best-effort ACK attempt from a sequence acceptable in
@@ -4048,20 +4097,18 @@ type tcpReuseEndpoints interface {
 // registry. Stack.mu protects endpoint registries; cookieMu protects the
 // cookie key and recent-issuance period.
 type tcpPassiveState struct {
-	exclusive           map[tcpListenKey]*TCPListener
-	reuse               tcpReuseEndpoints
-	cookieMu            sync.Mutex
-	cookieKey           [16]byte
-	cookieSet           bool
-	cookieEpoch         time.Time
-	cookiePeriod        uint64
-	cookieActive        bool
-	cookieScaleSet      bool
-	cookieScalePeriod   uint64
-	cookieWindowScale   uint8
-	previousScaleSet    bool
-	previousScalePeriod uint64
-	previousWindowScale uint8
+	exclusive    map[tcpListenKey]*TCPListener
+	reuse        tcpReuseEndpoints
+	cookieMu     sync.Mutex
+	cookieKey    [16]byte
+	cookieSet    bool
+	cookieEpoch  time.Time
+	cookiePeriod uint64
+	cookieActive bool
+	// nextCookieGeneration is protected by Stack.mu and is unique while this
+	// passive dispatcher retains its cookie secret. A new dispatcher receives a
+	// new secret, so its generation sequence may safely start over.
+	nextCookieGeneration uint64
 }
 
 // tcpListenerBinding supplies only the registration policy that differs
@@ -4125,14 +4172,17 @@ type TCPListenerInfo struct {
 
 // TCPListener is a passive userspace TCP endpoint.
 type TCPListener struct {
-	stack        *Stack
-	key          tcpListenKey
-	local        netip.AddrPort
-	dual         bool
-	net          string
-	options      tcpSocketOptionSet
-	reuseAddress bool
-	reusePort    bool
+	stack *Stack
+	key   tcpListenKey
+	// cookieGeneration distinguishes this listener from a replacement that
+	// reuses the same local endpoint while the passive cookie key remains.
+	cookieGeneration uint64
+	local            netip.AddrPort
+	dual             bool
+	net              string
+	options          tcpSocketOptionSet
+	reuseAddress     bool
+	reusePort        bool
 
 	accept         chan *TCPConn
 	closed         chan struct{}
@@ -4147,6 +4197,17 @@ type TCPListener struct {
 	acceptPeak  int
 	backlogPeak int
 
+	// SYN-cookie replies retain the receive scale advertised by this listener
+	// for the current and previous cookie periods. Keeping this policy beside
+	// the listener preserves RFC 7323's per-handshake negotiation without
+	// allowing one listener to alter another listener's stateless recovery.
+	cookieScalePeriod   uint64
+	previousScalePeriod uint64
+	cookieWindowScale   uint8
+	previousWindowScale uint8
+	cookieScaleSet      bool
+	previousScaleSet    bool
+
 	synsReceived         atomic.Uint64
 	statefulHandshakes   atomic.Uint64
 	handshakeCompletions atomic.Uint64
@@ -4157,6 +4218,44 @@ type TCPListener struct {
 	synCookiesRejected   atomic.Uint64
 	acceptQueueDrops     atomic.Uint64
 	acceptedConnections  atomic.Uint64
+}
+
+// recordSYNCookieScale selects the receive scale for one listener's cookie
+// period. A period remains stable after its first cookie so a configuration
+// update cannot change the scale promised by an outstanding SYN-cookie.
+func (l *TCPListener) recordSYNCookieScale(period uint64, scale uint8) uint8 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-l.closed:
+		return scale
+	default:
+	}
+	if !l.cookieScaleSet || period > l.cookieScalePeriod {
+		if l.cookieScaleSet {
+			l.previousScaleSet = true
+			l.previousScalePeriod = l.cookieScalePeriod
+			l.previousWindowScale = l.cookieWindowScale
+		}
+		l.cookieScaleSet = true
+		l.cookieScalePeriod = period
+		l.cookieWindowScale = scale
+	}
+	return l.cookieWindowScale
+}
+
+// lookupSYNCookieScale returns the scale promised by this listener for a
+// current or immediately previous cookie period.
+func (l *TCPListener) lookupSYNCookieScale(period uint64) (uint8, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cookieScaleSet && l.cookieScalePeriod == period {
+		return l.cookieWindowScale, true
+	}
+	if l.previousScaleSet && l.previousScalePeriod == period {
+		return l.previousWindowScale, true
+	}
+	return 0, false
 }
 
 // ListenTCP creates a passive TCP endpoint. Network must be tcp, tcp4, or
@@ -4225,6 +4324,7 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	}
 	local = netip.AddrPortFrom(address, port)
 	key := tcpListenKey{address: address, port: port}
+	passive.nextCookieGeneration++
 	acceptCapacity := state.tcpDefaults.AcceptQueue
 	if options.acceptQueue.set {
 		acceptCapacity = options.acceptQueue.value
@@ -4234,7 +4334,7 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 		backlog = options.synBacklog.value
 	}
 	listener := &TCPListener{
-		stack: s, key: key, local: local, dual: dual, net: network, options: options, accept: make(chan *TCPConn, acceptCapacity), backlog: backlog,
+		stack: s, key: key, cookieGeneration: passive.nextCookieGeneration, local: local, dual: dual, net: network, options: options, accept: make(chan *TCPConn, acceptCapacity), backlog: backlog,
 		acceptCapacity: acceptCapacity,
 		closed:         make(chan struct{}), pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
 	}
@@ -5188,7 +5288,8 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 	if listener == nil {
 		return false, nil
 	}
-	initialSequence, options, valid, attempted := state.validateSYNCookie(key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch))
+	validatedListener := listener
+	initialSequence, options, valid, attempted := state.validateSYNCookie(key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch), validatedListener)
 	if !valid {
 		if attempted {
 			listener.synCookiesRejected.Add(1)
@@ -5209,7 +5310,10 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 		return false, nil
 	}
 	listener = state.listener(key.local, key.remote)
-	if listener == nil {
+	// The listener owns the receive scale promised by the cookie. Do not apply
+	// a cookie validated for a listener that was closed and replaced while the
+	// stack lock was released; a retransmitted ACK can be validated afresh.
+	if listener == nil || listener != validatedListener {
 		stack.mu.Unlock()
 		return false, nil
 	}
@@ -5234,6 +5338,9 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 		connection.peerWindow <<= options.windowScale
 	}
 	connection.peerWindowSeq = segment.sequence
+	// The receive scale was advertised by this listener's SYN-cookie. Restore
+	// that per-listener value when the negotiated extensions are recoverable;
+	// the Linux-compatible timestamp-less fallback deliberately leaves it zero.
 	connection.receiveWindowScale = options.localWindowScale
 	if !listener.trackCompleted(connection) {
 		stack.mu.Unlock()
@@ -6484,9 +6591,14 @@ func (c *TCPConn) applicationReceiveClosed() bool {
 // appendReadBuffer takes ownership of and retains as much contiguous data as
 // the receive bound permits. owner is the complete independent allocation
 // that contains payload; a trimmed range is compacted before it is retained.
-func (c *TCPConn) appendReadBuffer(payload []byte, owner []byte, outOfOrderBytes int) int {
+// extraCapacity is the committed remainder of one scaled receive-window
+// quantum and is nonzero only after that extra sequence space was advertised.
+func (c *TCPConn) appendReadBuffer(payload []byte, owner []byte, outOfOrderBytes int, extraCapacity uint16) int {
 	c.mu.Lock()
 	available := c.receiveCapacity - c.readBuffer.size - outOfOrderBytes
+	if extraCapacity != 0 {
+		available += int(extraCapacity)
+	}
 	if c.userClosed || c.readClosed {
 		accepted := len(payload)
 		c.mu.Unlock()
@@ -7987,7 +8099,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			flags |= TCPFlagPSH
 		}
 		next := state.sendNext + uint32(payload.size)
-		window, right := state.nextAdvertisedReceiveWindow()
+		window, right, reserve := state.nextAdvertisedReceiveWindow()
 		reservation, outputWindow, available := outputWindow.reserve(c)
 		if !available {
 			return outputWindow, false, true, nil
@@ -8008,7 +8120,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if dsackSent {
 			state.haveRecentDSACK = false
 		}
-		state.commitAcknowledgment(window, right, len(options) != 0)
+		state.commitAcknowledgment(window, right, reserve, len(options) != 0)
 		state.observeSentData(hostQueue.queuedAt)
 		// Delivery sampling resets its pipeline timestamps only when packets_out
 		// is zero. SACKed or loss-marked data therefore remains part of the first
@@ -8243,7 +8355,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				reservation, outputWindow, available = outputWindow.reserve(c)
 				if available {
 					options, dsackSent := state.sackOptions(0)
-					window, right := state.nextAdvertisedReceiveWindow()
+					window, right, reserve := state.nextAdvertisedReceiveWindow()
 					var payload tcpPayloadView
 					published, err := c.publishReservedPayloadForMTU(state.sendNext, state.receiveNext, TCPFlagACK|TCPFlagFIN, window, options, &payload, false, c.mtu, reservation, tcpOutputSequenceRange{
 						unacknowledged: state.sendUnacknowledged,
@@ -8264,7 +8376,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					if dsackSent {
 						state.haveRecentDSACK = false
 					}
-					state.commitAcknowledgment(window, right, len(options) != 0)
+					state.commitAcknowledgment(window, right, reserve, len(options) != 0)
 					state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: published.timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, transmissionOrder: transmissionOrder}, false)
 					state.sendNext++
 					// Only the endpoint that closes first, or closes simultaneously,
@@ -8291,7 +8403,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		oldest := &state.outstanding[index]
 		rackRetransmission := oldest.state.has(sentTCPSegmentRACKLost)
 		repeated := oldest.isRetransmitted()
-		window, right := state.nextAdvertisedReceiveWindow()
+		window, right, reserve := state.nextAdvertisedReceiveWindow()
 		outputWindow, published, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *oldest, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 		if err != nil || blocked {
 			return outputWindow, blocked, err
@@ -8302,7 +8414,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if state.undo != nil {
 			state.undo.recordRetransmission(oldest.sequence, oldest.end, published.timestamp, repeated)
 		}
-		state.commitAcknowledgment(window, right, false)
+		state.commitAcknowledgment(window, right, reserve, false)
 		oldest.timestamp = published.timestamp
 		oldest.hostQueue = hostQueue
 		oldest.transmissionOrder = transmissionOrder
@@ -8348,7 +8460,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return outputWindow, false, nil
 		}
 		segment := &state.outstanding[index]
-		window, right := state.nextAdvertisedReceiveWindow()
+		window, right, reserve := state.nextAdvertisedReceiveWindow()
 		outputWindow, published, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 		if err != nil || blocked {
 			return outputWindow, blocked, err
@@ -8359,7 +8471,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if state.undo != nil {
 			state.undo.recordRetransmission(segment.sequence, segment.end, published.timestamp, segment.isRetransmitted())
 		}
-		state.commitAcknowledgment(window, right, false)
+		state.commitAcknowledgment(window, right, reserve, false)
 		if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
 			c.sendCWR = true
 		}
@@ -8423,7 +8535,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if !sent {
 			segment := &state.outstanding[pendingIndex]
 			originalCongestionState := segment.congestionPacketState
-			window, right := state.nextAdvertisedReceiveWindow()
+			window, right, reserve := state.nextAdvertisedReceiveWindow()
 			var published tcpPublishedTransmission
 			outputWindow, published, blocked, err = c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 			if err != nil || blocked {
@@ -8434,7 +8546,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			transmissionOrder := state.recordTransmission(hostQueue)
 			state.recordRetransmission(segment.sequence, segment.end)
 			sentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
-			state.commitAcknowledgment(window, right, false)
+			state.commitAcknowledgment(window, right, reserve, false)
 			segment.timestamp = published.timestamp
 			segment.hostQueue = hostQueue
 			segment.transmissionOrder = transmissionOrder
@@ -8465,7 +8577,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			outputWindow.release()
 			return nil
 		}
-		window, right := state.nextAdvertisedReceiveWindow()
+		window, right, reserve := state.nextAdvertisedReceiveWindow()
 		// Linux tcp_keepalive_timer tests queued output and the terminal policy
 		// under the socket lock. Keep these reads together so a newly queued
 		// Write or FIN cannot be mistaken for an idle, failed peer.
@@ -8511,7 +8623,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return err
 		}
 		hostQueue := published.hostQueue
-		state.commitAcknowledgment(window, right, false)
+		state.commitAcknowledgment(window, right, reserve, false)
 		liveness := state.ensureLivenessState()
 		liveness.keepAliveProbes++
 		liveness.lastKeepAlive = hostQueue.queuedTime(c.stack.timestampEpoch)
@@ -8531,7 +8643,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		segment := &state.outstanding[index]
 		repeated := segment.isRetransmitted()
-		window, right := state.nextAdvertisedReceiveWindow()
+		window, right, reserve := state.nextAdvertisedReceiveWindow()
 		outputWindow, published, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 		if err != nil || blocked {
 			return outputWindow, blocked, err
@@ -8542,7 +8654,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if state.undo != nil {
 			state.undo.recordRetransmission(segment.sequence, segment.end, published.timestamp, repeated)
 		}
-		state.commitAcknowledgment(window, right, false)
+		state.commitAcknowledgment(window, right, reserve, false)
 		if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
 			c.sendCWR = true
 		}
@@ -8660,7 +8772,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		payload := initialReceive.payload
 		fin := initialReceive.fin
 		previousReceiveNext := state.receiveNext
-		_, closed := c.receiveTCPData(state.receiveNext, payload, fin, state.receiveWindowState.size(state.receiveNext), &state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
+		_, closed := c.receiveTCPData(state.receiveNext, payload, fin, state.receiveWindowState.size(state.receiveNext), state.receiveWindowState.quantumReserve, &state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
 		advanced := state.receiveNext - previousReceiveNext
 		if closed && advanced != 0 {
 			advanced--
@@ -8677,6 +8789,22 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if state.scheduleACK(true, len(payload) != 0, receivedAt) {
 			if err := flushACK(tcpOutputReservation{}); err != nil {
 				return err
+			}
+		}
+	}
+	// An active opener may have advertised a zero final-ACK window when its
+	// configured receive capacity is smaller than one negotiated scale quantum.
+	// RFC 7323 permits that wire quantization, but leaving the connection there
+	// would make a peer's persist probes the only source of progress. Recompute
+	// the first rounded non-zero window once ESTABLISHED owns the state; the
+	// existing ACK/output retry path handles a temporarily full device queue.
+	if !state.ackPending {
+		window, _, _ := state.nextAdvertisedReceiveWindow()
+		if window > state.lastAdvertisedWindow {
+			if state.scheduleACK(true, false, time.Now()) {
+				if err := flushACK(tcpOutputReservation{}); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -8930,7 +9058,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					c.outOfOrderUnread.Store(0)
 				} else if len(state.outOfOrder) != 0 {
 					previousReceiveNext := state.receiveNext
-					_, closed := c.promoteTCPReceived(&state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
+					_, closed := c.promoteTCPReceived(state.receiveWindowState.quantumReserve, &state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
 					advanced := state.receiveNext - previousReceiveNext
 					if closed && advanced != 0 {
 						advanced--
@@ -8946,7 +9074,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 				}
 				available, capacity := c.receiveSpace(state.outOfOrderBytes)
-				window, _ := state.receiveWindowState.next(state.receiveNext, available, tcpReceiveWindowIncrease(capacity, state.receiveMSS))
+				window, _, _ := state.receiveWindowState.next(state.receiveNext, available, tcpReceiveWindowIncrease(capacity, state.receiveMSS))
 				if window > state.lastAdvertisedWindow {
 					ackNow = state.scheduleACK(state.lastAdvertisedWindow == 0, false, now) || ackNow
 				}
@@ -9122,7 +9250,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						}
 					}
 					if !state.remoteFINReceived {
-						_, closed := c.receiveTCPData(segment.sequence, segment.payload, fin, receiveWindow, &state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
+						_, closed := c.receiveTCPData(segment.sequence, segment.payload, fin, receiveWindow, state.receiveWindowState.quantumReserve, &state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
 						advanced := state.receiveNext - previousReceiveNext
 						if closed && advanced != 0 {
 							advanced--
@@ -9136,7 +9264,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					if newPayloadData && c.applicationReceiveClosed() {
 						sequence := tcpAcceptableSendSequence(state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
-						window, _ := state.nextAdvertisedReceiveWindow()
+						window, _, _ := state.nextAdvertisedReceiveWindow()
 						_ = c.trySendSegment(sequence, state.receiveNext, TCPFlagRST|TCPFlagACK, window)
 						return net.ErrClosed
 					}
@@ -9396,7 +9524,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			err := c.abortedError()
 			if c.takeAbortReset() {
 				sequence := tcpAcceptableSendSequence(state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
-				window, _ := state.nextAdvertisedReceiveWindow()
+				window, _, _ := state.nextAdvertisedReceiveWindow()
 				_ = c.sendAbortReset(sequence, state.receiveNext, window)
 			}
 			return err
@@ -10660,7 +10788,12 @@ func applyTCPSACK(outstanding []sentTCPSegment, blocks []TCPSACKBlock, epoch tim
 			if tcpSequenceGreaterEqual(segment.sequence, block.LeftEdge) && tcpSequenceGreaterEqual(block.RightEdge, segment.end) {
 				if !segment.state.has(sentTCPSegmentSACKed) {
 					newInformation = true
-					newlySACKed = append(newlySACKed, *segment)
+					candidate := *segment
+					candidate.state.set(sentTCPSegmentSACKed, true)
+					// The delivery sample retains the original controller metadata;
+					// its SACKed state separately tells BBR3 not to use this
+					// generation as probe-loss evidence.
+					newlySACKed = append(newlySACKed, candidate)
 					latest = newerRACKSample(latest, tcpRACKSample{sentAt: segment.transmittedAt(epoch), end: segment.end, order: segment.transmissionOrder, timestamp: segment.timestamp, retransmitted: segment.isRetransmitted()})
 					// A range contributes delivery-rate metadata only on its first
 					// SACK or cumulative ACK, matching tcp_rate_skb_delivered.
@@ -11373,7 +11506,9 @@ func newRenoPartialACKWindow(window, acknowledged uint32, mss int) uint32 {
 }
 
 // receiveTCPData inserts one range and exposes all newly contiguous bytes.
-func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, receiveWindow uint32, receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
+// receiveExtra is the bounded remainder of the currently advertised scaled
+// window quantum; it is shared by the in-order and out-of-order paths.
+func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, receiveWindow uint32, receiveExtra uint16, receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
 	owner := payload
 	finSequence := sequence + uint32(len(payload))
 	if tcpSequenceLess(sequence, *receiveNext) {
@@ -11395,7 +11530,7 @@ func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, rece
 		if uint64(len(payload)) > uint64(receiveWindow) {
 			payload = payload[:receiveWindow]
 		}
-		accepted := c.appendReadBuffer(payload, owner, 0)
+		accepted := c.appendReadBuffer(payload, owner, 0, receiveExtra)
 		*receiveNext += uint32(accepted)
 		// FIN consumes one sequence number after its payload. A FIN-only segment
 		// stores no bytes, so an in-order FIN remains consumable at a zero window;
@@ -11408,15 +11543,17 @@ func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, rece
 		c.outOfOrderUnread.Store(0)
 		return accepted != 0 || closed, closed
 	}
-	if !c.storeTCPOutOfOrder(*receiveNext, receiveWindow, sequence, payload, owner, fin, outOfOrder, outOfOrderBytes) && tcpSequenceGreater(sequence, *receiveNext) {
+	if !c.storeTCPOutOfOrder(*receiveNext, receiveWindow, receiveExtra, sequence, payload, owner, fin, outOfOrder, outOfOrderBytes) && tcpSequenceGreater(sequence, *receiveNext) {
 		return false, false
 	}
-	return c.promoteTCPReceived(receiveNext, outOfOrder, outOfOrderBytes)
+	return c.promoteTCPReceived(receiveExtra, receiveNext, outOfOrder, outOfOrderBytes)
 }
 
 // promoteTCPReceived exposes queued bytes that became deliverable after either
 // a segment filled a sequence gap or the application reopened its window.
-func (c *TCPConn) promoteTCPReceived(receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
+// receiveExtra preserves the already advertised quantum remainder while the
+// queued ranges are promoted.
+func (c *TCPConn) promoteTCPReceived(receiveExtra uint16, receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
 	delivered, remoteClosed := false, false
 	for len(*outOfOrder) != 0 && !remoteClosed {
 		piece := (*outOfOrder)[0]
@@ -11438,7 +11575,7 @@ func (c *TCPConn) promoteTCPReceived(receiveNext *uint32, outOfOrder *[]tcpRecei
 				piece.fin = piece.fin && pieceFINSequence == *receiveNext
 			}
 		}
-		accepted := c.appendReadBuffer(piece.payload, owner, *outOfOrderBytes)
+		accepted := c.appendReadBuffer(piece.payload, owner, *outOfOrderBytes, receiveExtra)
 		*receiveNext += uint32(accepted)
 		delivered = delivered || accepted != 0
 		if accepted != len(piece.payload) {
@@ -11467,9 +11604,12 @@ type tcpDataFragment struct {
 }
 
 // storeTCPOutOfOrder retains only uncovered bytes within the receive window.
-func (c *TCPConn) storeTCPOutOfOrder(receiveNext, receiveWindow, sequence uint32, payload, owner []byte, fin bool, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) bool {
+// receiveExtra is the one-quantum remainder already promised on the wire and
+// does not permit a second window extension.
+func (c *TCPConn) storeTCPOutOfOrder(receiveNext, receiveWindow uint32, receiveExtra uint16, sequence uint32, payload, owner []byte, fin bool, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) bool {
 	distance := sequence - receiveNext
 	available := c.receiveAvailable(*outOfOrderBytes)
+	available += int(receiveExtra)
 	if available < 0 {
 		available = 0
 	}

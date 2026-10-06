@@ -608,6 +608,34 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 	}
 }
 
+func TestCongestionDeliverySamplePreservesSACKPacketState(t *testing.T) {
+	recorder := &congestionAPIRecorder{}
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name:     "delivery-state",
+		New:      func(CongestionControlContext) CongestionController { return recorder },
+		Features: CongestionControlFeatureDeliveryRate,
+	})
+	now := time.Unix(100, 0)
+	controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 40_000, 1000, 1)
+	segment := sentTCPSegment{
+		sequence: 1, end: 1001,
+		state:                 sentTCPSegmentTransmitted | sentTCPSegmentSACKed,
+		congestionPacketState: 0x1234,
+		hostQueue:             packetQueueTicket{queuedAt: 2},
+		delivery:              tcpDeliverySnapshot{firstSent: 1, deliveredStamp: 1, deliveredFlags: 100},
+	}
+	sample := new(tcpDeliveryRateSample)
+	sample.observe(segment)
+	controller.finishDeliveryRateSample(sample, 1000, 1000, 0, now.Add(time.Millisecond), 3, 0, time.Millisecond, 0, false)
+	controller.onDeliveryRateSample(20_000, 40_000, 1000, segment.end, sample)
+	if got := recorder.rateSample.PacketState(); got != 0x1234 {
+		t.Fatalf("delivery callback PacketState = %#x, want %#x", got, uint64(0x1234))
+	}
+	if recorder.rateSample.PacketLossEvidenceValid() {
+		t.Fatal("delivery callback restored loss evidence for a SACKed generation")
+	}
+}
+
 // TestSentTCPSegmentLayout locks the hot retransmission record and its compact
 // host-queue ticket to the intended 64-bit memory layout.
 func TestSentTCPSegmentLayout(t *testing.T) {
