@@ -5172,7 +5172,7 @@ func TestTCPRecoveryEventsUseLossObservationTime(t *testing.T) {
 				observation = time.Time{}
 			}
 			before := time.Now()
-			if index := state.prepareRetransmission(0, timeout, false, observation); index != 0 {
+			if index := state.prepareRetransmission(0, timeout, false, true, observation); index != 0 {
 				t.Fatalf("selected retransmission = %d, want 0", index)
 			}
 			after := time.Now()

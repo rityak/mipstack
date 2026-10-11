@@ -992,10 +992,13 @@ true, that transmission events were enabled, or that retransmission
 attribution is otherwise unambiguous.
 `CongestionControlFeatureLossEvents` additionally retains that value until the
 generation is proven lost and reports per-generation SACK, RACK, RTO, and
-tail-loss-probe recovery events. `CongestionRateSample.TailLossProbeACK`
-identifies the Linux-style ambiguous ACK that exactly covers a retransmitted
-TLP range, allowing a model to preserve delivery signals until later ACK or
-DSACK evidence resolves the loss.
+tail-loss-probe recovery events. On a packet-loss event,
+`CongestionEvent.PacketLossEvidenceValid` qualifies the saved `PacketState`:
+SACK-reneging recovery cannot attribute loss to that old generation, nor can
+a delivery-rate controller use a snapshot already consumed by SACK.
+`CongestionRateSample.TailLossProbeACK` identifies the Linux-style ambiguous
+ACK that exactly covers a retransmitted TLP range, allowing a model to preserve
+delivery signals until later ACK or DSACK evidence resolves the loss.
 `CongestionControlFeatureCustomRecovery` opts into PRR, recovery-window, and
 spurious-undo window decisions. Without it TCP applies its RFC recovery
 defaults without dispatching those detailed stages; checkpoint and undo

@@ -105,12 +105,12 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 	if localMSS < 1 {
 		return errors.New("mipstack: MTU is too small for TCP")
 	}
+	// RFC 7323 requires TSval to use the sender's current timestamp clock. Keep
+	// the cookie timestamp independent of the delayed input event time and
+	// preserve the existing ECN parity encoding while avoiding zero.
 	timestamp := stack.tcpTimestamp()
 	if options.timestamp {
-		timestamp &^= 1
-		if options.ecn {
-			timestamp |= 1
-		}
+		timestamp = synCookieTimestamp(timestamp, options.ecn)
 	}
 	var optionStorage [40]byte
 	advertisedScale := configuredScale
@@ -129,6 +129,21 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 	state.noteSYNCookie(period)
 	flowLabelSet := listener != nil && listener.options.flowLabel.set
 	return stack.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0, defaults.FlowLabel, flowLabelSet, outputFlowKey{})
+}
+
+// synCookieTimestamp encodes ECN in TSval's low bit without emitting zero.
+// RFC 7323 section 3.2 permits zero, but Linux's tcp_synack_options replaces
+// a first zero TSval with ~0U to avoid its initialization sentinel. Here the
+// low bit carries ECN, so the no-ECN fallback must be a nonzero even value.
+func synCookieTimestamp(raw uint32, ecn bool) uint32 {
+	timestamp := raw &^ 1
+	if ecn {
+		return timestamp | 1
+	}
+	if timestamp == 0 {
+		return 2
+	}
+	return timestamp
 }
 
 // validateSYNCookie authenticates a final ACK against the current or previous

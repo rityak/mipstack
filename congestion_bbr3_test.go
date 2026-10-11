@@ -1,8 +1,10 @@
 package mipstack
 
 import (
+	"bytes"
 	"context"
 	"net/netip"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +15,25 @@ type bbr3TailProbeRecorder struct {
 	seen      atomic.Bool
 	acks      atomic.Uint64
 	recovery  atomic.Uint64
+}
+
+type bbr3RenegingRecorder struct {
+	algorithm *bbr3CongestionControl
+	validLoss atomic.Uint64
+	staleLoss atomic.Uint64
+	lostBytes atomic.Uint64
+}
+
+func (r *bbr3RenegingRecorder) HandleCongestionEvent(event *CongestionEvent) {
+	if event.Type == CongestionEventPacketLost {
+		if event.PacketLossEvidenceValid {
+			r.validLoss.Add(1)
+		} else {
+			r.staleLoss.Add(1)
+		}
+		r.lostBytes.Add(uint64(event.PacketBytes))
+	}
+	r.algorithm.HandleCongestionEvent(event)
 }
 
 func (r *bbr3TailProbeRecorder) HandleCongestionEvent(event *CongestionEvent) {
@@ -186,7 +207,7 @@ func TestBBR3LossBoundsAndProbePrefix(t *testing.T) {
 	bbr.minimumRTT = 10 * time.Millisecond
 	state := CongestionState{CongestionWindow: 20_000, MaximumSegmentSize: mss, LostBytes: 500}
 	packetState := bbr3EncodePacketState(&CongestionState{BytesInFlight: 19_000}, mss)
-	event := CongestionEvent{Type: CongestionEventPacketLost, Time: now, State: &state, PacketBytes: mss, PacketState: packetState}
+	event := CongestionEvent{Type: CongestionEventPacketLost, Time: now, State: &state, PacketBytes: mss, PacketState: packetState, PacketLossEvidenceValid: true}
 	bbr.onPacketLost(&event)
 	if bbr.inflightHigh == 0 || bbr.inflightHigh >= 20_000 || bbr.probeSamples || bbr.probePhase != bbr3ProbeDown {
 		t.Fatalf("probe loss response = inflight_hi %d samples %t phase %s", bbr.inflightHigh, bbr.probeSamples, bbr.probePhase.String())
@@ -204,6 +225,254 @@ func TestBBR3LossBoundsAndProbePrefix(t *testing.T) {
 	if bbr.bandwidthLow != 800_000 || bbr.inflightLow != 16_000 {
 		t.Fatalf("lower bounds = %v/%d", bbr.bandwidthLow, bbr.inflightLow)
 	}
+}
+
+func TestBBR3RenegingLossDoesNotUseProbeEvidence(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	bbr := newBBR3CongestionControl()
+	bbr.mode, bbr.probePhase = bbrProbeBandwidth, bbr3ProbeUp
+	bbr.fullBandwidthReached, bbr.probeSamples = true, true
+	bbr.minimumRTT, bbr.minimumRTTStamp = 10*time.Millisecond, now
+	bbr.bandwidthHigh[1], bbr.probeStarted = 1_000_000, now
+	state := CongestionState{CongestionWindow: 20_000, MaximumSegmentSize: mss, LostBytes: 500}
+	event := CongestionEvent{
+		Type:                    CongestionEventPacketLost,
+		Time:                    now,
+		State:                   &state,
+		PacketBytes:             mss,
+		PacketState:             bbr3EncodePacketState(&CongestionState{BytesInFlight: 19_000}, mss),
+		PacketLossEvidenceValid: false,
+	}
+	bbr.onPacketLost(&event)
+	if !bbr.lossInRound || bbr.lost != state.LostBytes || !bbr.probeSamples || bbr.probePhase != bbr3ProbeUp || bbr.inflightHigh != 0 {
+		t.Fatalf("reneging loss feedback = lossInRound:%v samples:%v phase:%s inflight_hi:%d", bbr.lossInRound, bbr.probeSamples, bbr.probePhase.String(), bbr.inflightHigh)
+	}
+}
+
+func TestTCPBBR3SACKRenegingLossEvidence(t *testing.T) {
+	local, remote := netip.MustParseAddr("192.0.2.192"), netip.MustParseAddr("198.51.100.192")
+	link, stack := newTestStack(t, local, remote)
+	defer stack.Close()
+	recorder := &bbr3RenegingRecorder{algorithm: newBBR3CongestionControl()}
+	builtin, _ := registeredCongestionControlFactory(CongestionControlBBR3)
+	definition := builtin.definition
+	definition.Name = "BBRv3-reneging"
+	definition.New = func(CongestionControlContext) CongestionController { return recorder }
+	factory, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		TCP: TCPSocketDefaults{CongestionControlFactory: factory}}); err != nil {
+		t.Fatal(err)
+	}
+	link.mu.Lock()
+	link.echoTCP, link.sackTCP, link.sackReneging = true, true, true
+	link.dropTCPOrdinals = map[int]bool{1: true}
+	link.mu.Unlock()
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8103))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err = connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	writeAndReadTCPEcho(t, connection, make([]byte, 16*1024))
+	link.mu.Lock()
+	renege := !link.sackRenegingAt.IsZero()
+	link.mu.Unlock()
+	if !renege || recorder.staleLoss.Load() < 2 || recorder.validLoss.Load() == 0 || recorder.lostBytes.Load() == 0 {
+		t.Fatalf("reneging:%t stale-loss:%d ordinary-loss:%d bytes:%d", renege, recorder.staleLoss.Load(), recorder.validLoss.Load(), recorder.lostBytes.Load())
+	}
+	if undos := connection.(*TCPConn).Info().SpuriousRecoveryUndos; undos != 0 {
+		t.Fatalf("reneging produced %d spurious undos", undos)
+	}
+}
+
+// TestTCPBBR3SACKRenegingAfterHostQueueDeparture exercises the Linux-style
+// host-queue barrier around SACK reneging. The first loss waits for its
+// original packet to leave the device queue; the peer then reneges on the
+// second SACKed range, which must likewise wait for that original packet's
+// departure before publishing loss without stale probe evidence.
+func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	recorder := &bbr3RenegingRecorder{algorithm: newBBR3CongestionControl()}
+	builtin, _ := registeredCongestionControlFactory(CongestionControlBBR3)
+	definition := builtin.definition
+	definition.Name = "BBRv3-host-queue-reneging"
+	definition.New = func(CongestionControlContext) CongestionController { return recorder }
+	factory, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	info := connection.Info()
+	if info.CongestionControl != definition.Name {
+		t.Fatalf("congestion controller = %q, want %q", info.CongestionControl, definition.Name)
+	}
+
+	link.mu.Lock()
+	link.dropTCPOrdinals = map[int]bool{1: true}
+	link.sackReneging = true
+	link.mu.Unlock()
+
+	type queuedData struct {
+		raw      []byte
+		slot     uint16
+		sequence uint32
+	}
+	snapshotData := func() []queuedData {
+		scheduler := stack.outbound.scheduler
+		if scheduler == nil {
+			return nil
+		}
+		scheduler.mu.Lock()
+		defer scheduler.mu.Unlock()
+		packets := make([]queuedData, 0, scheduler.queued)
+		for slot := range scheduler.nodes {
+			entry := scheduler.nodes[slot].entry
+			if len(entry.packet) == 0 {
+				continue
+			}
+			packet, parseErr := ParseIPPacket(entry.packet)
+			if parseErr != nil || packet.Protocol != ProtocolTCP {
+				continue
+			}
+			segment, parseErr := packet.TCPSegment()
+			if parseErr != nil || len(segment.Payload) == 0 {
+				continue
+			}
+			packets = append(packets, queuedData{
+				raw: append([]byte(nil), entry.packet...), slot: uint16(slot), sequence: segment.SequenceNumber,
+			})
+		}
+		sort.Slice(packets, func(i, j int) bool {
+			return tcpSequenceLess(packets[i].sequence, packets[j].sequence)
+		})
+		return packets
+	}
+
+	payload := bytes.Repeat([]byte{0x7a}, 2*info.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("TCP Write = %d, %v", n, err)
+	}
+	var initial []queuedData
+	waitFor(t, time.Second, func() bool {
+		initial = snapshotData()
+		return len(initial) >= 2
+	})
+	first, second := initial[0], initial[1]
+	// Feed copies to the peer while retaining both queue-owned originals. This
+	// separates wire observation from device departure, as required by the
+	// host-queue loss rule.
+	if err = link.handleOutboundPacket(first.raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = link.handleOutboundPacket(second.raw); err != nil {
+		t.Fatal(err)
+	}
+	// Serialize the SACK before waiting for the loss timer. Both original
+	// transmissions remain owned by the host queue at this point.
+	_ = connection.Info()
+
+	findDepartureWaiter := func() *packetQueueDepartureWaiter {
+		waiters := stack.outbound.departureWaiters.Load()
+		if waiters == nil {
+			return nil
+		}
+		for index := range waiters.slots {
+			if waiter := waiters.slots[index].Load(); waiter != nil {
+				return waiter
+			}
+		}
+		return nil
+	}
+	var firstWaiter *packetQueueDepartureWaiter
+	waitFor(t, 2*info.RetransmissionTimeout+time.Second, func() bool {
+		firstWaiter = findDepartureWaiter()
+		return firstWaiter != nil
+	})
+	entry, available := stack.outbound.tryDequeue()
+	if !available || entry.slot != first.slot {
+		if available {
+			stack.outbound.release(entry)
+		}
+		t.Fatalf("first host-queue departure slot = %d/%t, want %d", entry.slot, available, first.slot)
+	}
+	firstWire := consumeTestPacket(&stack.outbound, entry)
+	firstPacket, err := ParseIPPacket(firstWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSegment, err := firstPacket.TCPSegment()
+	if err != nil || firstSegment.SequenceNumber != first.sequence {
+		t.Fatalf("departed first segment = %+v, %v", firstSegment, err)
+	}
+	var firstRetransmission queuedData
+	waitFor(t, time.Second, func() bool {
+		for _, packet := range snapshotData() {
+			if packet.sequence == first.sequence {
+				firstRetransmission = packet
+				return true
+			}
+		}
+		return false
+	})
+	if err = link.handleOutboundPacket(firstRetransmission.raw); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.Info()
+
+	var secondWaiter *packetQueueDepartureWaiter
+	waitFor(t, 2*info.RetransmissionTimeout+time.Second, func() bool {
+		secondWaiter = findDepartureWaiter()
+		return secondWaiter != nil && secondWaiter != firstWaiter
+	})
+	entry, available = stack.outbound.tryDequeue()
+	if !available || entry.slot != second.slot {
+		if available {
+			stack.outbound.release(entry)
+		}
+		t.Fatalf("second host-queue departure slot = %d/%t, want %d", entry.slot, available, second.slot)
+	}
+	secondWire := consumeTestPacket(&stack.outbound, entry)
+	secondPacket, err := ParseIPPacket(secondWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSegment, err := secondPacket.TCPSegment()
+	if err != nil || secondSegment.SequenceNumber != second.sequence {
+		t.Fatalf("departed second segment = %+v, %v", secondSegment, err)
+	}
+	waitFor(t, time.Second, func() bool { return recorder.staleLoss.Load() != 0 })
+	if recorder.validLoss.Load() == 0 {
+		t.Fatal("initial RACK loss did not retain valid evidence")
+	}
+	var secondRetransmission queuedData
+	waitFor(t, time.Second, func() bool {
+		for _, packet := range snapshotData() {
+			if packet.sequence == second.sequence {
+				secondRetransmission = packet
+				return true
+			}
+		}
+		return false
+	})
+	if err = link.handleOutboundPacket(secondRetransmission.raw); err != nil {
+		t.Fatal(err)
+	}
+	link.mu.Lock()
+	renege := !link.sackRenegingAt.IsZero()
+	link.mu.Unlock()
+	if !renege {
+		t.Fatal("SACK reneging was not observed")
+	}
+	_ = connection.Info()
 }
 
 func TestBBR3LossThresholdIsStrictlyAboveTwoPercent(t *testing.T) {

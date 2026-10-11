@@ -774,11 +774,16 @@ func (b *bbr3CongestionControl) lossesSince(packet bbr3PacketSnapshot) uint64 {
 	return uint64(uint32(b.lost) - packet.lost)
 }
 
-// onPacketLost incorporates one transmission generation proven lost.
+// onPacketLost incorporates one transmission generation accounted as lost.
 func (b *bbr3CongestionControl) onPacketLost(event *CongestionEvent) {
 	b.syncDeliveryState(event.State)
 	b.noteLossRound()
-	if event.PacketBytes <= 0 || !b.probeSamples {
+	// RFC 2018 section 8 permits a receiver to renege on SACKed data. RFC 2018
+	// section 5 and RFC 6675 section 5.1 therefore require recovery to stop
+	// trusting the discarded SACK scoreboard. Linux BBRv3 follows that rule by
+	// ignoring a loss snapshot whose delivered timestamp was consumed, while
+	// retaining the loss in transport accounting.
+	if !event.PacketLossEvidenceValid || event.PacketBytes <= 0 || !b.probeSamples {
 		return
 	}
 	packet := bbr3DecodePacketState(event.PacketState)

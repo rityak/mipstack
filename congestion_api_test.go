@@ -46,6 +46,7 @@ type congestionAPILossRecorder struct {
 	lostState     uint64
 	lostBytes     int
 	totalLost     uint64
+	lossEvidence  bool
 	tailRecovered bool
 	nextState     uint64
 }
@@ -112,6 +113,7 @@ func (c *congestionAPILossRecorder) HandleCongestionEvent(event *CongestionEvent
 		c.lostState = event.PacketState
 		c.lostBytes = event.PacketBytes
 		c.totalLost = event.State.LostBytes
+		c.lossEvidence = event.PacketLossEvidenceValid
 	case CongestionEventTailLossProbeRecovered:
 		c.tailRecovered = true
 	}
@@ -588,8 +590,8 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 	if segment.congestionPacketState != 1 {
 		t.Fatalf("original packet state = %d, want 1", segment.congestionPacketState)
 	}
-	controller.notePacketLoss(&segment, 1000, false, now.Add(time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
-	if recorder.lostState != 1 || recorder.lostBytes != 1000 || recorder.totalLost != 1000 {
+	controller.notePacketLoss(&segment, 1000, false, true, now.Add(time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lostState != 1 || recorder.lostBytes != 1000 || recorder.totalLost != 1000 || !recorder.lossEvidence {
 		t.Fatalf("first loss = state %d bytes %d total %d", recorder.lostState, recorder.lostBytes, recorder.totalLost)
 	}
 	segment.congestionPacketState = 0
@@ -598,13 +600,55 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 	if segment.congestionPacketState != 2 {
 		t.Fatalf("retransmission packet state = %d, want 2", segment.congestionPacketState)
 	}
-	controller.notePacketLoss(&segment, 1000, true, now.Add(2*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
-	if recorder.lostState != 2 || recorder.totalLost != 2000 {
+	controller.notePacketLoss(&segment, 1000, true, true, now.Add(2*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lostState != 2 || recorder.totalLost != 2000 || !recorder.lossEvidence {
 		t.Fatalf("retransmission loss = state %d total %d", recorder.lostState, recorder.totalLost)
+	}
+	renege := sentTCPSegment{sequence: 2001, end: 3001, congestionPacketState: 3}
+	controller.notePacketLoss(&renege, 1000, false, false, now.Add(3*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lossEvidence || recorder.lostState != 3 || recorder.lostBytes != 1000 || recorder.totalLost != 3000 {
+		t.Fatalf("reneging loss = state:%d bytes:%d total:%d evidence:%t", recorder.lostState, recorder.lostBytes, recorder.totalLost, recorder.lossEvidence)
 	}
 	controller.onTailLossProbeRecovered(now.Add(3*time.Millisecond), 1000, segment.congestionPacketState, 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
 	if !recorder.tailRecovered {
 		t.Fatal("tail-loss-probe recovery event was not delivered")
+	}
+}
+
+func TestCongestionLossEvidenceAfterSACKReneging(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	for _, duringACK := range []bool{false, true} {
+		t.Run(fmt.Sprintf("during-ACK-%t", duringACK), func(t *testing.T) {
+			recorder := new(congestionAPILossRecorder)
+			controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+				Name: "reneged-transmission", New: func(CongestionControlContext) CongestionController { return recorder },
+				Features: CongestionControlFeatureDeliveryRate | CongestionControlFeatureTransmissionEvents | CongestionControlFeatureLossEvents,
+			})
+			controller.initialize(now, time.Millisecond, time.Millisecond, 20_000, 40_000, mss, 1)
+			snapshot, _ := controller.onDataSend(mss, mss, now, 1, 0, 20_000, 0, time.Millisecond, 40_000)
+			segment := sentTCPSegment{sequence: 100, end: 100 + mss, state: sentTCPSegmentTransmitted,
+				delivery: snapshot, congestionPacketState: controller.transmissionState()}
+			outstanding, _, _, _, _, _ := applyTCPSACK([]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 100 + mss}}, now)
+			segment = outstanding[0]
+			if segment.delivery.deliveredStamp != 0 {
+				t.Fatal("SACK did not consume the delivery snapshot")
+			}
+			// Once reneging clears the scoreboard, a later ordinary RTO or RACK
+			// loss must still reject this old generation's loss snapshot.
+			segment.state.set(sentTCPSegmentSACKed, false)
+			controller.notePacketLoss(&segment, recordTCPSegmentLoss(&segment, true), duringACK, true, now.Add(time.Millisecond), 20_000, 40_000, mss, mss, time.Millisecond)
+			if recorder.lossEvidence || recorder.lostState != 1 || recorder.totalLost != mss {
+				t.Fatalf("old generation = evidence:%t state:%d lost:%d", recorder.lossEvidence, recorder.lostState, recorder.totalLost)
+			}
+			segment.advanceTransmissionGeneration()
+			segment.delivery = controller.onRetransmit(mss, mss, now.Add(2*time.Millisecond), monotonicStamp(2*time.Millisecond)+1, 20_000, mss, mss, time.Millisecond, 40_000)
+			segment.congestionPacketState = controller.transmissionState()
+			controller.notePacketLoss(&segment, recordTCPSegmentLoss(&segment, true), duringACK, true, now.Add(3*time.Millisecond), 20_000, 40_000, mss, mss, time.Millisecond)
+			if !recorder.lossEvidence || recorder.lostState != 2 || recorder.totalLost != 2*mss {
+				t.Fatalf("new generation = evidence:%t state:%d lost:%d", recorder.lossEvidence, recorder.lostState, recorder.totalLost)
+			}
+		})
 	}
 }
 
@@ -666,6 +710,19 @@ func TestSentTCPSegmentLayout(t *testing.T) {
 	}
 	if offset := unsafe.Offsetof(segment.transmissionOrder); offset != 60 {
 		t.Fatalf("transmission order offset = %d, want 60", offset)
+	}
+}
+
+func TestCongestionEventLayout(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit layout assertion")
+	}
+	event := CongestionEvent{}
+	if size := unsafe.Sizeof(event); size != 216 {
+		t.Fatalf("CongestionEvent size = %d, want 216", size)
+	}
+	if offset, mark := unsafe.Offsetof(event.PacketLossEvidenceValid), unsafe.Offsetof(event.MarkApplicationLimited); offset != mark+1 {
+		t.Fatalf("loss-evidence flag offset = %d, want immediately after application-limited flag at %d", offset, mark)
 	}
 }
 

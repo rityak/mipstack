@@ -69,6 +69,9 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	if !timestampPresent {
 		t.Fatal("SYN cookie did not preserve timestamp negotiation")
 	}
+	if serverTimestamp == 0 {
+		t.Fatal("SYN cookie emitted a zero TSval")
+	}
 	stack.mu.RLock()
 	connectionsBeforeACK := len(stack.tcp)
 	stack.mu.RUnlock()
@@ -616,12 +619,6 @@ func TestSYNCookieZeroTimestampEcho(t *testing.T) {
 			syn.setOptions(append([]byte{TCPHeaderOptionMSS, 4, 0x05, 0xb4, TCPHeaderOptionSACKPermitted, 2,
 				TCPHeaderOptionNOP, TCPHeaderOptionWindowScale, 3, 7}, tcpTimestampOptions(700, 0)...))
 			cookieOptions, data := encodeSYNCookieOptions(syn, key.remote.Addr())
-			var optionStorage [40]byte
-			wireOptions := tcpPassiveSYNOptions(optionStorage[:0], 1440, cookieOptions.sack, cookieOptions.windowScaling, cookieOptions.timestamp, 7, 0, cookieOptions.timestampNow)
-			wireTimestamp, wireEcho, wirePresent := parseTCPTimestamp(wireOptions)
-			if !wirePresent || wireTimestamp != 0 || wireEcho != cookieOptions.timestampNow {
-				t.Fatalf("zero-valued cookie SYN-ACK timestamp = %d/%d/%v", wireTimestamp, wireEcho, wirePresent)
-			}
 			period := synCookiePeriodNumber(now, state.cookieEpoch)
 			cookie := synCookieSequence(state.cookieKey, key, 0, syn.sequence, period, data,
 				synCookieAuthenticatedData(data, cookieOptions.timestamp, cookieOptions.ecn))
@@ -637,6 +634,95 @@ func TestSYNCookieZeroTimestampEcho(t *testing.T) {
 				t.Fatalf("zero-TSecr cookie options = timestamp:%v/%d ecn:%v sack:%v scale:%d/%v",
 					options.timestamp, options.timestampNow, options.ecn, options.sack,
 					options.windowScale, options.windowScaling)
+			}
+		})
+	}
+}
+
+func TestSYNCookieTimestampAvoidsZero(t *testing.T) {
+	for _, test := range []struct {
+		raw  uint32
+		ecn  bool
+		want uint32
+	}{
+		{raw: 0, want: 2},
+		{raw: 1, want: 2},
+		{raw: 2, want: 2},
+		{raw: 3, want: 2},
+		{raw: 0, ecn: true, want: 1},
+		{raw: 1, ecn: true, want: 1},
+		{raw: 2, ecn: true, want: 3},
+		{raw: 3, ecn: true, want: 3},
+		{raw: ^uint32(0) - 1, want: ^uint32(0) - 1},
+		{raw: ^uint32(0) - 1, ecn: true, want: ^uint32(0)},
+		{raw: ^uint32(0), want: ^uint32(0) - 1},
+		{raw: ^uint32(0), ecn: true, want: ^uint32(0)},
+	} {
+		if got := synCookieTimestamp(test.raw, test.ecn); got != test.want || got == 0 || (got&1 != 0) != test.ecn {
+			t.Errorf("synCookieTimestamp(%#x, %t) = %#x, want %#x", test.raw, test.ecn, got, test.want)
+		}
+	}
+}
+
+// TestSYNCookieWireTimestamp exercises the packet builder for both address
+// families and ECN states, preserving the peer Timestamp echo. Boundary and
+// wraparound values are covered directly by TestSYNCookieTimestampAvoidsZero.
+func TestSYNCookieWireTimestamp(t *testing.T) {
+	for _, family := range []struct{ name, local, remote string }{
+		{"IPv4", "192.0.2.75", "198.51.100.75"},
+		{"IPv6", "2001:db8::75", "2001:db8:1::75"},
+	} {
+		t.Run(family.name, func(t *testing.T) {
+			local, remote := netip.MustParseAddr(family.local), netip.MustParseAddr(family.remote)
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			key := tcpKey{local: netip.AddrPortFrom(local, 443), remote: netip.AddrPortFrom(remote, 50000)}
+			for _, ecn := range []bool{false, true} {
+				t.Run(fmt.Sprintf("ECN-%t", ecn), func(t *testing.T) {
+					now := time.Now()
+					state := &tcpPassiveState{}
+					syn := tcpSegment{sequence: 100, flags: TCPFlagSYN, window: 65535}
+					if ecn {
+						syn.flags |= TCPFlagECE | TCPFlagCWR
+					}
+					options := []byte{TCPHeaderOptionMSS, 4, 0x05, 0xb4, TCPHeaderOptionSACKPermitted, 2,
+						TCPHeaderOptionNOP, TCPHeaderOptionWindowScale, 3, 7}
+					syn.setOptions(append(options, tcpTimestampOptions(700, 0)...))
+					if err := state.sendSYNCookie(stack, nil, key, syn, now); err != nil {
+						t.Fatal(err)
+					}
+					packet, err := ParseIPPacket(readOutboundPacket(t, stack))
+					if err != nil {
+						t.Fatal(err)
+					}
+					wire, err := packet.TCPSegment()
+					if err != nil {
+						t.Fatal(err)
+					}
+					value, echo, present := parseTCPTimestamp(wire.Options)
+					if !present || value == 0 || (value&1 != 0) != ecn || echo != 700 {
+						t.Fatalf("SYN-cookie Timestamp = %d/%d/%t, ECN:%t", value, echo, present, ecn)
+					}
+					ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: wire.SequenceNumber + 1, flags: TCPFlagACK, window: 4096}
+					ack.setOptions(tcpTimestampOptions(701, value))
+					_, recovered, valid, attempted := state.validateSYNCookie(key, ack, now, nil)
+					if !attempted || !valid || !recovered.timestamp || recovered.ecn != ecn ||
+						!recovered.sack || !recovered.windowScaling || recovered.windowScale != 7 {
+						t.Fatalf("SYN-cookie recovery = valid:%t attempted:%t options:%+v", valid, attempted, recovered)
+					}
+					// A middlebox may still clear TSecr despite a nonzero wire TSval.
+					ack.setOptions(tcpTimestampOptions(701, 0))
+					_, zeroEcho, valid, _ := state.validateSYNCookie(key, ack, now, nil)
+					if !valid || zeroEcho != recovered {
+						t.Fatalf("zero-TSecr recovery = valid:%t options:%+v, want %+v", valid, zeroEcho, recovered)
+					}
+				})
 			}
 		})
 	}

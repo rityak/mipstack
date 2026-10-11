@@ -465,10 +465,11 @@ func (c *tcpCongestionController) noteLoss(bytes uint32, duringACK bool) {
 	}
 }
 
-// notePacketLoss records one newly proven transmission generation and, when
-// requested, returns the controller-owned state captured for that generation.
-// The event follows delivery accounting so State.LostBytes includes this loss.
-func (c *tcpCongestionController) notePacketLoss(segment *sentTCPSegment, bytes uint32, duringACK bool, now time.Time, window, slowStartThreshold, flight uint32, mss int, smoothedRTT time.Duration) {
+// notePacketLoss accounts one loss generation and publishes its controller
+// event. The event follows delivery accounting so State.LostBytes includes
+// the loss; its evidence flag reports whether the generation snapshot remains
+// usable for attribution.
+func (c *tcpCongestionController) notePacketLoss(segment *sentTCPSegment, bytes uint32, duringACK, lossEvidenceValid bool, now time.Time, window, slowStartThreshold, flight uint32, mss int, smoothedRTT time.Duration) {
 	if bytes == 0 {
 		return
 	}
@@ -479,8 +480,15 @@ func (c *tcpCongestionController) notePacketLoss(segment *sentTCPSegment, bytes 
 	c.syncTransportState(window, slowStartThreshold, flight, mss, smoothedRTT)
 	event := c.prepareEvent(CongestionEventPacketLost, now)
 	event.PacketBytes = int(bytes)
+	event.PacketLossEvidenceValid = lossEvidenceValid
 	if segment != nil {
 		event.PacketState = segment.congestionPacketState
+		// Linux BBRv3's skb_marked_lost also rejects a cleared delivered_mstamp.
+		// SACK consumes this snapshot before reneging clears the scoreboard;
+		// only publishing a new transmission can restore its loss evidence.
+		if c.usesDeliveryRate() && segment.delivery.deliveredStamp == 0 {
+			event.PacketLossEvidenceValid = false
+		}
 	}
 	c.handleEvent()
 }

@@ -673,11 +673,15 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 						},
 						mipstackToGVisor: func(packet []byte) bool {
 							tcpHeader, _, ok := tcpSegment(packet)
-							if !scenario.stripSYN || !ok || tcpHeader.DestinationPort() != secondClientPort || !tcpHeader.Flags().Contains(header.TCPFlagSyn|header.TCPFlagAck) {
+							if !ok || tcpHeader.DestinationPort() != secondClientPort || !tcpHeader.Flags().Contains(header.TCPFlagSyn|header.TCPFlagAck) {
 								return true
 							}
 							options := header.ParseSynOptions(tcpHeader.Options(), true)
-							if options.TS || options.WS != -1 || options.SACKPermitted {
+							if scenario.stripSYN {
+								if options.TS || options.WS != -1 || options.SACKPermitted {
+									cookieSYNACKInvalid.Store(true)
+								}
+							} else if !options.TS || options.TSVal == 0 {
 								cookieSYNACKInvalid.Store(true)
 							}
 							cookieSYNACKChecked.Store(true)
@@ -733,8 +737,8 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					if !rewrittenHandshake.Load() {
 						t.Fatalf("SYN-cookie handshake was not rewritten for %s", scenario.name)
 					}
-					if scenario.stripSYN && (!cookieSYNACKChecked.Load() || cookieSYNACKInvalid.Load()) {
-						t.Fatal("cookie SYN-ACK negotiated SACK, window scaling or Timestamp without a timestamped SYN")
+					if !cookieSYNACKChecked.Load() || cookieSYNACKInvalid.Load() {
+						t.Fatalf("invalid cookie SYN-ACK options for %s", scenario.name)
 					}
 					accepted, err := listener.Accept()
 					if err != nil {
