@@ -858,11 +858,11 @@ func (s *datagramSocketErrorState) rearmPending() {
 
 // readMessage consumes one error into its public scatter/gather form after
 // successful validation and ancillary-data conversion.
-func (s *datagramSocketErrorState) readMessage(message *SocketMessage, flags int) (bool, error) {
+func (s *datagramSocketErrorState) readMessage(message *SocketMessage) (bool, error) {
 	if s == nil {
 		return false, nil
 	}
-	size, ok, err := readSocketErrorMessage(&s.queue, message, flags)
+	size, ok, err := readSocketErrorMessage(&s.queue, message)
 	if ok && err == nil {
 		s.queuedBytes -= size
 		s.rearmPending()
@@ -950,6 +950,61 @@ func copyMessageBuffers(destination []byte, buffers [][]byte) int {
 	return written
 }
 
+// copyLinuxControlMessages copies Linux ancillary records while preserving
+// each record's cmsghdr framing. A complete destination uses the existing
+// single-copy fast path. A short destination retains a complete header and
+// the payload prefix that fits; Linux reports MSG_CTRUNC only when a payload
+// is cut or another record cannot start, not merely when final padding is
+// absent.
+func copyLinuxControlMessages(destination, control []byte) (int, bool) {
+	if len(destination) >= len(control) {
+		return copy(destination, control), false
+	}
+	written := 0
+	for len(control) != 0 {
+		remaining := len(destination) - written
+		if remaining < linuxControlHeaderSize {
+			return written, true
+		}
+		if len(control) < linuxControlHeaderSize {
+			copy(destination[written:], control[:remaining])
+			return len(destination), true
+		}
+		length64 := binary.LittleEndian.Uint64(control[:8])
+		if length64 < linuxControlHeaderSize || length64 > uint64(len(control)) {
+			copy(destination[written:], control[:remaining])
+			return len(destination), true
+		}
+		length := int(length64)
+		space := (length + linuxControlAlignment - 1) &^ (linuxControlAlignment - 1)
+		if space > len(control) {
+			space = len(control)
+		}
+		copyLength := space
+		if copyLength > remaining {
+			copyLength = remaining
+		}
+		copy(destination[written:written+copyLength], control[:copyLength])
+		if copyLength < length {
+			// The header fits, but its cmsg_len must describe only the
+			// payload prefix copied to the caller.
+			binary.LittleEndian.PutUint64(destination[written:written+8], uint64(copyLength))
+			return written + copyLength, true
+		}
+		written += copyLength
+		if copyLength < space {
+			// Only alignment padding is missing. It is not a truncated
+			// payload, unless another record would also have needed space.
+			return written, len(control) > space
+		}
+		control = control[space:]
+		if len(control) != 0 && written == len(destination) {
+			return written, true
+		}
+	}
+	return written, false
+}
+
 // gatherMessagePayload returns the single supplied region directly and joins
 // a true scatter/gather message only when the existing transmit path requires
 // contiguous protocol payload bytes.
@@ -974,7 +1029,7 @@ func gatherMessagePayload(buffers [][]byte, maximum int) ([]byte, error) {
 
 // fillSocketErrorMessage copies one immutable error-queue entry into the
 // public scatter/gather representation.
-func fillSocketErrorMessage(message *SocketMessage, queued queuedSocketError, returnLength bool) error {
+func fillSocketErrorMessage(message *SocketMessage, queued queuedSocketError) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return err
 	}
@@ -983,16 +1038,15 @@ func fillSocketErrorMessage(message *SocketMessage, queued queuedSocketError, re
 		return err
 	}
 	copied := copyMessagePayload(message.Buffers, queued.payload)
+	// Linux's MSG_ERRQUEUE path reports the copied length; MSG_TRUNC only
+	// annotates the result instead of replacing N with the queued length.
 	n := copied
 	flags := MessageFlagErrorQueue
 	if copied < len(queued.payload) {
 		flags |= MessageFlagTruncated
-		if returnLength {
-			n = len(queued.payload)
-		}
 	}
-	oobn := copy(message.OOB, control)
-	if oobn < len(control) {
+	oobn, controlTruncated := copyLinuxControlMessages(message.OOB, control)
+	if controlTruncated {
 		flags |= MessageFlagControlTruncated
 	}
 	message.N, message.NN, message.Flags, message.Addr = n, oobn, flags, queued.err.Addr
@@ -1003,12 +1057,12 @@ func fillSocketErrorMessage(message *SocketMessage, queued queuedSocketError, re
 // only after every validation and ancillary-data conversion succeeds. Linux
 // MSG_ERRQUEUE ignores MSG_PEEK, so a successful read always removes the
 // error. The caller must hold the owning socket mutex for the complete call.
-func readSocketErrorMessage(queue *datagramQueue[queuedSocketError], message *SocketMessage, flags int) (size int, ok bool, err error) {
+func readSocketErrorMessage(queue *datagramQueue[queuedSocketError], message *SocketMessage) (size int, ok bool, err error) {
 	queued, ok := queue.peek()
 	if !ok {
 		return 0, false, nil
 	}
-	if err := fillSocketErrorMessage(message, queued, flags&MessageFlagTruncated != 0); err != nil {
+	if err := fillSocketErrorMessage(message, queued); err != nil {
 		return 0, true, err
 	}
 	consumed, popped := queue.pop()

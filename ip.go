@@ -850,8 +850,9 @@ func (c *IPConn) ReadMsgIP(buffer, oob []byte) (n, oobn, flags int, address *net
 		err = c.operationError("read", controlErr)
 		return
 	}
-	oobn = copy(oob, control)
-	if oobn < len(control) {
+	var controlTruncated bool
+	oobn, controlTruncated = copyLinuxControlMessages(oob, control)
+	if controlTruncated {
 		flags |= MessageFlagControlTruncated
 	}
 	return
@@ -867,7 +868,7 @@ func (c *IPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
 		return 0, c.operationError("read", syscall.EOPNOTSUPP)
 	}
 	if flags&MessageFlagErrorQueue != 0 {
-		return c.readErrorBatch(messages, flags)
+		return c.readErrorBatch(messages)
 	}
 	var network *networkState
 	for index := range messages {
@@ -886,8 +887,8 @@ func (c *IPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
 }
 
 // readBatchMessage receives one scatter/gather message without waiting when
-// wait is false. consumeErrors is false after a successful prefix so an
-// asynchronous error remains available to the next socket operation. network
+// wait is false. consumeErrors is false after a successful prefix; a pending
+// asynchronous error then stops the batch without consuming it. network
 // caches one immutable configuration snapshot for IPv4 packet-info fields.
 func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consumeErrors bool, network **networkState) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
@@ -912,8 +913,8 @@ func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consu
 	if truncated {
 		resultFlags |= MessageFlagTruncated
 	}
-	oobn := copy(message.OOB, control)
-	if oobn < len(control) {
+	oobn, controlTruncated := copyLinuxControlMessages(message.OOB, control)
+	if controlTruncated {
 		resultFlags |= MessageFlagControlTruncated
 	}
 	message.N, message.NN, message.Flags, message.Addr = n, oobn, resultFlags, ipNetAddr(datagram.source)
@@ -1043,6 +1044,13 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek
 				c.mu.Unlock()
 				return 0, ipDatagram{}, false, pending
 			}
+		} else if c.errorState != nil && c.errorState.pending != nil {
+			// Linux recvmmsg returns the completed prefix when the next
+			// message would report sk_err. Leave that error for the next
+			// operation instead of consuming it while stopping the batch.
+			pending := c.errorState.pending
+			c.mu.Unlock()
+			return 0, ipDatagram{}, false, pending
 		}
 		var queued ipDatagram
 		var ok bool
@@ -1097,7 +1105,7 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek
 
 // readErrorBatch consumes a prefix of the asynchronous error queue. Linux
 // MSG_ERRQUEUE is nonblocking regardless of socket deadlines or MSG_DONTWAIT.
-func (c *IPConn) readErrorBatch(messages []SocketMessage, flags int) (int, error) {
+func (c *IPConn) readErrorBatch(messages []SocketMessage) (int, error) {
 	for index := range messages {
 		c.mu.Lock()
 		select {
@@ -1109,7 +1117,7 @@ func (c *IPConn) readErrorBatch(messages []SocketMessage, flags int) (int, error
 			return 0, c.operationError("read", net.ErrClosed)
 		default:
 		}
-		ok, err := c.errorState.readMessage(&messages[index], flags)
+		ok, err := c.errorState.readMessage(&messages[index])
 		if !ok {
 			c.mu.Unlock()
 			if index != 0 {
@@ -1592,18 +1600,19 @@ func (c *IPConn) prepareWrite(target, packetInfoSource netip.Addr, options ipPac
 	if err = c.writeError(); err != nil {
 		return ipWriteParameters{}, err
 	}
-	options, pathMTUDiscovery, checksumOffset, receiveErrors, pendingErr := c.writeOptions(options, headerIncluded)
+	multicastTarget := target.IsMulticast()
+	options, pathMTUDiscovery, checksumOffset, receiveErrors, pendingErr := c.writeOptions(options, headerIncluded, multicastTarget)
 	if pendingErr != nil {
 		return ipWriteParameters{}, pendingErr
 	}
 	requestedSource := c.local
 	packetInfoSource = packetInfoSource.Unmap()
 	if packetInfoSource.IsValid() && !packetInfoSource.IsUnspecified() {
-		if !c.local.IsUnspecified() && packetInfoSource != c.local {
-			return ipWriteParameters{}, syscall.EADDRNOTAVAIL
-		}
 		requestedSource = packetInfoSource
 	}
+	// Linux permits IP_PKTINFO to select another valid local source even when
+	// the socket has a different concrete bound address; sourceForOutput still
+	// validates family, ownership, and route admission.
 	source, nonUnicast, err := c.stack.sourceForOutput(target, requestedSource)
 	if err != nil {
 		return ipWriteParameters{}, err
@@ -2371,9 +2380,9 @@ func (c *IPConn) deliverError(target netip.Addr, networkError ICMPError) {
 
 // writeOptions snapshots output policy under one lock. Linux header-included
 // raw sends consume sk_err during send-buffer allocation; payload sends do not.
-func (c *IPConn) writeOptions(options ipPacketOptions, headerIncluded bool) (ipPacketOptions, PathMTUDiscovery, int, bool, error) {
+func (c *IPConn) writeOptions(options ipPacketOptions, headerIncluded, multicast bool) (ipPacketOptions, PathMTUDiscovery, int, bool, error) {
 	c.mu.Lock()
-	options = options.withDefaults(c.defaultOptions)
+	options = options.withDefaults(c.defaultOptions, multicast)
 	pathMTUDiscovery := c.pathMTUDiscovery
 	checksumOffset := c.ipv6ChecksumOffset
 	receiveErrors := c.receiveErrors

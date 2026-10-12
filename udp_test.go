@@ -444,7 +444,7 @@ func TestUDPBatchRead(t *testing.T) {
 	if !bytes.Equal(messages[0].OOB[20:24], local.AsSlice()) || !bytes.Equal(messages[0].OOB[24:28], local.AsSlice()) {
 		t.Fatalf("first batch IPv4 packet-info fields = %x/%x, want %s", messages[0].OOB[20:24], messages[0].OOB[24:28], local)
 	}
-	if string(second) != "sec" || messages[1].N != 3 || messages[1].NN != len(messages[1].OOB) ||
+	if string(second) != "sec" || messages[1].N != 3 || messages[1].NN != 0 ||
 		messages[1].Flags != MessageFlagTruncated|MessageFlagControlTruncated {
 		t.Fatalf("second batch message = %+v payload %q", messages[1], second)
 	}
@@ -513,6 +513,56 @@ func TestUDPBatchRead(t *testing.T) {
 	}
 }
 
+func TestUDPBatchPreservesPendingErrorAfterPrefix(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.239")
+	remote := netip.MustParseAddr("198.51.100.239")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	netConnection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 5359))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := netConnection.(*UDPConn)
+	defer connection.Close()
+	localPort := connection.LocalAddr().(*net.UDPAddr).Port
+	for _, payload := range [][]byte{[]byte("prefix"), []byte("suffix")} {
+		if err = writeTestPacket(stack, buildTestUDP(remote, local, 5359, uint16(localPort), payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var network *networkState
+	first := SocketMessage{Buffers: [][]byte{make([]byte, 16)}}
+	if err = connection.readBatchMessage(&first, 0, true, true, &network); err != nil || first.N != len("prefix") {
+		t.Fatalf("prefix batch message = %+v, %v", first, err)
+	}
+	connection.deliverError(netip.AddrPortFrom(remote, 5359), ICMPError{Reporter: remote, Type: ICMPv4TypeDestinationUnreachable, Code: ICMPv4DestinationUnreachableCodePort})
+	connection.mu.Lock()
+	pending := connection.errorState.pending
+	connection.mu.Unlock()
+	if pending == nil {
+		t.Fatal("UDP batch pending error was not queued")
+	}
+	second := SocketMessage{Buffers: [][]byte{make([]byte, 16)}, N: 91, NN: 92, Flags: 93}
+	readErr := connection.readBatchMessage(&second, MessageFlagDontWait, false, false, &network)
+	var networkError ICMPError
+	if readErr != pending || !errors.As(readErr, &networkError) || second.N != 91 || second.NN != 92 || second.Flags != 93 {
+		t.Fatalf("pending error after batch prefix = %+v, %v", second, readErr)
+	}
+	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || !errors.As(readErr, &networkError) {
+		t.Fatalf("pending error was not deferred to next operation = %d, %v", count, readErr)
+	}
+	tail := make([]byte, 16)
+	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{tail}}}, MessageFlagDontWait); count != 1 || readErr != nil || string(tail[:len("suffix")]) != "suffix" {
+		t.Fatalf("suffix after deferred pending error = %d, %v, %q", count, readErr, tail)
+	}
+}
+
 func TestUDPBatchWrite(t *testing.T) {
 	firstLocal := netip.MustParseAddr("192.0.2.235")
 	secondLocal := netip.MustParseAddr("192.0.2.236")
@@ -558,11 +608,26 @@ func TestUDPBatchWrite(t *testing.T) {
 			t.Fatalf("batch result %d = %+v", index, messages[index])
 		}
 	}
+	var packet ipPacket
+	var ok bool
+	specificNet, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(firstLocal, 5341))
+	if err != nil {
+		t.Fatal(err)
+	}
+	specific := specificNet.(*UDPConn)
+	defer specific.Close()
+	if _, _, err = specific.WriteMsgUDPAddrPort([]byte("bound-source"), control, netip.AddrPortFrom(remote, 5352)); err != nil {
+		t.Fatalf("specific-bound packet-info source = %v", err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
+	if !ok || packet.source != secondLocal || string(packet.payload[udpHeaderSize:]) != "bound-source" {
+		t.Fatalf("specific-bound packet-info source = %s payload %q, want %s/bound-source", packet.source, packet.payload[udpHeaderSize:], secondLocal)
+	}
 	mixedControl := mustCodecVector(t, "1c00000000000000000000000800000000000000c00002ecc00002eb")
 	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("spec-dst"), mixedControl, netip.AddrPortFrom(remote, 5352)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != secondLocal || string(packet.payload[udpHeaderSize:]) != "spec-dst" {
 		t.Fatalf("mixed IPv4 packet-info source = %s payload %q, want %s/spec-dst", packet.source, packet.payload[udpHeaderSize:], secondLocal)
 	}
@@ -616,6 +681,37 @@ func TestUDPBatchWrite(t *testing.T) {
 	connectedMessage[0].Addr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5352))
 	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, net.ErrWriteToConnected) {
 		t.Fatalf("addressed connected WriteBatch = %d, %v", n, err)
+	}
+}
+
+func TestUDPIPv6PacketInfoSourceWithConcreteBind(t *testing.T) {
+	first := netip.MustParseAddr("2001:db8::114")
+	second := netip.MustParseAddr("2001:db8::115")
+	remote := netip.MustParseAddr("2001:db8:1::114")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(first, 128), netip.PrefixFrom(second, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	netConnection, err := stack.ListenUDP(context.Background(), "udp6", netip.AddrPortFrom(first, 5354))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := netConnection.(*UDPConn)
+	defer connection.Close()
+	control, err := (&IPv6ControlMessage{Src: second}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("bound-source-v6"), control, netip.AddrPortFrom(remote, 5355)); err != nil {
+		t.Fatalf("specific-bound IPv6 UDP packet-info source = %v", err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
+	if !ok || packet.source != second || string(packet.payload[udpHeaderSize:]) != "bound-source-v6" {
+		t.Fatalf("specific-bound IPv6 UDP packet-info source = %s payload %q, want %s/bound-source-v6", packet.source, packet.payload[udpHeaderSize:], second)
 	}
 }
 
@@ -1785,7 +1881,7 @@ func TestUDPMessageControlValidationAndWriteBuffer(t *testing.T) {
 	buffer := make([]byte, 16)
 	oob := make([]byte, 8)
 	_, oobn, flags, _, err := connection.ReadMsgUDPAddrPort(buffer, oob)
-	if err != nil || oobn != len(oob) || flags != MessageFlagControlTruncated {
+	if err != nil || oobn != 0 || flags != MessageFlagControlTruncated {
 		t.Fatalf("control truncation = oob %d flags %#x, %v", oobn, flags, err)
 	}
 	if err = connection.Close(); err != nil {
@@ -1853,6 +1949,25 @@ func TestUDPIPv6FlowLabelPolicy(t *testing.T) {
 	}
 	if label := writeAndLabel(nil); label != 0 {
 		t.Fatalf("explicit zero UDP flow label = %#x", label)
+	}
+	var flowInfo [4]byte
+	binary.BigEndian.PutUint32(flowInfo[:], 0x02e00001)
+	rawFlowInfo := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, flowInfo[:])
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("flow"), rawFlowInfo, target); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
+	if !ok || packet.flowLabel != 1 || packet.trafficClass != 0 {
+		t.Fatalf("FLOWINFO changed wire traffic class = %#x label %#x", packet.trafficClass, packet.flowLabel)
+	}
+	sentinelOOB := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, -1)
+	sentinelOOB = appendLinuxControlInt32(sentinelOOB, linuxLevelIPv6, linuxIPv6TrafficClass, -1)
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("flow"), sentinelOOB, target); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
+	if !ok || packet.hopLimit != 64 || packet.trafficClass != 0 {
+		t.Fatalf("IPv6 default sentinels = hop %d class %#x", packet.hopLimit, packet.trafficClass)
 	}
 	if info := connection.Info(); info.FlowLabel != 0 {
 		t.Fatalf("UDP flow-label diagnostics = %+v", info)

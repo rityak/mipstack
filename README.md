@@ -800,16 +800,19 @@ and IP sockets retain no per-socket transmit queue, so `SetWriteBuffer` is a
 validated no-op and a write deadline is checked only before the attempt.
 
 UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
-`MessageFlagPeek` preserves a queued payload but consumes a pending socket error.
-Like Linux, a successful `MessageFlagErrorQueue` read consumes its queue entry
-and may rearm the ordinary error from the next entry. An error-queue read never
-blocks and returns the quoted failed payload, original destination in `Addr`,
-and a Linux `sock_extended_err` record in `OOB`.
+`MessageFlagPeek` preserves a queued payload but consumes a pending socket error
+when it is encountered as the first ordinary message. Like Linux, a successful
+`MessageFlagErrorQueue` read consumes its queue entry and may rearm the ordinary
+error from the next entry. An error-queue read never blocks and returns the
+quoted failed payload, original destination in `Addr`, and a Linux
+`sock_extended_err` record in `OOB`.
 `MessageFlagDontWait` makes the first batch read nonblocking. Writes are already
 nonblocking with respect to device capacity, so the flag is accepted without
 changing their admission result.
-`MessageFlagTruncated` requests the complete payload length and, along with
-`MessageFlagControlTruncated`, also reports output truncation. Source-fragmented
+`MessageFlagTruncated` requests the complete payload length for ordinary
+datagrams. Error-queue reads always report the copied payload length and use
+the flag only to indicate that the queued quote was longer. Along with
+`MessageFlagControlTruncated`, it reports output truncation. Source-fragmented
 external output admits fragments independently in wire order. Flow-aware
 overload can discard queued fragments like ordinary link loss, and a later
 admission failure leaves surviving fragments published. Local loopback output
@@ -877,16 +880,21 @@ on every host. `ReadMsgUDP` emits `IP_PKTINFO` or `IPV6_PKTINFO` for the packet
 destination plus TTL/Hop Limit and TOS/Traffic Class, with Linux
 `MSG_TRUNC`/`MSG_CTRUNC` flags. Passing that data to `WriteMsgUDP` selects the
 corresponding managed source and output header fields. IPv6 messages also
-carry Linux `IPV6_FLOWINFO`. `IPConn` uses the same ancillary representation.
+carry Linux `IPV6_FLOWINFO`; on writes this implementation follows the RFC 3542
+separation of the low 20-bit Flow Label from the wire Traffic Class. The wire
+Traffic Class is selected independently by `IPV6_TCLASS` or the socket default;
+`IPV6_FLOWINFO` does not override it. `IPConn` uses the same ancillary
+representation.
 
 `IPv4ControlMessage` and `IPv6ControlMessage` make that ancillary data
 structured rather than opaque. Their `Parse` methods decode OOB returned by a
 message read; their `Marshal` methods encode `Src`, TTL/Hop Limit, and
 TOS/Traffic Class for a message write. `IPv6ControlMessage` also exposes the
-20-bit Flow Label. `Dst` is populated while parsing. `IfIndex` is always zero
-because MIPS has one embedding link. For IPv4, `IPv4ControlMessage.Parse` obtains
-`Dst` from the IP header destination (`ipi_addr`), while `Marshal` uses `Src`
-for source selection (`ipi_spec_dst`).
+20-bit Flow Label; a Hop Limit or Traffic Class of `-1` emits the RFC 3542
+kernel-default sentinel. `Dst` is populated while parsing. `IfIndex` is always
+zero because MIPS has one embedding link. For IPv4, `IPv4ControlMessage.Parse`
+obtains `Dst` from the IP header destination (`ipi_addr`), while `Marshal`
+uses `Src` for source selection (`ipi_spec_dst`).
 
 `UDPConn.ReadBatch`/`WriteBatch` and `IPConn.ReadBatch`/`WriteBatch` use the
 same `SocketMessage` layout as `x/net/ipv4` and `x/net/ipv6`: `Buffers` contains
@@ -896,9 +904,10 @@ its first message and then drains only the currently ready prefix;
 `MessageFlagDontWait` makes the first read nonblocking.
 `MessageFlagTruncated` and `MessageFlagControlTruncated` name the fixed Linux
 result bits returned on every host. Batch operations follow Linux
-`recvmmsg`/`sendmmsg` successful-prefix semantics: an error after one or more
-completed messages is deferred until the caller retries the unprocessed
-suffix, whose result fields remain unchanged.
+`recvmmsg`/`sendmmsg` successful-prefix semantics: when a pending socket error
+follows one or more completed messages, the prefix is returned and the error is
+left for the next socket operation; unprocessed messages and their result
+fields remain unchanged.
 Batch writes accept `MessageFlagDontWait`; other nonzero write flags return
 `EOPNOTSUPP`.
 

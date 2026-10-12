@@ -1129,9 +1129,12 @@ type ipPacketOptions struct {
 	flowLabelSet    bool
 }
 
-// withDefaults fills output fields omitted by per-packet control data.
-func (o ipPacketOptions) withDefaults(defaults ipPacketOptions) ipPacketOptions {
-	if !o.hopLimitSet && o.hopLimit == 0 {
+// withDefaults fills output fields omitted by per-packet control data. Linux
+// keeps IP_MULTICAST_TTL independent from the unicast TTL, so a multicast
+// destination keeps the hop limit unset for its independent default; broadcast
+// uses the ordinary socket default.
+func (o ipPacketOptions) withDefaults(defaults ipPacketOptions, multicast bool) ipPacketOptions {
+	if !multicast && !o.hopLimitSet && o.hopLimit == 0 {
 		o.hopLimit, o.hopLimitSet = defaults.hopLimit, defaults.hopLimitSet
 	}
 	if !o.trafficClassSet && o.trafficClass == 0 {

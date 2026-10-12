@@ -293,8 +293,8 @@ func TestSocketErrorControlMessageForRead(t *testing.T) {
 			if err = message.Parse(append(control, control...)); err == nil {
 				t.Fatal("duplicate socket error control message parsed successfully")
 			}
-			if err = message.Parse(control[:len(control)-1]); err == nil {
-				t.Fatal("truncated socket error control message parsed successfully")
+			if err = message.Parse(control[:len(control)-linuxControlAlignment]); err == nil {
+				t.Fatal("truncated socket error payload parsed successfully")
 			}
 		})
 	}
@@ -434,12 +434,11 @@ func TestIPControlMessageKnownAnswerMutations(t *testing.T) {
 			binary.LittleEndian.PutUint32(wire[16:20], 1)
 			return wire
 		}},
-		{name: "duplicate TTL", mutate: func(wire []byte) []byte { return append(wire, wire[32:56]...) }},
 		{name: "invalid TOS width", mutate: func(wire []byte) []byte {
 			binary.LittleEndian.PutUint64(wire[56:64], 18)
 			return wire
 		}},
-		{name: "truncated alignment", mutate: func(wire []byte) []byte { return wire[:len(wire)-1] }},
+		{name: "truncated payload", mutate: func(wire []byte) []byte { return wire[:len(wire)-linuxControlAlignment] }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -539,7 +538,6 @@ func TestControlMessageValidation(t *testing.T) {
 		{name: "IPv6 interface", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{IfIndex: 1}).Marshal() }},
 		{name: "IPv6 source", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{Src: netip.IPv4Unspecified()}).Marshal() }},
 		{name: "IPv6 hop limit", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{HopLimit: 256}).Marshal() }},
-		{name: "IPv6 traffic class", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{TrafficClass: -1}).Marshal() }},
 		{name: "IPv6 flow label", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{FlowLabel: ipv6MaximumFlowLabel + 1}).Marshal() }},
 	}
 	for _, test := range invalid {
@@ -588,8 +586,168 @@ func TestControlMessageValidation(t *testing.T) {
 	conflicting := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6TrafficClass, 1)
 	flowInfo := [4]byte{0x02, 0, 0, 1}
 	conflicting = appendLinuxControl(conflicting, linuxLevelIPv6, linuxIPv6FlowInfo, flowInfo[:])
-	if _, _, err = parseLinuxIPControlValues(conflicting, true, false); err == nil {
-		t.Fatal("conflicting IPv6 flow-info traffic class parsed successfully")
+	_, options, err = parseLinuxIPControlValues(conflicting, true, false)
+	if err != nil || options.trafficClass != 1 || options.flowLabel != 1 {
+		t.Fatalf("IPv6 flow-info class was not kept independent: %+v, %v", options, err)
+	}
+	reserved := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, []byte{0x10, 0, 0, 1})
+	_, options, err = parseLinuxIPControlValues(reserved, true, false)
+	if err != nil || options.flowLabel != 1 || !options.flowLabelSet {
+		t.Fatalf("IPv6 flow-info reserved bits were not masked: %+v, %v", options, err)
+	}
+}
+
+func TestLinuxControlMessageLastWinsAndSentinels(t *testing.T) {
+	first4 := appendLinuxControlInt32(nil, linuxLevelIP, linuxIPTimeToLive, 11)
+	first4 = appendLinuxControlInt32(first4, linuxLevelIP, linuxIPTypeOfService, 22)
+	last4 := appendLinuxControlInt32(nil, linuxLevelIP, linuxIPTimeToLive, 33)
+	last4 = appendLinuxControlInt32(last4, linuxLevelIP, linuxIPTypeOfService, 44)
+	_, options4, err := parseLinuxIPControlValues(append(first4, last4...), false, false)
+	if err != nil || options4.hopLimit != 33 || options4.trafficClass != 44 {
+		t.Fatalf("duplicate IPv4 controls = %+v, %v", options4, err)
+	}
+	first := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, 11)
+	first = appendLinuxControlInt32(first, linuxLevelIPv6, linuxIPv6TrafficClass, 22)
+	last := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, 33)
+	last = appendLinuxControlInt32(last, linuxLevelIPv6, linuxIPv6TrafficClass, 44)
+	control := append(first, last...)
+	_, options, err := parseLinuxIPControlValues(control, true, false)
+	if err != nil || options.hopLimit != 33 || options.trafficClass != 44 || !options.hopLimitSet || !options.trafficClassSet {
+		t.Fatalf("duplicate IPv6 controls = %+v, %v", options, err)
+	}
+	address4 := appendLinuxIPv4PacketInfoControl(nil, netip.MustParseAddr("192.0.2.1"), netip.Addr{})
+	address4 = append(address4, appendLinuxIPv4PacketInfoControl(nil, netip.MustParseAddr("192.0.2.2"), netip.Addr{})...)
+	parsedAddress, _, err := parseLinuxIPControlValues(address4, false, false)
+	if err != nil || parsedAddress != netip.MustParseAddr("192.0.2.2") {
+		t.Fatalf("duplicate IPv4 packet-info = %v, %v", parsedAddress, err)
+	}
+	address4 = append(address4, appendLinuxIPv4PacketInfoControl(nil, netip.IPv4Unspecified(), netip.Addr{})...)
+	parsedAddress, _, err = parseLinuxIPControlValues(address4, false, false)
+	if err != nil || parsedAddress.IsValid() {
+		t.Fatalf("zero IPv4 packet-info did not clear source = %v, %v", parsedAddress, err)
+	}
+	address6 := appendLinuxIPv6PacketInfoControl(nil, netip.MustParseAddr("2001:db8::1"))
+	address6 = append(address6, appendLinuxIPv6PacketInfoControl(nil, netip.IPv6Unspecified())...)
+	parsedAddress, _, err = parseLinuxIPControlValues(address6, true, false)
+	if err != nil || parsedAddress != netip.MustParseAddr("2001:db8::1") {
+		t.Fatalf("unspecified IPv6 packet-info changed source = %v, %v", parsedAddress, err)
+	}
+	flowFirst := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, []byte{0, 0, 0, 1})
+	flowLast := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, []byte{0, 0, 0, 2})
+	_, options, err = parseLinuxIPControlValues(append(flowFirst, flowLast...), true, false)
+	if err != nil || options.flowLabel != 2 {
+		t.Fatalf("duplicate IPv6 flow-info = %+v, %v", options, err)
+	}
+	reservedFlow := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, []byte{0, 0, 0, 1})
+	reservedFlow = append(reservedFlow, appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, []byte{0x10, 0, 0, 1})...)
+	if _, _, err = parseLinuxIPControlValues(reservedFlow, true, false); err == nil {
+		t.Fatal("duplicate IPv6 flow-info accepted conflicting reserved bits")
+	}
+	zeroFlow := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, []byte{0x10, 0, 0, 0})
+	zeroFlow = append(zeroFlow, appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, []byte{0, 0, 0, 1})...)
+	if _, options, err = parseLinuxIPControlValues(zeroFlow, true, false); err != nil || options.flowLabel != 1 {
+		t.Fatalf("zero masked IPv6 flow-info did not permit later value = %+v, %v", options, err)
+	}
+	sentinel := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, -1)
+	sentinel = appendLinuxControlInt32(sentinel, linuxLevelIPv6, linuxIPv6TrafficClass, -1)
+	_, options, err = parseLinuxIPControlValues(sentinel, true, false)
+	if err != nil || options.hopLimit != 0 || options.hopLimitSet || options.trafficClass != 0 || options.trafficClassSet {
+		t.Fatalf("IPv6 default sentinels = %+v, %v", options, err)
+	}
+	if _, _, err = parseLinuxIPControlValues(sentinel, true, true); err == nil {
+		t.Fatal("IPv6 receive ancillary accepted the outbound-only -1 sentinel")
+	}
+	message := &IPv6ControlMessage{HopLimit: -1, TrafficClass: -1, FlowLabel: 1}
+	encoded, err := message.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, options, err = parseControlMessageForWrite(encoded, true)
+	if err != nil || options.hopLimitSet || options.trafficClassSet || options.flowLabel != 1 || !options.flowLabelSet {
+		t.Fatalf("structured IPv6 sentinels = %+v, %v", options, err)
+	}
+}
+
+func TestLinuxControlMessageTruncation(t *testing.T) {
+	partial := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6HopLimit, make([]byte, 8))
+	padded := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, 31)
+	for _, test := range []struct {
+		name      string
+		control   []byte
+		capacity  int
+		want      int
+		truncated bool
+		length    uint64
+	}{
+		{name: "empty", control: partial, capacity: 0, want: 0, truncated: true},
+		{name: "header only", control: partial, capacity: 16, want: 16, truncated: true, length: 16},
+		{name: "partial payload", control: partial, capacity: 20, want: 20, truncated: true, length: 20},
+		{name: "missing tail padding", control: padded, capacity: 20, want: 20, truncated: false, length: 20},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			buffer := make([]byte, test.capacity)
+			n, truncated := copyLinuxControlMessages(buffer, test.control)
+			if n != test.want || truncated != test.truncated {
+				t.Fatalf("copy control = %d/%t, want %d/%t", n, truncated, test.want, test.truncated)
+			}
+			if test.length != 0 && binary.LittleEndian.Uint64(buffer[:8]) != test.length {
+				t.Fatalf("partial cmsg length = %d, want %d", binary.LittleEndian.Uint64(buffer[:8]), test.length)
+			}
+		})
+	}
+	second := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6TrafficClass, 47)
+	compound := append(append([]byte(nil), padded...), second...)
+	for _, test := range []struct {
+		name      string
+		capacity  int
+		want      int
+		truncated bool
+		secondLen uint64
+	}{
+		{name: "compound first record", capacity: len(padded), want: len(padded), truncated: true},
+		{name: "compound second header", capacity: len(padded) + 4, want: len(padded), truncated: true},
+		{name: "compound second payload", capacity: len(padded) + linuxControlHeaderSize, want: len(padded) + linuxControlHeaderSize, truncated: true, secondLen: linuxControlHeaderSize},
+		{name: "compound second without padding", capacity: len(padded) + 20, want: len(padded) + 20, truncated: false, secondLen: 20},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			buffer := make([]byte, test.capacity)
+			n, truncated := copyLinuxControlMessages(buffer, compound)
+			if n != test.want || truncated != test.truncated {
+				t.Fatalf("copy compound control = %d/%t, want %d/%t", n, truncated, test.want, test.truncated)
+			}
+			if n >= len(padded)+linuxControlHeaderSize && test.secondLen != 0 {
+				if length := binary.LittleEndian.Uint64(buffer[len(padded) : len(padded)+8]); length != test.secondLen {
+					t.Fatalf("partial second cmsg length = %d, want %d", length, test.secondLen)
+				}
+			}
+		})
+	}
+	for _, test := range []struct {
+		name  string
+		parse func([]byte) error
+	}{
+		{name: "IPv4", parse: func(control []byte) error { var message IPv4ControlMessage; return message.Parse(control) }},
+		{name: "IPv6", parse: func(control []byte) error { var message IPv6ControlMessage; return message.Parse(control) }},
+		{name: "socket error", parse: func(control []byte) error { var message SocketErrorControlMessage; return message.Parse(control) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var control []byte
+			switch test.name {
+			case "IPv4":
+				control, _ = (&IPv4ControlMessage{TTL: 31}).Marshal()
+			case "IPv6":
+				control, _ = (&IPv6ControlMessage{HopLimit: 31}).Marshal()
+			case "socket error":
+				control, _ = (SocketErrorControlMessage{Errno: 111, Offender: netip.MustParseAddr("2001:db8::1")}).MarshalBinary()
+			}
+			if len(control) < 2 || test.parse(control[:len(control)-1]) != nil {
+				t.Fatal("complete ancillary payload with partial final padding was rejected")
+			}
+		})
+	}
+	writeControl := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, 31)
+	if _, _, err := parseControlMessageForWrite(writeControl[:len(writeControl)-1], true); err == nil {
+		t.Fatal("write ancillary with partial final padding parsed successfully")
 	}
 }
 

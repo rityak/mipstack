@@ -401,7 +401,7 @@ func TestSocketMessagePeekTruncationAndErrorQueue(t *testing.T) {
 	shortControl := make([]byte, 8)
 	short := []SocketMessage{{Buffers: [][]byte{shortPayload}, OOB: shortControl}}
 	if count, readErr := connection.ReadBatch(short, MessageFlagErrorQueue|MessageFlagPeek); readErr != nil || count != 1 || short[0].N != len(shortPayload) ||
-		short[0].NN != len(shortControl) || short[0].Flags != MessageFlagErrorQueue|MessageFlagTruncated|MessageFlagControlTruncated || !bytes.Equal(shortPayload, quotedPayload[:len(shortPayload)]) {
+		short[0].NN != 0 || short[0].Flags != MessageFlagErrorQueue|MessageFlagTruncated|MessageFlagControlTruncated || !bytes.Equal(shortPayload, quotedPayload[:len(shortPayload)]) {
 		t.Fatalf("short peek error-queue read = %d message %+v payload %q, %v", count, short[0], shortPayload, readErr)
 	}
 	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagErrorQueue); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
@@ -412,7 +412,7 @@ func TestSocketMessagePeekTruncationAndErrorQueue(t *testing.T) {
 	fullPayload := make([]byte, 2)
 	fullControl := make([]byte, 128)
 	full := []SocketMessage{{Buffers: [][]byte{fullPayload}, OOB: fullControl}}
-	if count, readErr := connection.ReadBatch(full, MessageFlagErrorQueue|MessageFlagTruncated); readErr != nil || count != 1 || full[0].N != len(quotedPayload) ||
+	if count, readErr := connection.ReadBatch(full, MessageFlagErrorQueue|MessageFlagTruncated); readErr != nil || count != 1 || full[0].N != len(fullPayload) ||
 		full[0].Flags != MessageFlagErrorQueue|MessageFlagTruncated || full[0].Addr.(*net.UDPAddr).AddrPort() != remote {
 		t.Fatalf("full-length error-queue read = %d message %+v, %v", count, full[0], readErr)
 	}
