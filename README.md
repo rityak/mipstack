@@ -1098,10 +1098,16 @@ TCP user timeout follows Linux `TCP_USER_TIMEOUT`: it applies only in
 synchronized states, returns `ETIMEDOUT`, does not change retransmission or
 keepalive probe timing, and bounds data that remains unacknowledged or unsent
 behind a zero window. Retransmission does not restart the absolute deadline.
-Consecutive unanswered zero-window probes have a bounded retry budget; current
-ACK responses keep an open connection alive even if the window remains closed.
-For an open connection, the final unanswered probe's response interval starts
-when its departure from the device-output queue is observed.
+With no outstanding data or FIN, consecutive unanswered zero-window probes have a
+bounded retry budget; for an open connection, the final probe's response interval starts when its
+departure from the device-output queue is observed. Already-transmitted data or FIN
+remains on the ordinary retransmission timer: current ACK responses keep an
+open connection alive even if the window remains closed, while silence is
+bounded by twice the maximum retransmission timeout unless a user timeout is
+configured. Full `Close` retains a finite retry budget in either case. Accepted
+old ACKs still deliver valid data and selective acknowledgements, but do not
+reset unanswered keepalive probes or consume ECN CWR feedback. New receive
+data postpones idle and keepalive checks even when it carries an old ACK.
 When keepalive is enabled, user timeout replaces the probe-count close policy
 and is checked before a subsequent probe, after at least one probe has been
 sent and its interval has elapsed.

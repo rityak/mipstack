@@ -69,8 +69,8 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	if !timestampPresent {
 		t.Fatal("SYN cookie did not preserve timestamp negotiation")
 	}
-	if serverTimestamp == 0 {
-		t.Fatal("SYN cookie emitted a zero TSval")
+	if serverTimestamp&1 == 0 {
+		t.Fatal("SYN cookie lost ECN timestamp parity")
 	}
 	stack.mu.RLock()
 	connectionsBeforeACK := len(stack.tcp)
@@ -639,34 +639,37 @@ func TestSYNCookieZeroTimestampEcho(t *testing.T) {
 	}
 }
 
-func TestSYNCookieTimestampAvoidsZero(t *testing.T) {
+func TestSYNCookieTimestampPreservesClockOrder(t *testing.T) {
 	for _, test := range []struct {
 		raw  uint32
 		ecn  bool
 		want uint32
 	}{
-		{raw: 0, want: 2},
-		{raw: 1, want: 2},
+		{raw: 0, want: 0},
+		{raw: 1, want: 0},
 		{raw: 2, want: 2},
 		{raw: 3, want: 2},
-		{raw: 0, ecn: true, want: 1},
+		{raw: 0, ecn: true, want: ^uint32(0)},
 		{raw: 1, ecn: true, want: 1},
-		{raw: 2, ecn: true, want: 3},
+		{raw: 2, ecn: true, want: 1},
 		{raw: 3, ecn: true, want: 3},
 		{raw: ^uint32(0) - 1, want: ^uint32(0) - 1},
-		{raw: ^uint32(0) - 1, ecn: true, want: ^uint32(0)},
+		{raw: ^uint32(0) - 1, ecn: true, want: ^uint32(0) - 2},
 		{raw: ^uint32(0), want: ^uint32(0) - 1},
 		{raw: ^uint32(0), ecn: true, want: ^uint32(0)},
 	} {
-		if got := synCookieTimestamp(test.raw, test.ecn); got != test.want || got == 0 || (got&1 != 0) != test.ecn {
+		if got := synCookieTimestamp(test.raw, test.ecn); got != test.want || (got&1 != 0) != test.ecn || tcpSequenceGreater(got, test.raw) {
 			t.Errorf("synCookieTimestamp(%#x, %t) = %#x, want %#x", test.raw, test.ecn, got, test.want)
+		}
+		if previous, next := synCookieTimestamp(test.raw, test.ecn), synCookieTimestamp(test.raw+1, test.ecn); tcpSequenceLess(next, previous) {
+			t.Errorf("SYN-cookie timestamp moved backward from %#x to %#x at clock %#x, ECN:%t", previous, next, test.raw, test.ecn)
 		}
 	}
 }
 
 // TestSYNCookieWireTimestamp exercises the packet builder for both address
 // families and ECN states, preserving the peer Timestamp echo. Boundary and
-// wraparound values are covered directly by TestSYNCookieTimestampAvoidsZero.
+// wraparound values are covered directly by TestSYNCookieTimestampPreservesClockOrder.
 func TestSYNCookieWireTimestamp(t *testing.T) {
 	for _, family := range []struct{ name, local, remote string }{
 		{"IPv4", "192.0.2.75", "198.51.100.75"},
@@ -706,7 +709,7 @@ func TestSYNCookieWireTimestamp(t *testing.T) {
 						t.Fatal(err)
 					}
 					value, echo, present := parseTCPTimestamp(wire.Options)
-					if !present || value == 0 || (value&1 != 0) != ecn || echo != 700 {
+					if !present || (value&1 != 0) != ecn || echo != 700 {
 						t.Fatalf("SYN-cookie Timestamp = %d/%d/%t, ECN:%t", value, echo, present, ecn)
 					}
 					ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: wire.SequenceNumber + 1, flags: TCPFlagACK, window: 4096}

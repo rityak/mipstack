@@ -140,8 +140,9 @@ const (
 	tcpSYNBacklog = 256
 	// tcpMaximumRTOs matches Linux's default tcp_retries2 budget for
 	// consecutive retransmission timeouts without cumulative acknowledgement
-	// progress, and bounds consecutive unanswered persist probes. Fast
-	// recovery, tail-loss probes, and PMTU resegmentation do not consume it.
+	// progress, and bounds consecutive unanswered pure-persist probes. Fast
+	// recovery, tail-loss probes, and PMTU resegmentation do not consume it;
+	// outstanding zero-window probes on an open socket use a silence bound.
 	tcpMaximumRTOs = 15
 	// tcpActiveSYNMaximumAttempts is the initial SYN plus Linux's default six
 	// active-open retransmissions.
@@ -162,6 +163,9 @@ const (
 	// It also satisfies RFC 6298's requirement that an optional cap be at
 	// least 60 seconds.
 	tcpMaximumRTO = 120 * time.Second
+	// tcpZeroWindowOutstandingTimeout is the default silence bound for an
+	// outstanding zero-window flight, as in Linux's tcp_rtx_probe0_timed_out.
+	tcpZeroWindowOutstandingTimeout = 2 * tcpMaximumRTO
 	// tcpDelayedACKTimeout bounds acknowledgement delay for in-order data and
 	// non-critical receive-window growth.
 	tcpDelayedACKTimeout = 25 * time.Millisecond
@@ -805,7 +809,7 @@ type TCPConnInfo struct {
 	KeepAlive bool
 	// KeepAliveConfig is the effective keepalive probe policy.
 	KeepAliveConfig KeepAliveConfig
-	// IdleTimeout is the configured bidirectional inactivity timeout.
+	// IdleTimeout is the configured receive-inactivity timeout.
 	IdleTimeout time.Duration
 	// UserTimeout is the configured TCP user timeout.
 	UserTimeout time.Duration
@@ -1909,9 +1913,9 @@ type tcpRACKSample struct {
 }
 
 // tcpEstablishedLivenessState holds state first needed by asynchronous
-// network errors, keepalive probing, or a zero-window user timeout. Keeping it
-// separate from path and recovery diagnostics avoids charging one cold event
-// for every unrelated optional field.
+// network errors, keepalive probing, or a pure-persist user timeout. Keeping
+// it separate from path and recovery diagnostics avoids charging one cold
+// event for every unrelated optional field.
 type tcpEstablishedLivenessState struct {
 	zeroWindowSince, lastKeepAlive time.Time
 	lastSoftError                  error
@@ -2006,11 +2010,12 @@ type tcpEstablishedState struct {
 	pacingDeadline                    time.Time
 	// deliverySample is allocated only for controllers that consume delivery
 	// rate samples; loss-based controllers leave it nil.
-	deliverySample          *tcpDeliveryRateSample
-	lastDataReceived        monotonicStamp
-	lastAdvertisedWindow    uint16
-	lastReceiveSegmentSize  uint16
-	receiveWindowState      tcpReceiveWindow
+	deliverySample         *tcpDeliveryRateSample
+	lastDataReceived       monotonicStamp
+	lastAdvertisedWindow   uint16
+	lastReceiveSegmentSize uint16
+	receiveWindowState     tcpReceiveWindow
+	// lastActivity starts at actor creation, then tracks accepted current ACKs.
 	lastActivity, eventTime time.Time
 	// sackWorkspace is allocated only when an ACK must encode SACK blocks.
 	sackWorkspace *[34]byte
@@ -2039,7 +2044,7 @@ type tcpEstablishedState struct {
 	liveness, pathMTUProbe, pacing                       bool
 	retransmissionKind                                   tcpRetransmissionKind
 	frtoState                                            tcpFRTOState
-	// persistUnanswered is reset by a current ACK, even with a zero window.
+	// persistUnanswered is reset by a current ACK while pure persist is active.
 	// persistClosed is a finite post-Close resource-reclamation budget; peer
 	// responses must not remove that independent bound.
 	persistUnanswered, persistClosed uint8
@@ -2578,13 +2583,11 @@ func (s *tcpEstablishedState) keepAliveEligible() bool {
 	return offset >= total && (!writeClosed || s.localFINSent)
 }
 
-// userTimeoutDeadline returns the oldest unacknowledged-data or zero-window
-// deadline. It allocates liveness state only when zero-window timing begins.
+// userTimeoutDeadline bounds outstanding sequence space by its send time or
+// unsent data by its pure-persist start. Only pure-persist timing needs lazy
+// liveness state.
 func (s *tcpEstablishedState) userTimeoutDeadline(now time.Time, timeout time.Duration) time.Time {
 	if timeout <= 0 {
-		if s.livenessState != nil {
-			s.livenessState.zeroWindowSince = time.Time{}
-		}
 		return time.Time{}
 	}
 	var oldest time.Time
@@ -2598,14 +2601,12 @@ func (s *tcpEstablishedState) userTimeoutDeadline(now time.Time, timeout time.Du
 	offset := int(s.sendNext - s.sendUnacknowledged)
 	total, writeClosed, _ := s.connection.sendState()
 	zeroWindowBlocked := s.peerWindow == 0 && (offset < total || writeClosed && !s.localFINSent)
-	if zeroWindowBlocked {
+	if zeroWindowBlocked && len(s.outstanding) == 0 {
 		liveness := s.ensureLivenessState()
 		if liveness.zeroWindowSince.IsZero() {
 			liveness.zeroWindowSince = now
 		}
-		if oldest.IsZero() || liveness.zeroWindowSince.Before(oldest) {
-			oldest = liveness.zeroWindowSince
-		}
+		oldest = liveness.zeroWindowSince
 	} else if s.livenessState != nil {
 		s.livenessState.zeroWindowSince = time.Time{}
 	}
@@ -2613,6 +2614,27 @@ func (s *tcpEstablishedState) userTimeoutDeadline(now time.Time, timeout time.Du
 		return time.Time{}
 	}
 	return oldest.Add(timeout)
+}
+
+// zeroWindowDeadline bounds an outstanding flight held by a zero receive
+// window. Linux's tcp_rtx_probe0_timed_out bounds both retransmission age and
+// time since the last current ACK. The oldest range's firstSent supplies the
+// transmission age here; TCP_USER_TIMEOUT ignores peer activity. Pure persist
+// uses its separate unsent-data clock.
+func (s *tcpEstablishedState) zeroWindowDeadline(userTimeout time.Duration) time.Time {
+	if s.peerWindow != 0 || len(s.outstanding) == 0 {
+		return time.Time{}
+	}
+	// Retransmissions preserve firstSent; cumulative ACK progress selects the
+	// next range's original publication time.
+	started := s.connection.stack.timestampEpoch.Add(s.outstanding[0].firstSent)
+	if userTimeout > 0 {
+		return started.Add(userTimeout)
+	}
+	if !s.lastActivity.IsZero() && s.lastActivity.After(started) {
+		started = s.lastActivity
+	}
+	return started.Add(tcpZeroWindowOutstandingTimeout)
 }
 
 // ageRACKReordering expires one persistence round of an enlarged RACK
@@ -2719,6 +2741,32 @@ func (s *tcpEstablishedState) observeReceivedData(receivedAt time.Time) {
 		s.replenishQuickACK(tcpMaximumQuickACKs)
 	}
 	s.lastDataReceived = stamp
+}
+
+// receiveActivityTime includes both current ACKs and data advancing RCV.NXT.
+// RFC 9293 section 3.8.4 forbids keepalive probes after recent data; Linux
+// likewise uses the later of rcv_tstamp and icsk_ack.lrcvtime, even when that
+// data carries an old ACK that does not reset the unanswered-probe count.
+func (s *tcpEstablishedState) receiveActivityTime() time.Time {
+	activity := s.lastActivity
+	if s.lastDataReceived != 0 {
+		if receivedAt := s.lastDataReceived.time(s.connection.stack.timestampEpoch); receivedAt.After(activity) {
+			activity = receivedAt
+		}
+	}
+	return activity
+}
+
+// keepAliveDeadline preserves the previous probe's response interval while
+// postponing the next idle check when newly received data keeps the peer active.
+func (s *tcpEstablishedState) keepAliveDeadline(activity time.Time, config KeepAliveConfig) time.Time {
+	deadline := activity.Add(config.Idle)
+	if s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
+		if probeDeadline := s.livenessState.lastKeepAlive.Add(config.Interval); probeDeadline.After(deadline) {
+			deadline = probeDeadline
+		}
+	}
+	return deadline
 }
 
 // observeDataECN records ECN-capable data and reports feedback that benefits
@@ -2850,9 +2898,9 @@ func (s *tcpEstablishedState) armPathMTUProbe() {
 }
 
 // armLiveness selects the earliest idle, user-timeout, zero-window, or
-// keepalive deadline without allocating state for inactive policies. A probe
-// waiting for output capacity retains only its terminal user-timeout deadline;
-// capacity notifications resume publication without periodic retries.
+// keepalive deadline without allocating state for inactive policies. A
+// keepalive probe waiting for capacity does not schedule publication retries;
+// independent idle and user-timeout deadlines remain active.
 func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 	s.liveness = false
 	s.livenessDeadline = time.Time{}
@@ -2860,9 +2908,13 @@ func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 		return
 	}
 	options := s.connection.socketOptions()
+	activity := s.lastActivity
+	if options.idleTimeout > 0 || options.keepAlive {
+		activity = s.receiveActivityTime()
+	}
 	var deadline time.Time
 	if options.idleTimeout > 0 {
-		deadline = s.lastActivity.Add(options.idleTimeout)
+		deadline = activity.Add(options.idleTimeout)
 	}
 	if options.userTimeout > 0 {
 		if userDeadline := s.userTimeoutDeadline(time.Now(), options.userTimeout); !userDeadline.IsZero() && (deadline.IsZero() || userDeadline.Before(deadline)) {
@@ -2871,22 +2923,29 @@ func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 	} else if s.livenessState != nil {
 		s.livenessState.zeroWindowSince = time.Time{}
 	}
+	// Linux bounds an outstanding zero-window flight by the later of its
+	// retransmission episode and the last accepted current ACK. Keep that
+	// terminal check on the liveness timer while the ordinary RTO remains the
+	// sole retransmission owner, including during device-queue waits.
+	if s.peerWindow == 0 && len(s.outstanding) != 0 {
+		zeroWindowDeadline := s.zeroWindowDeadline(options.userTimeout)
+		if deadline.IsZero() || zeroWindowDeadline.Before(deadline) {
+			deadline = zeroWindowDeadline
+		}
+	}
 	if !keepAliveOutputPending && options.keepAlive && s.keepAliveEligible() {
 		// Linux tcp_keepalive_timer tests TCP_USER_TIMEOUT at a due probe
 		// check, before transmission. A published probe therefore gets its
 		// full Interval even when the inactivity timeout has already elapsed.
-		keepAliveDeadline := s.lastActivity.Add(options.keepAliveConfig.Idle)
-		if s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
-			keepAliveDeadline = s.livenessState.lastKeepAlive.Add(options.keepAliveConfig.Interval)
-		}
+		keepAliveDeadline := s.keepAliveDeadline(activity, options.keepAliveConfig)
 		if deadline.IsZero() || keepAliveDeadline.Before(deadline) {
 			deadline = keepAliveDeadline
 		}
 	} else if keepAliveOutputPending && options.keepAlive && options.userTimeout > 0 && s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
 		// A blocked output queue must neither shorten the previous probe's
 		// Interval nor suppress the eventual timeout while capacity is absent.
-		keepAliveDeadline := s.livenessState.lastKeepAlive.Add(options.keepAliveConfig.Interval)
-		if userDeadline := s.lastActivity.Add(options.userTimeout); userDeadline.After(keepAliveDeadline) {
+		keepAliveDeadline := s.keepAliveDeadline(activity, options.keepAliveConfig)
+		if userDeadline := activity.Add(options.userTimeout); userDeadline.After(keepAliveDeadline) {
 			keepAliveDeadline = userDeadline
 		}
 		if deadline.IsZero() || keepAliveDeadline.Before(deadline) {
@@ -2905,6 +2964,7 @@ func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 // their zero values select the ranges' transmission clocks.
 func (s *tcpEstablishedState) selectRetransmission(rtoDeadline, probeBase, rackObservedAt time.Time) {
 	if len(s.outstanding) == 0 {
+		// RFC 6298 section 5.2 stops the loss timer when the flight drains.
 		s.retransmit = false
 		s.retransmissionDeadline = time.Time{}
 		s.retransmissionKind = tcpRetransmissionRTO
@@ -2922,14 +2982,16 @@ func (s *tcpEstablishedState) selectRetransmission(rtoDeadline, probeBase, rackO
 		rtoDeadline = s.outstanding[index].transmittedAt(s.connection.stack.timestampEpoch).Add(s.rtt.rto)
 	}
 	s.sendTimer.baseDeadline = rtoDeadline
-	if s.peerSACK && s.outstanding[0].state.has(sentTCPSegmentSACKed) {
+	// Linux keeps packets_out on the ordinary retransmission timer when SND.WND
+	// is zero. Evaluate the window condition when that RTO expires, without
+	// consuming the pure-persist budget; TLP, RACK, and SACK-reneging selection
+	// resume only after the window becomes usable.
+	if s.peerSACK && s.outstanding[0].state.has(sentTCPSegmentSACKed) && s.peerWindow != 0 {
 		s.armSACKReneging()
 		return
 	}
-	s.retransmit = false
-	s.retransmissionDeadline = time.Time{}
-	s.retransmissionKind = tcpRetransmissionRTO
 	deadline := rtoDeadline
+	kind := tcpRetransmissionRTO
 	haveSACKed := s.peerSACK && s.sackedRanges != 0
 	if s.peerSACK && s.peerWindow != 0 && s.ecnHoldUntil.IsZero() && !s.tailProbeActive && s.rtt.samples > s.tailProbeRTTSamples && !s.fastRecovery && !s.rtoRecovery && !haveSACKed {
 		probeIndex := len(s.outstanding) - 1
@@ -2939,25 +3001,47 @@ func (s *tcpEstablishedState) selectRetransmission(rtoDeadline, probeBase, rackO
 		probeDeadline := probeBase.Add(tailLossProbeDelay(s.rtt.srtt, s.rtt.rto, len(s.outstanding) == 1))
 		if probeDeadline.Before(deadline) {
 			deadline = probeDeadline
-			s.retransmissionKind = tcpRetransmissionProbe
+			kind = tcpRetransmissionProbe
 		}
 	}
-	if s.peerSACK && (haveSACKed || s.rackLatestDelivered.retransmitted) {
+	if s.peerSACK && (haveSACKed || s.rackLatestDelivered.retransmitted) && s.peerWindow != 0 {
 		if rackObservedAt.IsZero() {
 			rackObservedAt = time.Now()
 		}
 		if candidate, exists := s.rackDeadline(rackObservedAt, haveSACKed); exists && !candidate.After(deadline) {
 			deadline = candidate
-			s.retransmissionKind = tcpRetransmissionRACK
+			kind = tcpRetransmissionRACK
 		}
 	}
 	s.retransmit = true
 	s.retransmissionDeadline = deadline
+	s.retransmissionKind = kind
 }
 
 // armRetransmission selects timers from the current transmission clocks.
 func (s *tcpEstablishedState) armRetransmission() {
 	s.selectRetransmission(time.Time{}, time.Time{}, time.Time{})
+}
+
+// zeroWindowTimeoutError reports the terminal error for an outstanding flight
+// held by a zero receive window. Pure persist remains governed by its own
+// unanswered-probe budget; this check applies only to an outstanding flight.
+func (s *tcpEstablishedState) zeroWindowTimeoutError(now time.Time, userTimeout time.Duration) error {
+	if s.peerWindow != 0 || len(s.outstanding) == 0 {
+		return nil
+	}
+	deadline := s.zeroWindowDeadline(userTimeout)
+	if deadline.IsZero() || !now.After(deadline) {
+		return nil
+	}
+	if userTimeout > 0 {
+		return syscall.ETIMEDOUT
+	}
+	var softError error
+	if s.livenessState != nil {
+		softError = s.livenessState.lastSoftError
+	}
+	return tcpTimeoutError(softError)
 }
 
 // armRetransmissionAfterACK restarts RFC 6298 timing from actor processing
@@ -2979,7 +3063,7 @@ func (s *tcpEstablishedState) reselectRetransmission(observedAt time.Time) {
 		s.armRetransmission()
 		return
 	}
-	if s.peerSACK && s.outstanding[0].state.has(sentTCPSegmentSACKed) {
+	if s.peerSACK && s.outstanding[0].state.has(sentTCPSegmentSACKed) && s.peerWindow != 0 {
 		s.armSACKReneging()
 		return
 	}
@@ -2993,15 +3077,21 @@ func (s *tcpEstablishedState) reselectRetransmission(observedAt time.Time) {
 		s.sendTimer.baseDeadline = deadline
 	}
 	kind := tcpRetransmissionRTO
-	haveSACKed := s.peerSACK && s.sackedRanges != 0
-	if s.retransmit && s.retransmissionKind == tcpRetransmissionProbe && !haveSACKed && !s.retransmissionDeadline.IsZero() && s.retransmissionDeadline.Before(deadline) {
-		deadline = s.retransmissionDeadline
-		kind = tcpRetransmissionProbe
-	}
-	if s.peerSACK && (haveSACKed || s.rackLatestDelivered.retransmitted) {
-		if candidate, exists := s.rackDeadline(observedAt, haveSACKed); exists && !candidate.After(deadline) {
-			deadline = candidate
-			kind = tcpRetransmissionRACK
+	if s.peerWindow == 0 {
+		if s.retransmit && s.retransmissionKind == tcpRetransmissionRTO && s.retransmissionDeadline.IsZero() {
+			return
+		}
+	} else {
+		haveSACKed := s.peerSACK && s.sackedRanges != 0
+		if s.retransmit && s.retransmissionKind == tcpRetransmissionProbe && !haveSACKed && !s.retransmissionDeadline.IsZero() && s.retransmissionDeadline.Before(deadline) {
+			deadline = s.retransmissionDeadline
+			kind = tcpRetransmissionProbe
+		}
+		if s.peerSACK && (haveSACKed || s.rackLatestDelivered.retransmitted) {
+			if candidate, exists := s.rackDeadline(observedAt, haveSACKed); exists && !candidate.After(deadline) {
+				deadline = candidate
+				kind = tcpRetransmissionRACK
+			}
 		}
 	}
 	s.retransmit = true
@@ -3070,9 +3160,14 @@ func (s *tcpEstablishedState) armSACKReneging() {
 // reselect the timer from the current scoreboard instead of using a stale
 // range index.
 func (s *tcpEstablishedState) retransmissionTarget(kind tcpRetransmissionKind) int {
-	index := firstUnsackedSegment(s.outstanding)
+	// RFC 6298 section 5.4 and RFC 2018 section 5 require an RTO to retry
+	// the left edge even when SACKed. Contradictory SACK marks are cleared
+	// after this generation's host-queue wait, before timeout preparation.
+	index := 0
 	if kind == tcpRetransmissionProbe {
 		index = lastUnsackedSegment(s.outstanding)
+	} else if kind != tcpRetransmissionRTO {
+		index = firstUnsackedSegment(s.outstanding)
 	}
 	if index < 0 || index >= len(s.outstanding) {
 		s.armRetransmission()
@@ -3306,13 +3401,19 @@ func (s *tcpEstablishedState) ordinaryOutputKind() tcpOrdinaryOutputKind {
 // that may need publication or cleanup. It deliberately avoids scoreboard
 // scans so ordinary ACK processing can bypass the recovery drain cheaply.
 func (s *tcpEstablishedState) recoveryOutputPending() bool {
-	return (s.retransmit && s.retransmissionKind == tcpRetransmissionPathMTU) || s.rtoRecovery || s.fastRecovery || s.haveRACKLoss
+	// A zero window keeps outstanding data on the RTO path rather than generic
+	// congestion recovery. PMTU resegmentation retains its independent drain.
+	return (s.retransmit && s.retransmissionKind == tcpRetransmissionPathMTU) ||
+		(s.rtoRecovery || s.fastRecovery || s.haveRACKLoss) && (s.peerWindow != 0 || len(s.outstanding) == 0)
 }
 
 // recoveryOutputReady reports whether current recovery state authorizes an
 // immediate transmission. It is evaluated only after a recovery attempt found
 // the device queue full; ordinary actor turns do not scan the scoreboard.
 func (s *tcpEstablishedState) recoveryOutputReady() bool {
+	if !s.recoveryOutputPending() {
+		return false
+	}
 	if s.retransmit && s.retransmissionKind == tcpRetransmissionPathMTU {
 		return firstUnsackedSegment(s.outstanding) >= 0
 	}
@@ -6177,8 +6278,8 @@ func (c *TCPConn) SetKeepAliveConfig(config KeepAliveConfig) error {
 	return c.updateSocketOptions(func() { c.keepAliveConfig = config })
 }
 
-// SetIdleTimeout closes the connection when no acceptable segment arrives for
-// timeout. Zero disables the timeout.
+// SetIdleTimeout closes the connection when neither a current ACK nor new
+// receive data arrives for timeout. Zero disables the timeout.
 func (c *TCPConn) SetIdleTimeout(timeout time.Duration) error {
 	if timeout < 0 {
 		return c.setOperationError(syscall.EINVAL)
@@ -7443,6 +7544,9 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		}
 		state.deliverySample.ackTime = receivedAt
 	}
+	// An active CWR point is at or ahead of SND.UNA. recoveryPhaseAt clears
+	// an already acknowledged phase when undo restores an older episode, so
+	// an ACK reaching this point cannot be an old ACK.
 	if state.ecnRecoveryActive && state.controller.state.Phase == CongestionPhaseCWR && tcpSequenceGreaterEqual(ack, state.ecnRecoveryPoint) {
 		state.controller.setCongestionPhase(CongestionPhaseOpen, receivedAt)
 	}
@@ -7659,11 +7763,11 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			c.growSendCapacity(target)
 		}
 	} else if !oldACK {
-		// Linux tcp_ack clears icsk_probes_out and any earlier soft error for
-		// a current zero-window response (RFC 9293 section 3.8.6.1). Persist
-		// probes reuse acknowledged sequence space, so their ACK cannot advance
-		// SND.UNA; starting a new flight already clears persist accounting.
-		// Peer responses must not remove full Close's independent drain budget.
+		// Linux tcp_ack clears the unanswered pure-persist budget and any
+		// earlier soft error for a current zero-window response (RFC 9293
+		// section 3.8.6.1). Pure persist has no outstanding sequence space, so
+		// its valid ACK cannot advance SND.UNA. Peer responses must not remove
+		// full Close's independent drain budget in persistClosed.
 		if state.persist {
 			state.persistUnanswered = 0
 		}
@@ -8453,7 +8557,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		return outputWindow, false, nil
 	}
 	retransmitRTORecovery = func(outputWindow tcpOutputWindow, index int) (tcpOutputWindow, bool, error) {
-		if len(state.outstanding) == 0 {
+		if len(state.outstanding) == 0 || state.peerWindow == 0 {
 			return outputWindow, false, nil
 		}
 		if index < 0 || index >= len(state.outstanding) {
@@ -8588,12 +8692,21 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			outputWindow.release()
 			return nil
 		}
+		activity := state.receiveActivityTime()
+		now := time.Now()
+		if now.Before(state.keepAliveDeadline(activity, c.keepAliveConfig)) {
+			c.mu.Unlock()
+			keepAliveOutputWaiting = false
+			livenessDirty = true
+			outputWindow.release()
+			return nil
+		}
 		// Like Linux tcp_keepalive_timer, test the terminal policy before each
 		// due probe, including capacity retries. Queue or socket-lock waits must
 		// not restart an expired inactivity timeout. RFC 9293 section 3.8.4
 		// warns that one unanswered probe alone does not establish peer failure.
 		if liveness := state.livenessState; liveness != nil {
-			userExpired := c.userTimeout > 0 && liveness.keepAliveProbes != 0 && !time.Now().Before(state.lastActivity.Add(c.userTimeout))
+			userExpired := c.userTimeout > 0 && liveness.keepAliveProbes != 0 && !now.Before(activity.Add(c.userTimeout))
 			countExpired := c.userTimeout == 0 && liveness.keepAliveProbes >= c.keepAliveConfig.Count
 			if userExpired || countExpired {
 				c.mu.Unlock()
@@ -8692,7 +8805,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 	// admission leaves the scoreboard unchanged for the next actor turn.
 	drainRecovery := func(first tcpOutputReservation) error {
 		outputWindow := newTCPOutputWindow(first)
-		if tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state, hostQueueWait != nil) {
+		if !state.recoveryOutputPending() || tcpTimerOutputPending(state, hostQueueWait != nil) || tcpPersistOutputPending(state, hostQueueWait != nil) {
 			outputWindow.release()
 			return nil
 		}
@@ -9199,6 +9312,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						continue
 					}
 				}
+				oldACK := tcpSequenceLess(ack, state.sendUnacknowledged)
 				// RFC 7323 section 4.3 updates TS.Recent for accepted old ACKs
 				// as well as current ACKs. Linux follows this rule after sequence
 				// and ACK admission; zero replay tolerance prevents a tolerated
@@ -9209,20 +9323,25 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					c.recentTimestamp = timestampValue
 					state.lastTimestampUpdate = receivedAt
 				}
-				// Refresh liveness and consume RFC 3168 CWR only after admission.
-				// Rejected ACK/SYN traffic cannot cancel probes or clear congestion
-				// feedback; accepted old ACKs retain their receive-side effects.
-				state.lastActivity = receivedAt
-				keepAliveOutputWaiting = false
-				if state.livenessState != nil {
-					state.livenessState.lastKeepAlive = time.Time{}
-					state.livenessState.keepAliveProbes = 0
-				}
-				livenessDirty = true
-				if c.peerECN && segment.flags&TCPFlagCWR != 0 {
-					c.echoCongestion = false
+				// RFC 9293 permits accepted old-ACK data to continue through the
+				// receive path below. Linux's tcp_ack old_ack path deliberately does
+				// not reset unanswered keepalive probes or consume CWR. New receive
+				// data updates a separate activity clock below, as in Linux.
+				if !oldACK {
+					state.lastActivity = receivedAt
+					keepAliveOutputWaiting = false
+					if state.livenessState != nil {
+						state.livenessState.lastKeepAlive = time.Time{}
+						state.livenessState.keepAliveProbes = 0
+					}
+					livenessDirty = true
+					if c.peerECN && segment.flags&TCPFlagCWR != 0 {
+						c.echoCongestion = false
+					}
 				}
 				retransmissionUpdate := state.processAcknowledgment(&segment, receivedAt, timestampEcho)
+				// Advertised-window updates reselect the outstanding flight's
+				// loss timer without consuming the pure-persist probe budget.
 				if tcpTimerOutputPending(state, hostQueueWait != nil) && (retransmissionUpdate == tcpRetransmissionRestart || retransmissionUpdate == tcpRetransmissionReselect && state.retransmissionKind == tcpRetransmissionProbe) {
 					// Advancing ACKs replace every consumed loss timer. New SACK
 					// evidence also reselects an unpublished TLP before recovery is
@@ -9274,6 +9393,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					if receivedData {
 						state.observeReceivedData(receivedAt)
+						if oldACK {
+							keepAliveOutputWaiting = false
+							livenessDirty = true
+						}
 					}
 					if state.receiveNext != previousReceiveNext {
 						state.sackACKs = 0
@@ -9331,17 +9454,19 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			sackReneging := retransmissionKind == tcpRetransmissionSACKReneging
 			if sackReneging {
 				state.retransmissionKind = tcpRetransmissionRTO
+				retransmissionKind = tcpRetransmissionRTO
 			}
 			if retransmissionKind == tcpRetransmissionClose {
 				return net.ErrClosed
 			}
-			if sackReneging && len(state.outstanding) != 0 && state.outstanding[0].state.has(sentTCPSegmentSACKed) {
-				for index := range state.outstanding {
-					state.outstanding[index].state.set(sentTCPSegmentSACKed, false)
-				}
-				state.sackedRanges, state.sackedBytes = 0, 0
-				state.haveRACKLoss = false
-				state.sackRenegingRecovery = true
+			zeroWindowRTO := state.peerWindow == 0 && len(state.outstanding) != 0 && retransmissionKind != tcpRetransmissionPathMTU && !c.applicationReceiveClosed()
+			if zeroWindowRTO {
+				// Linux keeps packets_out on the ordinary RTO path while SND.WND is
+				// zero. RFC 9293 section 3.8.6.1 keeps a responsive peer alive while
+				// the application owns the socket; after full Close, the ordinary
+				// retry budget reclaims it, as in Linux's SOCK_DEAD path.
+				retransmissionKind = tcpRetransmissionRTO
+				state.retransmissionKind = tcpRetransmissionRTO
 			}
 			pendingIndex := state.retransmissionTarget(retransmissionKind)
 			if pendingIndex < 0 {
@@ -9398,32 +9523,50 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				}
 				continue
 			}
-			state.rtoAttempts++
-			if state.rtoAttempts > tcpMaximumRTOs {
-				var softError error
-				if state.livenessState != nil {
-					softError = state.livenessState.lastSoftError
+			if retransmissionKind == tcpRetransmissionRTO && state.outstanding[0].state.has(sentTCPSegmentSACKed) {
+				// RFC 2018 permits receiver reneging. Like Linux tcp_enter_loss,
+				// discard a contradictory scoreboard at any RTO, including a
+				// zero-window retry that did not use the short reneging timer.
+				for index := range state.outstanding {
+					state.outstanding[index].state.set(sentTCPSegmentSACKed, false)
 				}
-				return tcpTimeoutError(softError)
+				state.sackedRanges, state.sackedBytes = 0, 0
+				state.haveRACKLoss = false
+				state.sackRenegingRecovery = true
+				sackReneging = true
 			}
-			state.blackHoleRTOs++
-			if state.blackHoleRTOs >= tcpBlackHoleTimeouts {
-				if len(state.outstanding) != 0 {
-					segment := state.outstanding[firstUnsackedSegment(state.outstanding)]
-					mtu := nextBlackHoleProbeMTU(c.mtu, c.key.remote.Addr().Is6(), segment.dataSize(), c.peerTimestamp)
-					if mtu < c.mtu {
-						c.stack.stats.pathMTUBlackHoleReductions.Add(1)
-						pathState := state.ensurePathMTUState()
-						pathState.blackHoleMTU = mtu
-						pathState.blackHoleExpiry = time.Now().Add(pathMTULifetime)
-						state.applyPathMTU(state.effectivePathMTU(), false)
+			if zeroWindowRTO {
+				if err := state.zeroWindowTimeoutError(time.Now(), c.socketOptions().userTimeout); err != nil {
+					return err
+				}
+			} else {
+				state.rtoAttempts++
+				if state.rtoAttempts > tcpMaximumRTOs {
+					var softError error
+					if state.livenessState != nil {
+						softError = state.livenessState.lastSoftError
+					}
+					return tcpTimeoutError(softError)
+				}
+				state.blackHoleRTOs++
+				if state.blackHoleRTOs >= tcpBlackHoleTimeouts {
+					if len(state.outstanding) != 0 {
+						segment := state.outstanding[firstUnsackedSegment(state.outstanding)]
+						mtu := nextBlackHoleProbeMTU(c.mtu, c.key.remote.Addr().Is6(), segment.dataSize(), c.peerTimestamp)
+						if mtu < c.mtu {
+							c.stack.stats.pathMTUBlackHoleReductions.Add(1)
+							pathState := state.ensurePathMTUState()
+							pathState.blackHoleMTU = mtu
+							pathState.blackHoleExpiry = time.Now().Add(pathMTULifetime)
+							state.applyPathMTU(state.effectivePathMTU(), false)
+						}
 					}
 				}
 			}
-			// SACK reneging reuses the RTO recovery machinery after the peer
-			// discarded its earlier SACK scoreboard. It is still loss accounting,
-			// but the pre-reneging transmission snapshot cannot prove probe loss.
-			pendingIndex = state.prepareRetransmission(pendingIndex, true, false, !sackReneging, time.Time{})
+			// SACK reneging and zero-window retransmissions share RTO preparation,
+			// but neither supplies reliable probe-loss evidence from the saved
+			// transmission snapshot.
+			pendingIndex = state.prepareRetransmission(pendingIndex, true, false, !sackReneging && !zeroWindowRTO, time.Time{})
 			if pendingIndex < 0 {
 				state.armRetransmission()
 				continue
@@ -9504,17 +9647,21 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			state.livenessDeadline = time.Time{}
 			options := c.socketOptions()
 			now := time.Now()
-			if options.idleTimeout > 0 && !now.Before(state.lastActivity.Add(options.idleTimeout)) {
+			activity := state.lastActivity
+			if options.idleTimeout > 0 || options.keepAlive {
+				activity = state.receiveActivityTime()
+			}
+			if options.idleTimeout > 0 && !now.Before(activity.Add(options.idleTimeout)) {
 				return os.ErrDeadlineExceeded
 			}
 			if deadline := state.userTimeoutDeadline(now, options.userTimeout); !deadline.IsZero() && !now.Before(deadline) {
 				return syscall.ETIMEDOUT
 			}
+			if err := state.zeroWindowTimeoutError(now, options.userTimeout); err != nil {
+				return err
+			}
 			if options.keepAlive && state.keepAliveEligible() {
-				deadline := state.lastActivity.Add(options.keepAliveConfig.Idle)
-				if state.livenessState != nil && state.livenessState.keepAliveProbes != 0 {
-					deadline = state.livenessState.lastKeepAlive.Add(options.keepAliveConfig.Interval)
-				}
+				deadline := state.keepAliveDeadline(activity, options.keepAliveConfig)
 				if !now.Before(deadline) {
 					keepAliveOutputWaiting = true
 					if err := drainKeepAliveOutput(tcpOutputReservation{}); err != nil {
@@ -9562,6 +9709,10 @@ func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duri
 	// within an older recovery is eligible only after the second retry.
 	frtoEligible := timeout && !state.fastRecovery && !state.sackRenegingRecovery && (!state.rtoRecovery || state.rtoAttempts > 1) && (state.pathMTUState == nil || !state.pathMTUState.discovery.active)
 	if state.pathMTUState != nil && state.pathMTUState.discovery.active {
+		// Like Linux __tcp_retransmit_skb, cancel an inconclusive MTU probe and
+		// retransmit within the confirmed MSS, including at a zero window.
+		// This preserves the search bounds without treating flow control as
+		// evidence that the probe MTU failed.
 		retransmitSequence := state.outstanding[index].sequence
 		delay := tcpPLPMTUProbeHeadway(state.congestionWindow, state.peerMSS, state.rtt.srtt)
 		if timeout {
@@ -9641,8 +9792,9 @@ func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duri
 		state.prrOut = 0
 		state.ecnRecoveryPoint = state.sendNext
 		state.ecnRecoveryActive = true
-		// Modern Linux preserves valid SACK state across an ordinary RTO;
-		// contradictory marks were cleared before range selection above.
+		// Modern Linux preserves valid SACK state across an ordinary RTO.
+		// The caller clears contradictory marks after the selected generation
+		// leaves the host queue, before preparing timeout recovery.
 		for index := range state.outstanding {
 			state.outstanding[index].state.set(sentTCPSegmentSACKRetried, false)
 			state.outstanding[index].state.set(sentTCPSegmentRACKLost, false)

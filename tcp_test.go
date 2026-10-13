@@ -698,7 +698,7 @@ func TestTCPUserTimeoutClosesZeroWindowConnection(t *testing.T) {
 	select {
 	case <-tcp.done:
 	case <-time.After(time.Second):
-		t.Fatal("TCP user timeout did not terminate a zero-window connection")
+		t.Fatalf("TCP user timeout did not terminate a zero-window connection: %+v", tcp.Info())
 	}
 	if !errors.Is(tcp.Info().LastError, syscall.ETIMEDOUT) {
 		t.Fatalf("zero-window user timeout = %+v", tcp.Info())
@@ -5080,6 +5080,65 @@ func TestTCPOldACKECEDoesNotChangeRecovery(t *testing.T) {
 	}
 }
 
+// TestTCPCWRRecoveryPointTracksACKProgress verifies that CWR completion only
+// observes a current ACK, including when a nested timeout is undone.
+func TestTCPCWRRecoveryPointTracksACKProgress(t *testing.T) {
+	for _, start := range []uint32{2000, 0xfffffe00} {
+		for _, recovery := range []string{"ordinary", "undo-before-point", "undo-at-point"} {
+			t.Run(fmt.Sprintf("%08x/%s", start, recovery), func(t *testing.T) {
+				now := time.Now()
+				c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				c.stack = &Stack{timestampEpoch: now}
+				c.peerECN = true
+				c.sendBuffer.append(make([]byte, 1000))
+				state := tcpEstablishedState{
+					connection: c, controller: newTCPCongestionController(CongestionControlCUBIC),
+					peerMSS: 1000, peerWindow: 20_000, bytesAcknowledged: 1000,
+					sendUnacknowledged: start, sendNext: start + 1000,
+					congestionWindow: 10_000, slowStartThreshold: 10_000,
+					rtt: newRTTEstimator(time.Millisecond),
+					outstanding: []sentTCPSegment{{sequence: start, end: start + 1000,
+						state:     sentTCPSegmentTransmitted,
+						hostQueue: packetQueueTicket{queuedAt: monotonicStampAt(now, now)}}},
+				}
+				state.controller.initialize(now, time.Millisecond, time.Millisecond, 10_000, 10_000, 1000, 1)
+				segment := tcpSegment{sequence: 100, acknowledgement: start, flags: TCPFlagACK | TCPFlagECE, window: 20_000}
+				state.processAcknowledgment(&segment, now.Add(time.Millisecond), 0)
+				if state.controller.state.Phase != CongestionPhaseCWR || !state.ecnRecoveryActive || state.ecnRecoveryPoint != state.sendNext {
+					t.Fatal("current ECE did not establish the outstanding CWR recovery point")
+				}
+				point := state.ecnRecoveryPoint
+				if recovery != "ordinary" {
+					state.rtoAttempts = 1
+					if index := state.prepareRetransmission(0, true, false, true, now.Add(2*time.Millisecond)); index != 0 || state.undo == nil || state.undo.transport == nil || state.undo.transport.phase != CongestionPhaseCWR {
+						t.Fatal("nested timeout did not retain the active CWR episode")
+					}
+					if recovery == "undo-before-point" {
+						if !state.restoreSpuriousRecovery(now.Add(3*time.Millisecond), 0) || state.controller.state.Phase != CongestionPhaseCWR {
+							t.Fatal("undo before the recovery point did not restore CWR")
+						}
+					}
+				}
+				if recovery != "undo-at-point" {
+					segment.acknowledgement = start - 1
+					state.processAcknowledgment(&segment, now.Add(4*time.Millisecond), 0)
+					if state.controller.state.Phase != CongestionPhaseCWR || state.ecnRecoveryPoint != point || tcpSequenceLess(point, state.sendUnacknowledged) {
+						t.Fatal("old ACK completed or invalidated an active CWR episode")
+					}
+				}
+				segment.acknowledgement, segment.flags = point, TCPFlagACK
+				state.processAcknowledgment(&segment, now.Add(5*time.Millisecond), 0)
+				if state.sendUnacknowledged != point || state.controller.state.Phase != CongestionPhaseOpen || len(state.outstanding) != 0 {
+					t.Fatal("ACK progress retained an already completed CWR episode")
+				}
+				if recovery == "undo-at-point" && state.undo.active {
+					t.Fatal("advancing ACK did not undo the unpublished nested timeout")
+				}
+			})
+		}
+	}
+}
+
 func TestTCPOldACKOnlyReportsNewDeliveryEvidence(t *testing.T) {
 	for _, evidence := range []string{"none", "new-SACK", "RACK"} {
 		now := time.Now()
@@ -5217,8 +5276,11 @@ func TestTCPRecoveryEventsUseLossObservationTime(t *testing.T) {
 	}
 }
 
-func TestTCPRejectedSegmentDoesNotRefreshLivenessOrCWR(t *testing.T) {
-	for _, kind := range []string{"future-ACK", "too-old-ACK", "no-ACK", "SYN", "inexact-RST"} {
+// TestTCPNonCurrentACKPreservesLivenessAndCWR verifies that rejected segments
+// and payload-free old ACKs cannot refresh liveness or clear receive-side ECN
+// feedback.
+func TestTCPNonCurrentACKPreservesLivenessAndCWR(t *testing.T) {
+	for _, kind := range []string{"future-ACK", "too-old-ACK", "no-ACK", "SYN", "inexact-RST", "old-ACK"} {
 		t.Run(kind, func(t *testing.T) {
 			link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.25"), netip.MustParseAddr("192.0.2.26"))
 			link.mu.Lock()
@@ -5230,6 +5292,17 @@ func TestTCPRejectedSegmentDoesNotRefreshLivenessOrCWR(t *testing.T) {
 			}
 			defer connection.Close()
 			c := connection.(*TCPConn)
+			if kind == "old-ACK" {
+				if _, err := c.Write([]byte("h")); err != nil {
+					t.Fatal(err)
+				}
+				var echoed [1]byte
+				_ = c.SetReadDeadline(time.Now().Add(time.Second))
+				if _, err := io.ReadFull(c, echoed[:]); err != nil || echoed[0] != 'h' {
+					t.Fatalf("ACK history echo = %q, %v", echoed, err)
+				}
+				waitFor(t, time.Second, func() bool { return c.Info().BytesAcknowledged == 1 })
+			}
 			link.mu.Lock()
 			link.echoTCP = false
 			peer := link.tcp[c.key.local.Port()]
@@ -5264,6 +5337,8 @@ func TestTCPRejectedSegmentDoesNotRefreshLivenessOrCWR(t *testing.T) {
 			case "inexact-RST":
 				flags |= TCPFlagRST
 				sequence++
+			case "old-ACK":
+				ack--
 			}
 			if err := c.SetIdleTimeout(50 * time.Millisecond); err != nil {
 				t.Fatal(err)
@@ -5279,7 +5354,7 @@ func TestTCPRejectedSegmentDoesNotRefreshLivenessOrCWR(t *testing.T) {
 			_ = c.Info()
 			_ = c.Info()
 			if !c.echoCongestion {
-				t.Fatal("rejected CWR cleared congestion feedback")
+				t.Fatal("segment cleared congestion feedback")
 			}
 			select {
 			case <-c.done:
@@ -5287,7 +5362,90 @@ func TestTCPRejectedSegmentDoesNotRefreshLivenessOrCWR(t *testing.T) {
 					t.Fatalf("idle close = %v, want deadline exceeded", c.Info().LastError)
 				}
 			case <-time.After(time.Second):
-				t.Fatal("rejected traffic postponed the idle timeout")
+				t.Fatal("traffic postponed the idle timeout")
+			}
+		})
+	}
+}
+
+// TestTCPOldACKDataRefreshesReceiveActivity verifies that accepted new data
+// prevents idle closure and keepalive probes without consuming ECN CWR.
+func TestTCPOldACKDataRefreshesReceiveActivity(t *testing.T) {
+	for _, policy := range []string{"keepalive", "keepalive-user-timeout", "idle-timeout"} {
+		t.Run(policy, func(t *testing.T) {
+			link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.27"), netip.MustParseAddr("192.0.2.28"))
+			link.mu.Lock()
+			link.echoTCP, link.ecnTCP = true, true
+			link.mu.Unlock()
+			connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 7995))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			c := connection.(*TCPConn)
+			if _, err := c.Write([]byte("h")); err != nil {
+				t.Fatal(err)
+			}
+			var data [1]byte
+			_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := io.ReadFull(c, data[:]); err != nil || data[0] != 'h' {
+				t.Fatalf("ACK history echo = %q, %v", data, err)
+			}
+			waitFor(t, time.Second, func() bool { return c.Info().BytesAcknowledged == 1 })
+			link.mu.Lock()
+			link.echoTCP = false
+			peer := link.tcp[c.key.local.Port()]
+			sequence, ack := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+			wire := buildTestTCP(link.remote, link.local, c.key.remote.Port(), c.key.local.Port(), sequence, ack, TCPFlagACK, 65535, nil, []byte("e"))
+			setPacketECN(wire, 3)
+			if err := writeTestPacket(stack, wire); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(c, data[:]); err != nil || data[0] != 'e' {
+				t.Fatalf("ECN fixture data = %q, %v", data, err)
+			}
+			_ = c.Info()
+			if !c.peerECN || !c.echoCongestion {
+				t.Fatal("fixture did not establish negotiated ECN feedback")
+			}
+			sequence++
+			ack--
+			if policy == "idle-timeout" {
+				if err := c.SetIdleTimeout(150 * time.Millisecond); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := c.SetKeepAliveConfig(KeepAliveConfig{Idle: 150 * time.Millisecond, Interval: 50 * time.Millisecond, Count: 2}); err != nil {
+					t.Fatal(err)
+				}
+				if policy == "keepalive-user-timeout" {
+					if err := c.SetUserTimeout(75 * time.Millisecond); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := c.SetKeepAlive(true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for started := time.Now(); time.Since(started) < 400*time.Millisecond; {
+				if err := link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, ack, TCPFlagACK|TCPFlagCWR, 65535, nil, []byte("x")); err != nil {
+					t.Fatal(err)
+				}
+				sequence++
+				if _, err := io.ReadFull(c, data[:]); err != nil || data[0] != 'x' {
+					t.Fatalf("accepted old-ACK data = %q, %v; %+v", data, err, c.Info())
+				}
+				time.Sleep(10 * time.Millisecond)
+				select {
+				case <-c.done:
+					t.Fatalf("connection closed while receiving new data: %+v", c.Info())
+				default:
+				}
+			}
+			_ = c.Info()
+			if !c.echoCongestion || stack.Stats().TCPKeepAliveProbes != 0 {
+				t.Fatalf("old-ACK data changed CWR or triggered keepalive: echo=%t probes=%d", c.echoCongestion, stack.Stats().TCPKeepAliveProbes)
 			}
 		})
 	}
@@ -6332,6 +6490,41 @@ func TestTCPPersistBudgetWaitsForProbeDeparture(t *testing.T) {
 	}
 }
 
+// withPausedTCPActor parks the actor on an unbuffered Info response while
+// action inspects actor-owned state or controls its physical timer.
+// Stopping, draining, and resetting that timer cannot race its protocol owner
+// or change the actor's logical deadline and backoff.
+func withPausedTCPActor(t *testing.T, c *TCPConn, action func()) {
+	t.Helper()
+	response := make(chan TCPConnInfo)
+	c.mu.Lock()
+	if c.pending == nil {
+		c.pending = new(tcpPendingEvents)
+	}
+	c.pending.infoRequests = append(c.pending.infoRequests, response)
+	c.mu.Unlock()
+	c.wakeActor(tcpActorWakeInfo)
+	defer func() {
+		select {
+		case <-response:
+		case <-c.done:
+		case <-time.After(2 * time.Second):
+			t.Error("actor did not release its diagnostic response")
+		}
+	}()
+	waitFor(t, 2*time.Second, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.pending == nil || len(c.pending.infoRequests) == 0
+	})
+	select {
+	case <-c.done:
+		t.Fatalf("actor terminated before timer control: %+v", c.Info())
+	default:
+	}
+	action()
+}
+
 // TestTCPPersistDepartureActor exercises the established actor's terminal
 // probe wait, including timer rearming and independent liveness deadlines.
 func TestTCPPersistDepartureActor(t *testing.T) {
@@ -6406,45 +6599,12 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 				if _, err := c.Write([]byte("queued")); err != nil {
 					t.Fatal(err)
 				}
-				// An unbuffered diagnostic response parks the sole timer owner.
-				// Stop/drain/Reset is then safe under Go 1.20 as well as Go 1.26;
-				// no production deadline, backoff value or timer state is replaced.
-				withActorPaused := func(action func()) {
-					t.Helper()
-					response := make(chan TCPConnInfo)
-					c.mu.Lock()
-					if c.pending == nil {
-						c.pending = new(tcpPendingEvents)
-					}
-					c.pending.infoRequests = append(c.pending.infoRequests, response)
-					c.mu.Unlock()
-					c.wakeActor(tcpActorWakeInfo)
-					defer func() {
-						select {
-						case <-response:
-						case <-c.done:
-						case <-time.After(2 * time.Second):
-							t.Error("persist actor did not release its diagnostic response")
-						}
-					}()
-					waitFor(t, 2*time.Second, func() bool {
-						c.mu.Lock()
-						defer c.mu.Unlock()
-						return c.pending == nil || len(c.pending.infoRequests) == 0
-					})
-					select {
-					case <-c.done:
-						t.Fatalf("persist actor terminated before timer control: %+v", c.Info())
-					default:
-					}
-					action()
-				}
 				firePersist := func() {
 					t.Helper()
 					// A previous send wake may have changed the logical deadline
 					// before its Info reply; the next turn arms the physical timer.
 					_ = c.Info()
-					withActorPaused(func() {
+					withPausedTCPActor(t, c, func() {
 						if !actorTimer.active {
 							t.Fatal("persist deadline has no active physical timer")
 						}
@@ -6475,7 +6635,7 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 					}
 					return false
 				})
-				withActorPaused(func() {
+				withPausedTCPActor(t, c, func() {
 					if actorTimer.active {
 						t.Fatal("queue-owned final probe retained an active retry timer")
 					}
@@ -6486,7 +6646,7 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 				switch scenario {
 				case "departure interval":
 					var responseDeadline time.Time
-					withActorPaused(func() {
+					withPausedTCPActor(t, c, func() {
 						buffers, sizes := [][]byte{make([]byte, 1500)}, make([]int, 1)
 						if n, err := stack.Read(buffers, sizes, 0); err != nil || n != 1 {
 							t.Fatalf("Stack.Read = %d, %v", n, err)
@@ -6503,7 +6663,7 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 					})
 					_ = c.Info()
 					_ = c.Info()
-					withActorPaused(func() {
+					withPausedTCPActor(t, c, func() {
 						select {
 						case expiredAt := <-actorTimer.timer.C:
 							// Timer values record the scheduled expiry, excluding
@@ -6518,7 +6678,7 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 						}
 					})
 				case "current ACK after departure":
-					withActorPaused(func() {
+					withPausedTCPActor(t, c, func() {
 						buffers, sizes := [][]byte{make([]byte, 1500)}, make([]int, 1)
 						if n, err := stack.Read(buffers, sizes, 0); err != nil || n != 1 {
 							t.Fatalf("Stack.Read = %d, %v", n, err)
@@ -6553,7 +6713,7 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 					if info := c.Info(); info.State != TCPStateEstablished || stack.Stats().TCPZeroWindowProbes != tcpMaximumRTOs {
 						t.Fatalf("current ACK did not retain the next probe interval: %+v", info)
 					}
-					withActorPaused(func() {
+					withPausedTCPActor(t, c, func() {
 						if actorTimer.active {
 							t.Fatal("current ACK armed persist timer before probe departure")
 						}
@@ -6564,7 +6724,7 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 					// The ACK can arrive while the terminal probe is still in the
 					// device queue. It must not discard the departure waiter and
 					// re-use the queue-admission deadline.
-					withActorPaused(func() {
+					withPausedTCPActor(t, c, func() {
 						buffers, sizes := [][]byte{make([]byte, 1500)}, make([]int, 1)
 						if n, err := stack.Read(buffers, sizes, 0); err != nil || n != 1 {
 							t.Fatalf("Stack.Read = %d, %v", n, err)
@@ -6592,7 +6752,7 @@ func TestTCPPersistDepartureActor(t *testing.T) {
 						_ = c.Info()
 						_ = c.Info()
 					}
-					withActorPaused(func() {
+					withPausedTCPActor(t, c, func() {
 						if actorTimer.active || stack.Stats().TCPZeroWindowProbes != tcpMaximumRTOs {
 							t.Fatal("unaccepted or old ACK canceled the terminal departure wait")
 						}
@@ -6831,6 +6991,284 @@ func TestTCPPersistProbeSurvivesStoppedDeviceRead(t *testing.T) {
 	}
 }
 
+// TestTCPZeroWindowOutstandingUsesResponsiveRetry keeps one transmitted data
+// range outstanding while the peer advertises a zero window. The ordinary RTO
+// retransmits it without charging the loss-retry or PMTU black-hole budget,
+// and a current ACK must not trigger recovery output before the next RTO.
+func TestTCPZeroWindowOutstandingUsesResponsiveRetry(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	clientPort := uint16(connection.LocalAddr().(*net.TCPAddr).Port)
+	link.mu.Lock()
+	peer := link.tcp[clientPort]
+	serverSequence := peer.serverNext
+	link.mu.Unlock()
+	payload := []byte("outstanding")
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("initial data was not published")
+	}
+	original := consumeTestPacket(&stack.outbound, entry)
+	packet, err := ParseIPPacket(original)
+	if err != nil {
+		t.Fatalf("invalid initial data packet: %v", err)
+	}
+	wire, err := packet.TCPSegment()
+	if err != nil || len(wire.Payload) != len(payload) {
+		t.Fatalf("initial TCP payload = %d, %v", len(wire.Payload), err)
+	}
+	if err = link.deliverTCP(8080, clientPort, serverSequence, wire.SequenceNumber, TCPFlagACK, 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.Info().PeerWindow == 0 })
+	before := connection.Info()
+	if before.State != TCPStateEstablished || before.BytesSent != uint64(len(payload)) {
+		t.Fatalf("zero-window flight = %+v", before)
+	}
+	// The first retry is tied to the original RTO. Leave enough room for the
+	// actor and queue wake without waiting for the subsequent exponential delay.
+	entry, available = waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout+2*time.Second)
+	if !available {
+		t.Fatal("zero-window retransmission was not published")
+	}
+	retry := consumeTestPacket(&stack.outbound, entry)
+	retryPacket, err := ParseIPPacket(retry)
+	if err != nil {
+		t.Fatalf("invalid zero-window retransmission: %v", err)
+	}
+	retryWire, err := retryPacket.TCPSegment()
+	if err != nil || retryWire.SequenceNumber != wire.SequenceNumber || len(retryWire.Payload) != len(payload) {
+		t.Fatalf("zero-window retry = seq:%d payload:%d, want seq:%d payload:%d", retryWire.SequenceNumber, len(retryWire.Payload), wire.SequenceNumber, len(payload))
+	}
+	if info := connection.Info(); info.State != TCPStateEstablished || info.PathMTU != before.PathMTU || info.Retransmissions == 0 {
+		t.Fatalf("zero-window retry changed connection state: before:%+v after:%+v", before, info)
+	}
+	// The timeout preparation also enters the shared congestion-recovery
+	// bookkeeping. A current zero-window ACK must not let that bookkeeping
+	// publish a second copy immediately while SND.WND is still closed.
+	if err = link.deliverTCP(8080, clientPort, serverSequence, wire.SequenceNumber, TCPFlagACK, 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	guard := before.RetransmissionTimeout / 3
+	if guard < 25*time.Millisecond {
+		guard = 25 * time.Millisecond
+	}
+	if entry, available := waitTestPacketEntry(&stack.outbound, guard); available {
+		consumeTestPacket(&stack.outbound, entry)
+		t.Fatal("current zero-window ACK triggered ordinary recovery output")
+	}
+}
+
+// TestTCPZeroWindowOutstandingReopensAfterQueueWait verifies that a window
+// update received while the original transmission is still device-queue
+// resident resumes ordinary RTO timing when that generation departs.
+func TestTCPZeroWindowOutstandingReopensAfterQueueWait(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	before := connection.Info()
+	payload := []byte("queued zero-window")
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	waitFor(t, time.Second, func() bool { return stack.outbound.len() == 1 })
+
+	clientPort := uint16(connection.LocalAddr().(*net.TCPAddr).Port)
+	link.mu.Lock()
+	peer := link.tcp[clientPort]
+	serverSequence, acknowledgement := peer.serverNext, peer.clientNext
+	link.mu.Unlock()
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free)-1 {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free)-1)
+	}
+
+	var departureWaiter *packetQueueDepartureWaiter
+	waitFor(t, before.RetransmissionTimeout+time.Second, func() bool {
+		waiters := stack.outbound.departureWaiters.Load()
+		if waiters == nil {
+			return false
+		}
+		for index := range waiters.slots {
+			if waiter := waiters.slots[index].Load(); waiter != nil {
+				departureWaiter = waiter
+				return true
+			}
+		}
+		return false
+	})
+
+	if err := link.deliverTCP(8080, clientPort, serverSequence, acknowledgement, TCPFlagACK, 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.Info().PeerWindow == 0 })
+	if err := link.deliverTCP(8080, clientPort, serverSequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.Info().PeerWindow != 0 })
+
+	entry, available := stack.outbound.tryDequeue()
+	if !available {
+		t.Fatal("queue-resident TCP data was unavailable")
+	}
+	original := consumeTestPacket(&stack.outbound, entry)
+	if len(original) == 0 {
+		t.Fatal("queue-resident TCP data was empty")
+	}
+	if _, departed := departureWaiter.departedTime(stack.timestampEpoch); !departed {
+		t.Fatal("window-reopened target did not record device departure")
+	}
+
+	guard := before.RetransmissionTimeout / 3
+	if guard < 25*time.Millisecond {
+		guard = 25 * time.Millisecond
+	}
+	if entry, available := waitTestPacketEntry(&stack.outbound, guard); available {
+		consumeTestPacket(&stack.outbound, entry)
+		t.Fatal("window-reopened target was retransmitted before a new ordinary RTO")
+	}
+	entry, available = waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout+time.Second)
+	if !available {
+		t.Fatal("ordinary retransmission did not resume after queue departure")
+	}
+	consumeTestPacket(&stack.outbound, entry)
+	if info := connection.Info(); info.Retransmissions != before.Retransmissions+1 || info.PeerWindow == 0 {
+		t.Fatalf("window-reopened retransmission = %+v, want one ordinary retry", info)
+	}
+}
+
+func TestTCPZeroWindowOutstandingRetryPolicy(t *testing.T) {
+	for _, family := range []struct {
+		name, local, remote string
+		sack                bool
+	}{
+		{name: "IPv4", local: "192.0.2.197", remote: "198.51.100.197"},
+		{name: "IPv6", local: "2001:db8::197", remote: "2001:db8:1::197"},
+		{name: "IPv4 fully SACKed", local: "192.0.2.197", remote: "198.51.100.197", sack: true},
+		{name: "IPv6 fully SACKed", local: "2001:db8::197", remote: "2001:db8:1::197", sack: true},
+	} {
+		t.Run(family.name, func(t *testing.T) {
+			local, remote := netip.MustParseAddr(family.local), netip.MustParseAddr(family.remote)
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			network := "tcp4"
+			if local.Is6() {
+				network = "tcp6"
+			}
+			c := newTCPConn(stack, network, tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1500, tcpSocketOptionSet{})
+			c.receiveNext, c.peerWindow, c.peerMSS = 200, 65535, 1200
+			c.peerSACK = family.sack
+			c.sendBuffer.append([]byte{1})
+			stack.mu.Lock()
+			stack.tcp[c.key] = c
+			stack.stats.activeTCPConnections.Add(1)
+			stack.mu.Unlock()
+			actorTimer := newOwnedTimer()
+			go func() {
+				defer stack.removeTCP(c)
+				defer close(c.done)
+				defer actorTimer.close()
+				c.finish(c.established(100, actorTimer, tcpInitialReceive{}))
+			}()
+			t.Cleanup(func() {
+				c.abort(net.ErrClosed)
+				select {
+				case <-c.done:
+				case <-time.After(2 * time.Second):
+					t.Error("closed zero-window actor did not terminate")
+				}
+			})
+			c.wakeActor(tcpActorWakeSend)
+			_ = readOutboundPacket(t, stack)
+			respond := func() {
+				t.Helper()
+				var options []byte
+				if family.sack {
+					var sack [10]byte
+					sack[0], sack[1] = TCPHeaderOptionSACK, 10
+					binary.BigEndian.PutUint32(sack[2:6], 100)
+					binary.BigEndian.PutUint32(sack[6:10], 101)
+					options = sack[:]
+				}
+				wire := buildTestTCP(remote, local, 80, 12345, 200, 100, TCPFlagACK, 0, options, nil)
+				if err := writeTestPacket(stack, wire); err != nil {
+					t.Fatal(err)
+				}
+				_ = c.Info()
+				_ = c.Info()
+			}
+			respond()
+			if info := c.Info(); info.PeerWindow != 0 || info.BytesSent != 1 || info.BytesAcknowledged != 0 {
+				t.Fatalf("outstanding zero-window flight = %+v", info)
+			}
+			fireTimer := func() {
+				t.Helper()
+				_ = c.Info()
+				withPausedTCPActor(t, c, func() {
+					if !actorTimer.active {
+						t.Fatal("outstanding zero-window flight has no RTO")
+					}
+					if !actorTimer.timer.Stop() {
+						<-actorTimer.timer.C
+					}
+					actorTimer.timer.Reset(0)
+				})
+			}
+			// Only the physical wake is accelerated. A responsive open connection
+			// exceeds the ordinary retry bound, then full Close restores that bound.
+			// The actor owns every RTO transition and packet publication.
+			for count := 1; count <= 2*tcpMaximumRTOs+1; count++ {
+				if count == tcpMaximumRTOs+2 {
+					if err = c.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fireTimer()
+				packet, err := ParseIPPacket(readOutboundPacket(t, stack))
+				if err != nil {
+					t.Fatal(err)
+				}
+				wire, err := packet.TCPSegment()
+				if err != nil || wire.SequenceNumber != 100 || len(wire.Payload) != 1 {
+					t.Fatalf("retry %d = %+v, %v", count, wire, err)
+				}
+				respond()
+			}
+			fireTimer()
+			select {
+			case <-c.done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("responsive zero-window peer removed the full-Close retry bound")
+			}
+			if info := c.Info(); !errors.Is(info.LastError, os.ErrDeadlineExceeded) || info.Retransmissions != 2*tcpMaximumRTOs+1 {
+				t.Fatalf("full-Close terminal state = %+v", info)
+			}
+		})
+	}
+}
+
 func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 	for _, test := range []struct {
 		name              string
@@ -6838,12 +7276,16 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 		applicationOutput bool
 		closeWrite        bool
 		userTimeout       bool
+		oldACK            bool
+		oldACKData        bool
 	}{
 		{name: "returned capacity publishes probe"},
 		{name: "inbound activity cancels probe", inboundActivity: true},
 		{name: "application output cancels probe", applicationOutput: true},
 		{name: "CloseWrite cancels probe", closeWrite: true},
 		{name: "delayed first probe with user timeout", userTimeout: true},
+		{name: "old ACK preserves pending probe and retry count", oldACK: true},
+		{name: "old ACK data cancels pending probe", inboundActivity: true, oldACKData: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			link, stack, connection := newManuallyPumpedTCPConnection(t)
@@ -6854,6 +7296,24 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 			peer := link.tcp[clientPort]
 			sequence, acknowledgement := peer.serverNext, peer.clientNext
 			link.mu.Unlock()
+			if test.oldACK || test.oldACKData {
+				if _, err := connection.Write([]byte{1}); err != nil {
+					t.Fatal(err)
+				}
+				packet, err := ParseIPPacket(readOutboundPacket(t, stack))
+				if err != nil {
+					t.Fatal(err)
+				}
+				sent, err := packet.TCPSegment()
+				if err != nil || len(sent.Payload) != 1 {
+					t.Fatalf("ACK history transmission = %+v, %v", sent, err)
+				}
+				acknowledgement = sent.SequenceNumber + 1
+				if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, time.Second, func() bool { return connection.Info().BytesAcknowledged == 1 })
+			}
 
 			held := make([]uint16, 0, cap(stack.outbound.free))
 			defer func() {
@@ -6875,6 +7335,9 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 			keepAlive := KeepAliveConfig{Idle: 100 * time.Millisecond, Interval: 100 * time.Millisecond, Count: 3}
 			if test.userTimeout {
 				keepAlive.Interval = 300 * time.Millisecond
+			}
+			if test.oldACK {
+				keepAlive.Interval, keepAlive.Count = 300*time.Millisecond, 1
 			}
 			if err := connection.SetKeepAliveConfig(keepAlive); err != nil {
 				t.Fatal(err)
@@ -6910,7 +7373,11 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 				link.mu.Lock()
 				peer.serverNext += uint32(len(payload))
 				link.mu.Unlock()
-				if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK|TCPFlagPSH, 65535, nil, payload); err != nil {
+				ack := acknowledgement
+				if test.oldACKData {
+					ack--
+				}
+				if err := link.deliverTCP(8080, clientPort, sequence, ack, TCPFlagACK|TCPFlagPSH, 65535, nil, payload); err != nil {
 					t.Fatal(err)
 				}
 				if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -6934,6 +7401,12 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 				_ = connection.Info()
 			} else if test.closeWrite {
 				if err := connection.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+				_ = connection.Info()
+				_ = connection.Info()
+			} else if test.oldACK {
+				if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement-1, TCPFlagACK, 65535, nil, nil); err != nil {
 					t.Fatal(err)
 				}
 				_ = connection.Info()
@@ -6990,6 +7463,21 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 					t.Fatalf("resumed output is not the current keepalive probe: %x", wire)
 				}
 				waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+				if test.oldACK {
+					if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement-1, TCPFlagACK, 65535, nil, nil); err != nil {
+						t.Fatal(err)
+					}
+					_ = connection.Info()
+					_ = connection.Info()
+					select {
+					case <-connection.done:
+						if info := connection.Info(); !errors.Is(info.LastError, syscall.ETIMEDOUT) || stack.Stats().TCPKeepAliveProbes != 1 {
+							t.Fatalf("old ACK changed keepalive retry count: info:%+v probes:%d", info, stack.Stats().TCPKeepAliveProbes)
+						}
+					case <-time.After(time.Second):
+						t.Fatal("old ACK postponed the keepalive timeout")
+					}
+				}
 				if test.userTimeout {
 					select {
 					case <-connection.done:
@@ -6997,6 +7485,110 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 					case <-time.After(keepAlive.Interval / 3):
 					}
 				}
+			}
+		})
+	}
+}
+
+// TestTCPKeepAliveOldACKDataPostponesPendingProbe verifies that receive data
+// supersedes a capacity-blocked probe without resetting the published count.
+func TestTCPKeepAliveOldACKDataPostponesPendingProbe(t *testing.T) {
+	for _, userTimeout := range []time.Duration{0, 750 * time.Millisecond} {
+		t.Run(userTimeout.String(), func(t *testing.T) {
+			link, stack, c := newManuallyPumpedTCPConnection(t)
+			defer c.Close()
+			if _, err := c.Write([]byte{1}); err != nil {
+				t.Fatal(err)
+			}
+			packet, err := ParseIPPacket(readOutboundPacket(t, stack))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sent, err := packet.TCPSegment()
+			if err != nil || len(sent.Payload) != 1 {
+				t.Fatalf("ACK history transmission = %+v, %v", sent, err)
+			}
+			link.mu.Lock()
+			sequence := link.tcp[c.key.local.Port()].serverNext
+			link.mu.Unlock()
+			ack := sent.SequenceNumber + 1
+			if err := link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, ack, TCPFlagACK, 65535, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, time.Second, func() bool { return c.Info().BytesAcknowledged == 1 })
+			config := KeepAliveConfig{Idle: 200 * time.Millisecond, Interval: 100 * time.Millisecond, Count: 2}
+			if err := c.SetKeepAliveConfig(config); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetUserTimeout(userTimeout); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			_ = readOutboundPacket(t, stack)
+			waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+			var held []uint16
+			defer func() {
+				for _, slot := range held {
+					stack.outbound.releaseReserved(slot)
+				}
+			}()
+			for slot, ok := stack.outbound.tryReserve(); ok; slot, ok = stack.outbound.tryReserve() {
+				held = append(held, slot)
+			}
+			if len(held) != cap(stack.outbound.free) {
+				t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+			}
+			time.Sleep(config.Interval + 50*time.Millisecond)
+			_ = c.Info()
+			_ = c.Info()
+			if err := link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, ack-1, TCPFlagACK|TCPFlagPSH, 65535, nil, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			_ = c.SetReadDeadline(time.Now().Add(time.Second))
+			var data [1]byte
+			if _, err := io.ReadFull(c, data[:]); err != nil || data[0] != 'x' {
+				t.Fatalf("old-ACK receive data = %q, %v", data, err)
+			}
+			if err := c.SetQuickACK(true); err != nil {
+				t.Fatal(err)
+			}
+			_ = c.Info()
+			_ = c.Info()
+			last := len(held) - 1
+			stack.outbound.releaseReserved(held[last])
+			held = held[:last]
+			packet, err = ParseIPPacket(readOutboundPacket(t, stack))
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := packet.TCPSegment()
+			if err != nil || response.SequenceNumber != ack || response.AcknowledgmentNumber != sequence+1 || len(response.Payload) != 0 {
+				t.Fatalf("data ACK did not supersede keepalive: %+v, %v", response, err)
+			}
+			select {
+			case <-c.done:
+				t.Fatalf("old-ACK data did not postpone idle close: %+v", c.Info())
+			case <-time.After(config.Idle / 2):
+			}
+			if probes := stack.Stats().TCPKeepAliveProbes; probes != 1 {
+				t.Fatalf("capacity retry probed an active receiver: probes=%d, want 1", probes)
+			}
+			// After new data stops, the original count still limits unanswered
+			// probes. A data-only refresh must not silently restart that budget.
+			_ = readOutboundPacket(t, stack)
+			waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 2 })
+			select {
+			case <-c.done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("new data reset the unanswered keepalive budget")
+			}
+			if !errors.Is(c.Info().LastError, syscall.ETIMEDOUT) {
+				t.Fatalf("idle close = %v, want ETIMEDOUT", c.Info().LastError)
+			}
+			if userTimeout == 0 && stack.Stats().TCPKeepAliveProbes != uint64(config.Count) {
+				t.Fatalf("data reset the probe count: probes=%d, want %d", stack.Stats().TCPKeepAliveProbes, config.Count)
 			}
 		})
 	}
@@ -9445,6 +10037,7 @@ func TestTCPSendTimerOwnership(t *testing.T) {
 		state := tcpEstablishedState{
 			connection:  &TCPConn{stack: &Stack{timestampEpoch: receivedAt}},
 			outstanding: []sentTCPSegment{{sequence: 100, end: 200}},
+			peerWindow:  65535,
 			rtt:         rttEstimator{rto: time.Second},
 		}
 		before := time.Now()
@@ -9490,6 +10083,7 @@ func TestTCPSendTimerOwnership(t *testing.T) {
 		state := tcpEstablishedState{
 			peerSACK:     true,
 			sackedRanges: 1,
+			peerWindow:   65535,
 			outstanding:  []sentTCPSegment{{state: sentTCPSegmentSACKed}},
 		}
 		state.armSACKReneging()
@@ -9499,6 +10093,589 @@ func TestTCPSendTimerOwnership(t *testing.T) {
 			t.Fatalf("SACK reneging timer = kind:%v deadline:%v, want kind:%v deadline:%v", state.retransmissionKind, state.retransmissionDeadline, tcpRetransmissionSACKReneging, deadline)
 		}
 	})
+}
+
+func TestTCPZeroWindowUsesOrdinaryRTOPath(t *testing.T) {
+	now := time.Now()
+	state := tcpEstablishedState{
+		connection:         &TCPConn{stack: &Stack{timestampEpoch: now}},
+		outstanding:        []sentTCPSegment{{sequence: 100, end: 200}},
+		sendUnacknowledged: 100, sendNext: 200,
+		peerWindow: 0,
+		controller: newTCPCongestionController(CongestionControlReno),
+		rtt:        rttEstimator{baseRTO: time.Second, rto: time.Second},
+	}
+	state.armRetransmission()
+	if !state.retransmit || state.retransmissionKind != tcpRetransmissionRTO || state.retransmissionDeadline.IsZero() || state.persist {
+		t.Fatalf("zero-window timer = active:%v kind:%v deadline:%v persist:%v", state.retransmit, state.retransmissionKind, state.retransmissionDeadline, state.persist)
+	}
+	ordinaryDeadline := state.retransmissionDeadline
+	state.retransmissionKind = tcpRetransmissionProbe
+	state.retransmissionDeadline = ordinaryDeadline.Add(-time.Millisecond)
+	state.reselectRetransmission(now)
+	if state.retransmissionKind != tcpRetransmissionRTO || !state.retransmissionDeadline.Equal(ordinaryDeadline) {
+		t.Fatalf("zero-window reselect = kind:%v deadline:%v, want RTO at %v", state.retransmissionKind, state.retransmissionDeadline, ordinaryDeadline)
+	}
+	state.outstanding[0].state.set(sentTCPSegmentSACKed, true)
+	state.sackedRanges = 1
+	if index := state.retransmissionTarget(tcpRetransmissionRTO); index != 0 {
+		t.Fatalf("fully SACKed zero-window target = %d, want queue head", index)
+	}
+	state.armPersist(time.Time{}, 200, false)
+	if state.persist || !state.retransmit || !state.retransmissionDeadline.Equal(ordinaryDeadline) {
+		t.Fatal("unsent data replaced the outstanding flight's RTO with persist")
+	}
+	state.retransmissionDeadline = time.Time{}
+	state.reselectRetransmission(now)
+	if !state.retransmissionDeadline.IsZero() || !tcpTimerOutputPending(&state, false) {
+		t.Fatal("SACK reselection restarted an already consumed zero-window RTO")
+	}
+}
+
+func TestTCPSACKRenegingRetainsSelectedDeadline(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(25 * time.Millisecond)
+	state := tcpEstablishedState{
+		connection: &TCPConn{stack: &Stack{timestampEpoch: now}},
+		outstanding: []sentTCPSegment{{sequence: 100, end: 200,
+			state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed}},
+		peerWindow: 65535, peerSACK: true, sackedRanges: 1,
+		retransmit: true, retransmissionKind: tcpRetransmissionSACKReneging,
+		retransmissionDeadline: deadline,
+		rtt:                    rttEstimator{rto: time.Second},
+	}
+	state.selectRetransmission(now.Add(time.Second), now, now)
+	if state.retransmissionKind != tcpRetransmissionSACKReneging || !state.retransmissionDeadline.Equal(deadline) {
+		t.Fatalf("SACK-reneging selection = kind:%v deadline:%v, want original deadline %v", state.retransmissionKind, state.retransmissionDeadline, deadline)
+	}
+	state.reselectRetransmission(now)
+	if state.retransmissionKind != tcpRetransmissionSACKReneging || !state.retransmissionDeadline.Equal(deadline) {
+		t.Fatalf("SACK-reneging reselection = kind:%v deadline:%v, want original deadline %v", state.retransmissionKind, state.retransmissionDeadline, deadline)
+	}
+}
+
+func TestTCPZeroWindowACKProgressSelectsRemainingFlightClock(t *testing.T) {
+	now := time.Now()
+	state := tcpEstablishedState{
+		connection: &TCPConn{stack: &Stack{timestampEpoch: now.Add(-time.Minute)}},
+		outstanding: []sentTCPSegment{
+			{sequence: 100, end: 150, firstSent: 30 * time.Second},
+			{sequence: 150, end: 200, firstSent: 45 * time.Second},
+		},
+		sendUnacknowledged: 100, sendNext: 200,
+		peerWindow: 0,
+		controller: newTCPCongestionController(CongestionControlReno),
+		rtt:        rttEstimator{baseRTO: time.Second, rto: time.Second},
+	}
+	before := state.zeroWindowDeadline(0)
+	state.processAcknowledgment(&tcpSegment{acknowledgement: 150, flags: TCPFlagACK, window: 0}, now, 0)
+	if after := state.zeroWindowDeadline(0); !after.Equal(before.Add(15 * time.Second)) {
+		t.Fatalf("remaining zero-window flight deadline = %v, want %v", after, before.Add(15*time.Second))
+	}
+}
+
+func TestTCPZeroWindowTransitionAvoidsOrdinaryLossAccounting(t *testing.T) {
+	now := time.Now()
+	state := tcpEstablishedState{
+		connection:         &TCPConn{stack: &Stack{timestampEpoch: now}},
+		outstanding:        []sentTCPSegment{{sequence: 100, end: 200}},
+		sendUnacknowledged: 100, sendNext: 200,
+		peerWindow:             65535,
+		controller:             newTCPCongestionController(CongestionControlReno),
+		rtt:                    rttEstimator{baseRTO: time.Second, rto: time.Second},
+		retransmit:             true,
+		retransmissionKind:     tcpRetransmissionRTO,
+		retransmissionDeadline: now.Add(time.Second),
+		rtoAttempts:            3,
+		blackHoleRTOs:          2,
+	}
+	state.peerWindowSequence = 0
+	update := state.processAcknowledgment(&tcpSegment{sequence: 0, acknowledgement: 100, flags: TCPFlagACK, window: 0}, now, 0)
+	state.updateRetransmissionTimer(update, now)
+	if state.retransmissionKind != tcpRetransmissionRTO || state.rtoAttempts != 3 || state.blackHoleRTOs != 2 {
+		t.Fatalf("zero-window transition = kind:%v rto:%d black-hole:%d", state.retransmissionKind, state.rtoAttempts, state.blackHoleRTOs)
+	}
+}
+
+func TestTCPZeroWindowRetransmissionDisablesLossEvidence(t *testing.T) {
+	now := time.Now()
+	recorder := new(congestionAPILossRecorder)
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name: "zero-window-loss-evidence", New: func(CongestionControlContext) CongestionController { return recorder },
+		Features: CongestionControlFeatureDeliveryRate | CongestionControlFeatureTransmissionEvents | CongestionControlFeatureLossEvents,
+	})
+	controller.initialize(now, time.Millisecond, time.Millisecond, 20_000, 40_000, 1000, 1)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	connection.stack = &Stack{timestampEpoch: now}
+	state := tcpEstablishedState{
+		connection:         connection,
+		controller:         controller,
+		peerMSS:            1000,
+		peerWindow:         0,
+		sendUnacknowledged: 100,
+		sendNext:           1100,
+		congestionWindow:   20_000,
+		slowStartThreshold: 40_000,
+		rtt:                rttEstimator{baseRTO: time.Second, rto: time.Second},
+		retransmit:         true,
+		retransmissionKind: tcpRetransmissionRTO,
+		outstanding: []sentTCPSegment{{sequence: 100, end: 1100,
+			state: sentTCPSegmentTransmitted, congestionPacketState: controller.transmissionState()}},
+	}
+	if index := state.prepareRetransmission(0, true, false, false, now); index != 0 {
+		t.Fatalf("zero-window retransmission index = %d, want 0", index)
+	}
+	if recorder.lossEvidence {
+		t.Fatal("zero-window retransmission exposed loss evidence for congestion attribution")
+	}
+}
+
+func TestTCPZeroWindowRecoveryCannotPublishOutsideWindow(t *testing.T) {
+	state := tcpEstablishedState{
+		outstanding:        []sentTCPSegment{{sequence: 100, end: 200}},
+		retransmit:         true,
+		retransmissionKind: tcpRetransmissionRTO,
+		peerWindow:         0,
+		rtoRecovery:        true,
+		fastRecovery:       true,
+		haveRACKLoss:       true,
+	}
+	if state.recoveryOutputPending() || state.recoveryOutputReady() {
+		t.Fatal("zero-window recovery exposed ordinary output while the peer window was closed")
+	}
+	state.peerWindow = 65535
+	if !state.recoveryOutputPending() || !state.recoveryOutputReady() {
+		t.Fatal("recovery did not resume after the peer reopened its window")
+	}
+}
+
+func TestTCPZeroWindowOutstandingTimeoutUsesLinuxSilenceBudget(t *testing.T) {
+	now := time.Now()
+	c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	c.stack = &Stack{timestampEpoch: now.Add(-tcpZeroWindowOutstandingTimeout - time.Second)}
+	state := tcpEstablishedState{
+		connection:  c,
+		outstanding: []sentTCPSegment{{sequence: 100, end: 200}},
+		peerWindow:  0,
+	}
+	state.lastActivity = now.Add(-tcpZeroWindowOutstandingTimeout - time.Second)
+	if err := state.zeroWindowTimeoutError(now, 0); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("silent zero-window flight error = %v, want deadline exceeded", err)
+	}
+	// A current ACK keeps an open connection alive even when the retransmission
+	// episode itself has lasted longer than the default bound.
+	state.lastActivity = now.Add(-time.Second)
+	if err := state.zeroWindowTimeoutError(now, 0); err != nil {
+		t.Fatalf("responsive zero-window flight error = %v", err)
+	}
+	state.outstanding[0].firstSent = time.Second
+	state.lastActivity = now.Add(-tcpZeroWindowOutstandingTimeout)
+	if err := state.zeroWindowTimeoutError(now, 0); err != nil {
+		t.Fatalf("zero-window exact silence deadline error = %v, want nil", err)
+	}
+	state.outstanding[0].firstSent = time.Second - time.Nanosecond
+	state.lastActivity = now.Add(-tcpZeroWindowOutstandingTimeout - time.Nanosecond)
+	if err := state.zeroWindowTimeoutError(now, 0); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("zero-window exceeded silence deadline error = %v, want deadline exceeded", err)
+	}
+	c.userTimeout = 50 * time.Millisecond
+	state.outstanding[0].firstSent = now.Add(-c.userTimeout).Sub(c.stack.timestampEpoch)
+	if err := state.zeroWindowTimeoutError(now, c.userTimeout); err != nil {
+		t.Fatalf("user-timeout exact zero-window deadline error = %v, want nil", err)
+	}
+	state.outstanding[0].firstSent -= time.Nanosecond
+	if err := state.zeroWindowTimeoutError(now, c.userTimeout); !errors.Is(err, syscall.ETIMEDOUT) {
+		t.Fatalf("user-timeout exceeded zero-window deadline error = %v, want ETIMEDOUT", err)
+	}
+}
+
+func TestTCPZeroWindowOutstandingArmsSilenceDeadline(t *testing.T) {
+	now := time.Now()
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	connection.stack = &Stack{timestampEpoch: now.Add(-tcpZeroWindowOutstandingTimeout - time.Second)}
+	state := tcpEstablishedState{
+		connection:         connection,
+		outstanding:        []sentTCPSegment{{sequence: 100, end: 200}},
+		peerWindow:         0,
+		retransmit:         true,
+		retransmissionKind: tcpRetransmissionRTO,
+		lastActivity:       now.Add(-tcpZeroWindowOutstandingTimeout - time.Second),
+	}
+	state.armLiveness(false)
+	if !state.liveness {
+		t.Fatal("zero-window silence deadline was not armed")
+	}
+	if state.livenessDeadline.After(time.Now().Add(time.Second)) {
+		t.Fatalf("zero-window silence deadline = %v, want an already due deadline", state.livenessDeadline)
+	}
+}
+
+func TestTCPZeroWindowLivenessUsesStableClocks(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		outstanding bool
+		sacked      bool
+		timeout     time.Duration
+		active      bool
+	}{
+		{name: "pure persist", timeout: time.Second, active: true},
+		{name: "pure persist without user timeout"},
+		{name: "outstanding", outstanding: true, active: true},
+		{name: "outstanding user timeout", outstanding: true, timeout: time.Second, active: true},
+		{name: "fully SACKed user timeout", outstanding: true, sacked: true, timeout: time.Second, active: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now()
+			c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			c.stack = &Stack{timestampEpoch: now.Add(-time.Minute)}
+			c.userTimeout = test.timeout
+			c.sendBuffer.append(make([]byte, 200))
+			state := tcpEstablishedState{
+				connection: c, sendUnacknowledged: 100, sendNext: 100,
+				lastActivity: now, rtt: rttEstimator{rto: time.Second},
+			}
+			if test.outstanding {
+				state.sendNext = 200
+				state.outstanding = []sentTCPSegment{{sequence: 100, end: 200, firstSent: time.Minute,
+					hostQueue: packetQueueTicket{queuedAt: monotonicStampAt(c.stack.timestampEpoch, now)}}}
+				if test.sacked {
+					state.outstanding[0].state.set(sentTCPSegmentSACKed, true)
+					state.sackedRanges = 1
+				}
+			}
+			state.armPersist(time.Time{}, c.sendBuffer.size, false)
+			state.armLiveness(false)
+			if state.liveness != test.active {
+				t.Fatalf("liveness = %t, want %t", state.liveness, test.active)
+			}
+			if !test.active {
+				if state.livenessState != nil {
+					t.Fatal("pure persist without user timeout allocated liveness state")
+				}
+				return
+			}
+			var started time.Time
+			if state.livenessState != nil {
+				started = state.livenessState.zeroWindowSince
+			}
+			if (state.livenessState != nil) != !test.outstanding {
+				t.Fatal("outstanding timing allocated state instead of reusing firstSent")
+			}
+			deadline := state.livenessDeadline
+			for i := 0; i < 5; i++ {
+				state.updateRetransmissionTimer(tcpRetransmissionReselect, now)
+				state.armLiveness(false)
+				if !state.livenessDeadline.Equal(deadline) || state.livenessState != nil && !state.livenessState.zeroWindowSince.Equal(started) {
+					t.Fatal("timer reselection or liveness rearming moved the zero-window clock")
+				}
+			}
+			state.peerWindow = 65535
+			state.armLiveness(false)
+			if state.livenessState != nil && !state.livenessState.zeroWindowSince.IsZero() {
+				t.Fatal("window reopening retained the zero-window clock")
+			}
+		})
+	}
+}
+
+func TestTCPZeroWindowRetransmissionPrecedesSACKReneging(t *testing.T) {
+	for _, fullySACKed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fully-SACKed=%t", fullySACKed), func(t *testing.T) {
+			now := time.Now()
+			c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			state := tcpEstablishedState{
+				connection: c,
+				outstanding: []sentTCPSegment{
+					{sequence: 100, end: 200, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+					{sequence: 200, end: 300, state: sentTCPSegmentTransmitted},
+				},
+				peerWindow: 0, peerSACK: true, sackedRanges: 1,
+				rtt: rttEstimator{rto: time.Second},
+			}
+			if fullySACKed {
+				state.outstanding[1].state.set(sentTCPSegmentSACKed, true)
+				state.sackedRanges++
+			}
+			state.selectRetransmission(now, now, now)
+			if state.retransmissionKind != tcpRetransmissionRTO {
+				t.Fatalf("zero-window SACKed flight kind = %v, want ordinary RTO", state.retransmissionKind)
+			}
+			if index := state.retransmissionTarget(tcpRetransmissionRTO); index != 0 {
+				t.Fatalf("zero-window SACKed target = %d, want queue head", index)
+			}
+		})
+	}
+}
+
+// TestTCPZeroWindowSACKRenegingRecovery verifies that a zero-window RTO
+// retransmits the SACKed left edge and recovers the entire stream after reopening.
+func TestTCPZeroWindowSACKRenegingRecovery(t *testing.T) {
+	link, stack, c := newManuallyPumpedTCPConnection(t)
+	defer c.Close()
+	mss := c.Info().MaximumSegmentSize
+	payload := make([]byte, 3*mss)
+	for index := range payload {
+		payload[index] = byte(index / mss)
+	}
+	if n, err := c.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	var flight [3]TCPSegment
+	for index := range flight {
+		packet, err := ParseIPPacket(readOutboundPacket(t, stack))
+		if err != nil {
+			t.Fatal(err)
+		}
+		flight[index], err = packet.TCPSegment()
+		if err != nil || !bytes.Equal(flight[index].Payload, payload[index*mss:(index+1)*mss]) {
+			t.Fatalf("initial segment %d = %+v, %v", index, flight[index], err)
+		}
+	}
+	link.mu.Lock()
+	peer := link.tcp[c.key.local.Port()]
+	sequence := peer.serverNext
+	link.mu.Unlock()
+	var sack [10]byte
+	sack[0], sack[1] = TCPHeaderOptionSACK, 10
+	binary.BigEndian.PutUint32(sack[2:6], flight[1].SequenceNumber)
+	binary.BigEndian.PutUint32(sack[6:10], flight[1].SequenceNumber+uint32(mss))
+	if err := link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, flight[0].SequenceNumber, TCPFlagACK, 0, sack[:], nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return c.Info().PeerWindow == 0 })
+	// The receiver accepts the first range but discards the SACKed middle
+	// range. Its cumulative ACK exposes that stale mark at the new queue head.
+	link.mu.Lock()
+	peer.clientNext = flight[1].SequenceNumber
+	peer.pending = append(peer.pending, flight[0].Payload)
+	link.mu.Unlock()
+	if err := link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, flight[1].SequenceNumber, TCPFlagACK, 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return c.Info().BytesAcknowledged == uint64(mss) })
+	entry, ok := waitTestPacketEntry(&stack.outbound, c.Info().RetransmissionTimeout+time.Second)
+	if !ok {
+		t.Fatal("zero-window reneging did not publish an RTO retransmission")
+	}
+	retry := consumeTestPacket(&stack.outbound, entry)
+	packet, err := ParseIPPacket(retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := packet.TCPSegment()
+	if err != nil || wire.SequenceNumber != flight[1].SequenceNumber || !bytes.Equal(wire.Payload, flight[1].Payload) {
+		t.Fatalf("zero-window reneging retry = %+v, %v; want SACKed left edge %d", wire, err, flight[1].SequenceNumber)
+	}
+	if stats := stack.Stats(); stats.TCPZeroWindowProbes != 0 || stats.TCPTailLossProbes != 0 {
+		t.Fatalf("zero-window reneging used a non-RTO probe: %+v", stats)
+	}
+	if err = link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, flight[1].SequenceNumber, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = link.handleOutboundPacket(retry); err != nil {
+		t.Fatal(err)
+	}
+	for until := time.Now().Add(3 * time.Second); c.Info().BytesAcknowledged != uint64(len(payload)); {
+		if time.Now().After(until) {
+			t.Fatalf("reopened reneging flight did not drain: %+v", c.Info())
+		}
+		if entry, available := waitTestPacketEntry(&stack.outbound, 20*time.Millisecond); available {
+			if err = link.handleOutboundPacket(consumeTestPacket(&stack.outbound, entry)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err = c.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, len(payload))
+	if n, err := io.ReadFull(c, received); err != nil || !bytes.Equal(received, payload) {
+		t.Fatalf("reopened reneging stream = %d/%d bytes, %v", n, len(payload), err)
+	}
+}
+
+// TestTCPZeroWindowRetransmissionCancelsPLPMTUProbe verifies that a probe
+// larger than the confirmed MTU is safely resegmented without shrinking the search.
+func TestTCPZeroWindowRetransmissionCancelsPLPMTUProbe(t *testing.T) {
+	for _, family := range []struct{ name, local, remote string }{
+		{"IPv4", "192.0.2.204", "198.51.100.204"},
+		{"IPv6", "2001:db8::204", "2001:db8:1::204"},
+	} {
+		t.Run(family.name, func(t *testing.T) {
+			local, remote := netip.MustParseAddr(family.local), netip.MustParseAddr(family.remote)
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}, MTU: 3000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			network := "tcp4"
+			if local.Is6() {
+				network = "tcp6"
+			}
+			c := newTCPConn(stack, network, tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1500, tcpSocketOptionSet{})
+			c.peerMSS, c.peerWindow = 2960, 0
+			payloadSize := tcpMSSForMTU(2000, local)
+			c.sendBuffer.append(bytes.Repeat([]byte{0x33}, payloadSize))
+			state := newTCPEstablishedState(c, 100)
+			defer state.finish()
+			state.sendNext = 100 + uint32(payloadSize)
+			state.outstanding = []sentTCPSegment{{sequence: 100, end: state.sendNext, flags: TCPFlagACK, state: sentTCPSegmentTransmitted | sentTCPSegmentMTUProbe}}
+			state.pathMTUState = &tcpEstablishedPathMTUState{discovery: tcpPLPMTU{active: true, searching: true, probeMTU: 2000, probeStart: 100, probeEnd: state.sendNext, searchLow: 1500, searchHigh: 3000}}
+			index := state.prepareRetransmission(0, true, false, false, time.Now())
+			if index != 0 || len(state.outstanding) != 2 {
+				t.Fatalf("retransmission index/segments = %d/%d, want 0/2", index, len(state.outstanding))
+			}
+			discovery := state.pathMTUState.discovery
+			if discovery.active || discovery.probeMTU != 0 || !discovery.searching || discovery.searchLow != 1500 || discovery.searchHigh != 3000 || c.mtu != 1500 || stack.Stats().PathMTUProbeFailures != 0 {
+				t.Fatalf("inconclusive retry changed confirmed MTU or search bounds: mtu=%d discovery=%+v stats=%+v", c.mtu, discovery, stack.Stats())
+			}
+			for _, segment := range state.outstanding {
+				if segment.dataSize() > state.peerMSS || segment.state.has(sentTCPSegmentMTUProbe) {
+					t.Fatalf("unsafe probe remainder: %+v", segment)
+				}
+			}
+			window, _, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, state.outstanding[index], state.receiveNext, 65535, nil, false, c.mtu, tcpOutputWindow{})
+			window.release()
+			if err != nil || blocked {
+				t.Fatalf("zero-window retry publication = blocked:%t error:%v", blocked, err)
+			}
+			wire := readOutboundPacket(t, stack)
+			if len(wire) > c.mtu {
+				t.Fatalf("retry packet length = %d, exceeds confirmed MTU %d", len(wire), c.mtu)
+			}
+		})
+	}
+}
+
+// TestTCPZeroWindowPLPMTURecovery covers an actual oversized probe, its
+// zero-window RTO, and delivery of the whole stream after the window reopens.
+func TestTCPZeroWindowPLPMTURecovery(t *testing.T) {
+	for _, family := range []struct {
+		name, local, remote string
+		mtu                 int
+	}{
+		{"IPv4", "192.0.2.39", "192.0.2.40", 1000},
+		{"IPv6", "2001:db8::39", "2001:db8::40", 1280},
+	} {
+		t.Run(family.name, func(t *testing.T) {
+			link, stack := newTestStack(t, netip.MustParseAddr(family.local), netip.MustParseAddr(family.remote))
+			link.mu.Lock()
+			link.echoTCP = true
+			link.mu.Unlock()
+			if !stack.observePathMTU(link.remote, uint32(family.mtu)) {
+				t.Fatal("failed to install confirmed PMTU")
+			}
+			stack.pathMTUMu.Lock()
+			entry := stack.pathMTU[link.remote]
+			entry.updated = time.Now().Add(-pathMTULifetime + 50*time.Millisecond)
+			stack.pathMTU[link.remote] = entry
+			stack.pathMTUMu.Unlock()
+			connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8094))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			c := connection.(*TCPConn)
+			waitFor(t, time.Second, func() bool { return c.Info().PathMTUDiscovery })
+			link.mu.Lock()
+			link.echoTCP = false
+			peer := link.tcp[c.key.local.Port()]
+			sequence, ack := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+			payload := bytes.Repeat([]byte{0x33}, 16*1024)
+			if _, err := c.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			// Hold the original flight until the zero-window retry is observed.
+			// Dropping it would instead test recovery of a wholly lost flight.
+			var held []ipPacket
+			probeSeen := false
+			probeDeadline := time.NewTimer(time.Second)
+			defer probeDeadline.Stop()
+			for !probeSeen {
+				select {
+				case wire := <-link.outbound:
+					packet, ok := parseIPPacket(wire, false)
+					if !ok || packet.protocol != ProtocolTCP {
+						t.Fatal("invalid held TCP packet")
+					}
+					held = append(held, packet)
+					probeSeen = len(wire) > family.mtu
+				case <-probeDeadline.C:
+					t.Fatalf("oversized probe was not published: %+v", c.Info())
+				}
+			}
+			if err := link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, ack, TCPFlagACK, 0, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, time.Second, func() bool { return c.Info().PeerWindow == 0 })
+			retrySeen := false
+			retryDeadline := time.NewTimer(2 * time.Second)
+			defer retryDeadline.Stop()
+			for !retrySeen {
+				select {
+				case wire := <-link.outbound:
+					packet, ok := parseIPPacket(wire, false)
+					if !ok || packet.protocol != ProtocolTCP {
+						t.Fatal("invalid held TCP packet")
+					}
+					headerSize := int(packet.payload[12]>>4) * 4
+					retrySeen = binary.BigEndian.Uint32(packet.payload[4:8]) == ack && len(packet.payload) > headerSize && len(wire) <= family.mtu
+					held = append(held, packet)
+				case <-retryDeadline.C:
+					t.Fatalf("confirmed-MTU zero-window retry was not published: %+v", c.Info())
+				}
+			}
+			waitFor(t, time.Second, func() bool { return c.Info().Retransmissions != 0 })
+			if info := c.Info(); info.PathMTU != family.mtu || info.PathMTUProbe != 0 || info.PathMTUProbeFailures != 0 {
+				t.Fatalf("zero-window retry misclassified PMTU loss: %+v", info)
+			}
+			if err := link.deliverTCP(c.key.remote.Port(), c.key.local.Port(), sequence, ack, TCPFlagACK, 65535, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			// Deliver originals before their shorter retry so the emulated peer
+			// receives complete ranges without relying on overlapping-data support.
+			for _, packet := range held {
+				if err := link.handleTCP(packet); err != nil {
+					t.Fatal(err)
+				}
+			}
+			deliveryDeadline := time.NewTimer(5 * time.Second)
+			defer deliveryDeadline.Stop()
+			for {
+				link.mu.Lock()
+				delivered := peer.clientNext == ack+uint32(len(payload))
+				link.mu.Unlock()
+				if delivered {
+					break
+				}
+				select {
+				case wire := <-link.outbound:
+					packet, ok := parseIPPacket(wire, false)
+					if !ok || packet.protocol != ProtocolTCP {
+						t.Fatal("invalid resumed TCP packet")
+					}
+					if err := link.handleTCP(packet); err != nil {
+						t.Fatal(err)
+					}
+				case <-deliveryDeadline.C:
+					t.Fatalf("reopened flight was not delivered: %+v", c.Info())
+				}
+			}
+			link.mu.Lock()
+			link.echoTCP = true
+			link.mu.Unlock()
+			_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			received := make([]byte, len(payload))
+			if n, err := io.ReadFull(c, received); err != nil || !bytes.Equal(received, payload) {
+				link.mu.Lock()
+				peer := link.tcp[c.key.local.Port()]
+				peerNext, pending, outOfOrder := peer.clientNext, len(peer.pending), len(peer.outOfOrder)
+				link.mu.Unlock()
+				t.Fatalf("reopened stream = %d/%d bytes equal:%t error:%v info:%+v peer next:%d pending:%d out-of-order:%d", n, len(payload), bytes.Equal(received, payload), err, c.Info(), peerNext, pending, outOfOrder)
+			}
+		})
+	}
 }
 
 // TestTCPPathMTUReduction verifies that Packet Too Big resegments outstanding
@@ -10402,6 +11579,32 @@ func TestTCPQueuedSegmentEventTime(t *testing.T) {
 	}
 }
 
+// TestTCPEmptyFlightTimerOwnership verifies that ACK timer maintenance stops
+// ordinary loss clocks but preserves independently owned transport deadlines.
+func TestTCPEmptyFlightTimerOwnership(t *testing.T) {
+	deadline := time.Now().Add(time.Second)
+	for _, kind := range []tcpRetransmissionKind{tcpRetransmissionRTO, tcpRetransmissionProbe, tcpRetransmissionRACK, tcpRetransmissionSACKReneging, tcpRetransmissionPathMTU, tcpRetransmissionClose} {
+		for _, update := range []tcpRetransmissionUpdate{tcpRetransmissionPreserve, tcpRetransmissionRestart, tcpRetransmissionReselect} {
+			state := tcpEstablishedState{retransmit: true, retransmissionKind: kind, retransmissionDeadline: deadline}
+			state.sendTimer.baseDeadline = deadline
+			state.updateRetransmissionTimer(update, time.Now())
+			if kind >= tcpRetransmissionPathMTU {
+				if !state.retransmit || state.retransmissionKind != kind || !state.retransmissionDeadline.Equal(deadline) || !state.sendTimer.baseDeadline.Equal(deadline) {
+					t.Fatalf("owned timer kind=%v update=%v was cleared: %+v", kind, update, state)
+				}
+			} else if state.retransmit || state.retransmissionKind != tcpRetransmissionRTO || !state.retransmissionDeadline.IsZero() || !state.sendTimer.baseDeadline.IsZero() {
+				t.Fatalf("empty loss timer kind=%v update=%v was retained: %+v", kind, update, state)
+			}
+		}
+	}
+	state := tcpEstablishedState{persist: true}
+	state.sendTimer.baseDeadline = deadline
+	state.updateRetransmissionTimer(tcpRetransmissionRestart, time.Now())
+	if !state.persist || !state.sendTimer.baseDeadline.Equal(deadline) {
+		t.Fatalf("ACK timer maintenance changed pure persist: %+v", state)
+	}
+}
+
 func TestTCPLivenessClearsDisabledUserTimeoutState(t *testing.T) {
 	zeroWindowSince := time.Now().Add(-time.Minute)
 	state := tcpEstablishedState{
@@ -10446,6 +11649,7 @@ func TestTCPLivenessKeepAliveUserTimeoutDeadline(t *testing.T) {
 		disabled      bool
 		outstanding   bool
 		zeroWindow    bool
+		dataAfter     time.Duration
 		deadlineAfter time.Duration
 	}{
 		{name: "first probe short timeout", userTimeout: 5 * time.Second, deadlineAfter: 30 * time.Second},
@@ -10469,6 +11673,13 @@ func TestTCPLivenessKeepAliveUserTimeoutDeadline(t *testing.T) {
 		{name: "pending outstanding data", userTimeout: 5 * time.Second, probed: true, pending: true, outstanding: true, deadlineAfter: 37 * time.Second},
 		{name: "zero window", userTimeout: 5 * time.Second, probed: true, zeroWindow: true, deadlineAfter: 37 * time.Second},
 		{name: "pending zero window", userTimeout: 5 * time.Second, probed: true, pending: true, zeroWindow: true, deadlineAfter: 37 * time.Second},
+		{name: "data postpones first probe", dataAfter: 20 * time.Second, deadlineAfter: 50 * time.Second},
+		{name: "data postpones subsequent probe", dataAfter: 35 * time.Second, probed: true, deadlineAfter: 65 * time.Second},
+		{name: "probe interval remains minimum", dataAfter: 5 * time.Second, probed: true, deadlineAfter: 40 * time.Second},
+		{name: "data postpones pending user timeout", userTimeout: 45 * time.Second, dataAfter: 35 * time.Second, probed: true, pending: true, deadlineAfter: 80 * time.Second},
+		{name: "data postpones independent idle timeout", idleTimeout: 10 * time.Second, dataAfter: 35 * time.Second, probed: true, deadlineAfter: 45 * time.Second},
+		{name: "data cannot postpone outstanding user timeout", userTimeout: 5 * time.Second, dataAfter: 35 * time.Second, probed: true, outstanding: true, deadlineAfter: 37 * time.Second},
+		{name: "data cannot postpone persist user timeout", userTimeout: 5 * time.Second, dataAfter: 35 * time.Second, probed: true, zeroWindow: true, deadlineAfter: 37 * time.Second},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			connection := &TCPConn{
@@ -10479,6 +11690,9 @@ func TestTCPLivenessKeepAliveUserTimeoutDeadline(t *testing.T) {
 				idleTimeout:     test.idleTimeout,
 			}
 			state := tcpEstablishedState{connection: connection, lastActivity: activity, peerWindow: 65535}
+			if test.dataAfter != 0 {
+				state.lastDataReceived = monotonicStampAt(activity, activity.Add(test.dataAfter))
+			}
 			if test.probed {
 				state.livenessState = &tcpEstablishedLivenessState{keepAliveProbes: 1, lastKeepAlive: activity.Add(30 * time.Second)}
 			}

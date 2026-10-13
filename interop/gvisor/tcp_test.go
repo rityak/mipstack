@@ -2595,6 +2595,144 @@ func TestTCPPersistProbeResponseInterop(t *testing.T) {
 	}
 }
 
+// TestTCPZeroWindowOutstandingResponseInterop verifies native gVisor replies
+// to mipstack's outstanding-data retries and delivery after the window reopens.
+func TestTCPZeroWindowOutstandingResponseInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var widened atomic.Bool
+			var captured atomic.Bool
+			var zeroACK, responses atomic.Uint32
+			retryPacket := make(chan []byte, 1)
+			zeroReplies := make(chan uint32, 16)
+			seen := make(map[uint32]bool)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					segment, _, ok := tcpSegment(packet)
+					if !ok {
+						return true
+					}
+					if segment.Flags() == header.TCPFlagSyn|header.TCPFlagAck {
+						// gVisor does not shrink its advertised window. Enlarge only
+						// the SYN-ACK's grant to reproduce a peer that subsequently
+						// shrinks it; all established ACKs remain native and unchanged.
+						segment.SetWindowSize(65535)
+						segment.SetChecksum(0)
+						partial := header.PseudoHeaderChecksum(tcp.ProtocolNumber, gvisorAddress(family.gvisorAddress), gvisorAddress(family.mipstackAddress), uint16(len(segment)))
+						segment.SetChecksum(^checksum.Checksum(segment, partial))
+						widened.Store(true)
+					} else if segment.Flags() == header.TCPFlagAck && segment.WindowSize() == 0 {
+						zeroACK.Store(segment.AckNumber())
+						responses.Add(1)
+						select {
+						case zeroReplies <- segment.AckNumber():
+						default:
+						}
+					}
+					return true
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if !ok || size == 0 {
+						return true
+					}
+					sequence := segment.SequenceNumber()
+					repeated := seen[sequence]
+					seen[sequence] = true
+					if repeated && responses.Load() != 0 && sequence == zeroACK.Load() && !captured.Swap(true) {
+						// Hold one natural RTO packet so an earlier queued ACK cannot
+						// be mistaken for the receiver's response to its delivery.
+						retryPacket <- append([]byte(nil), packet...)
+						return false
+					}
+					return true
+				},
+			})
+			limits := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 4096, Max: 4096}
+			if err := network.gvisor.SetTransportProtocolOption(tcp.ProtocolNumber, &limits); err != nil {
+				t.Fatalf("set gVisor receive limits: %s", err.String())
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer server.Close()
+			defer client.Close()
+			deadline := time.Now().Add(8 * time.Second)
+			if err := client.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			connection := client.(*mipstack.TCPConn)
+			payload := patternedPayload(3*connection.Info().MaximumSegmentSize, 163)
+			if n, err := client.Write(payload); err != nil || n != len(payload) {
+				t.Fatalf("mipstack outstanding Write = %d, %v", n, err)
+			}
+			for until := time.Now().Add(time.Second); time.Now().Before(until); {
+				if info := connection.Info(); info.PeerWindow == 0 && info.BytesSent > info.BytesAcknowledged {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if info := connection.Info(); info.PeerWindow != 0 || info.BytesSent <= info.BytesAcknowledged {
+				t.Fatalf("gVisor did not close its window with outstanding data: %+v", info)
+			}
+			// Release one receive segment so native retries can be processed.
+			// The remaining free space stays below gVisor's window-reopen threshold.
+			received := make([]byte, len(payload))
+			prefix := connection.Info().MaximumSegmentSize
+			if n, err := io.ReadFull(server, received[:prefix]); err != nil || n != prefix {
+				t.Fatalf("gVisor partial read = %d/%d bytes, %v", n, prefix, err)
+			}
+			var retry []byte
+			select {
+			case retry = <-retryPacket:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("outstanding zero-window retry was not observed: %+v", connection.Info())
+			}
+			for len(zeroReplies) != 0 {
+				<-zeroReplies
+			}
+			select {
+			case ack := <-zeroReplies:
+				t.Fatalf("unexpected zero-window ACK %d before retry delivery", ack)
+			case <-time.After(100 * time.Millisecond):
+			}
+			segment, _, ok := tcpSegment(retry)
+			if !ok {
+				t.Fatal("invalid held retry packet")
+			}
+			if err := network.deliverToGVisor(retry); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case ack := <-zeroReplies:
+				if ack != segment.SequenceNumber() {
+					t.Fatalf("native zero-window response ACK = %d, want %d", ack, segment.SequenceNumber())
+				}
+			case <-time.After(time.Second):
+				t.Fatal("gVisor did not respond to the delivered RTO packet")
+			}
+			if info := connection.Info(); !widened.Load() || info.PeerWindow != 0 || info.BytesSent <= info.BytesAcknowledged || info.Retransmissions == 0 {
+				t.Fatalf("outstanding zero-window response = widened:%t replies:%d info:%+v", widened.Load(), responses.Load(), info)
+			}
+			if stats := network.mipstack.Stats(); stats.TCPZeroWindowProbes != 0 || stats.TCPTailLossProbes != 0 {
+				t.Fatalf("outstanding flight used a persist or tail-loss probe: %+v", stats)
+			}
+			if n, err := io.ReadFull(server, received[prefix:]); err != nil || !bytes.Equal(received, payload) {
+				t.Fatalf("gVisor read after reopening = %d/%d bytes, %v; %+v", n+prefix, len(payload), err, connection.Info())
+			}
+			exchangeTCPPayload(t, server, client, patternedPayload(4096, 165))
+			if info := connection.Info(); info.LastError != nil || info.State != mipstack.TCPStateEstablished {
+				t.Fatalf("resumed outstanding connection = %+v", info)
+			}
+		})
+	}
+}
+
 // TestTCPZeroWindowFINInterop verifies that a FIN-only segment is consumed at
 // RCV.NXT while mipstack's application receive buffer is full. The bridge
 // counts FINs so a delayed close caused by peer retransmission cannot pass.

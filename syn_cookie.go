@@ -106,8 +106,8 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 		return errors.New("mipstack: MTU is too small for TCP")
 	}
 	// RFC 7323 requires TSval to use the sender's current timestamp clock. Keep
-	// the cookie timestamp independent of the delayed input event time and
-	// preserve the existing ECN parity encoding while avoiding zero.
+	// the cookie timestamp independent of the delayed input event time; ECN
+	// parity encoding must not move it ahead of that clock.
 	timestamp := stack.tcpTimestamp()
 	if options.timestamp {
 		timestamp = synCookieTimestamp(timestamp, options.ecn)
@@ -131,17 +131,18 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 	return stack.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0, defaults.FlowLabel, flowLabelSet, outputFlowKey{})
 }
 
-// synCookieTimestamp encodes ECN in TSval's low bit without emitting zero.
-// RFC 7323 section 3.2 permits zero, but Linux's tcp_synack_options replaces
-// a first zero TSval with ~0U to avoid its initialization sentinel. Here the
-// low bit carries ECN, so the no-ECN fallback must be a nonzero even value.
+// synCookieTimestamp encodes ECN in TSval's low bit without exceeding the
+// current clock, as Linux does for option-packed cookie timestamps.
+// RFC 7323 section 3.2 permits TSval zero. Timestamp negotiation is tracked
+// separately from TSval here, so Linux's SYN-ACK zero-value sentinel is not
+// needed; backward rounding also preserves parity across wraparound.
 func synCookieTimestamp(raw uint32, ecn bool) uint32 {
 	timestamp := raw &^ 1
 	if ecn {
-		return timestamp | 1
+		timestamp |= 1
 	}
-	if timestamp == 0 {
-		return 2
+	if tcpSequenceGreater(timestamp, raw) {
+		timestamp -= 2
 	}
 	return timestamp
 }
