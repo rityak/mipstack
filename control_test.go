@@ -2,9 +2,12 @@ package mipstack
 
 import (
 	"bytes"
+	"context"
 	"encoding"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+	"net"
 	"net/netip"
 	"testing"
 )
@@ -203,6 +206,32 @@ func TestSocketErrorControlMessageLinuxFixtures(t *testing.T) {
 			encoded, err := test.message.MarshalBinary()
 			if err != nil || !bytes.Equal(encoded, wire) {
 				t.Fatalf("MarshalBinary = %x, %v, want Linux fixture %x", encoded, err, wire)
+			}
+			for _, compound := range []bool{false, true} {
+				for tail := 0; tail <= linuxControlHeaderSize; tail++ {
+					t.Run(fmt.Sprintf("compound-%v/tail-%d", compound, tail), func(t *testing.T) {
+						var control []byte
+						if compound {
+							control = appendLinuxControlInt32(nil, linuxLevelIP, linuxIPTimeToLive, 31)
+						}
+						control = append(control, wire...)
+						control = append(control, bytes.Repeat([]byte{0xa5}, tail)...)
+						before := append([]byte(nil), control...)
+						initial := SocketErrorControlMessage{Errno: 1, Offender: netip.MustParseAddr("192.0.2.1")}
+						message := initial
+						err := message.Parse(control)
+						if tail == linuxControlHeaderSize {
+							if err == nil || message != initial {
+								t.Fatalf("invalid trailing record Parse = %+v, %v", message, err)
+							}
+						} else if err != nil || message != test.message {
+							t.Fatalf("Parse = %+v, %v, want %+v", message, err, test.message)
+						}
+						if !bytes.Equal(control, before) {
+							t.Fatal("socket-error parsing modified its input")
+						}
+					})
+				}
 			}
 		})
 	}
@@ -417,7 +446,6 @@ func TestIPControlMessageKnownAnswerMutations(t *testing.T) {
 		name   string
 		mutate func([]byte) []byte
 	}{
-		{name: "short header", mutate: func(wire []byte) []byte { return wire[:15] }},
 		{name: "length below header", mutate: func(wire []byte) []byte {
 			binary.LittleEndian.PutUint64(wire[:8], 15)
 			return wire
@@ -451,6 +479,38 @@ func TestIPControlMessageKnownAnswerMutations(t *testing.T) {
 			}
 			if message != initial || !bytes.Equal(wire, before) {
 				t.Fatal("failed control parse modified its receiver or input")
+			}
+		})
+	}
+}
+
+func TestControlMessageShortHeader(t *testing.T) {
+	control := mustCodecVector(t, "1c000000000000000000000008000000")
+	for length := 0; length < linuxControlHeaderSize; length++ {
+		t.Run(fmt.Sprintf("length-%d", length), func(t *testing.T) {
+			wire := control[:length]
+			before := append([]byte(nil), wire...)
+			message4 := IPv4ControlMessage{TTL: 7, TOS: 9, Dst: netip.MustParseAddr("192.0.2.1")}
+			if err := message4.Parse(wire); err != nil || message4 != (IPv4ControlMessage{}) {
+				t.Fatalf("IPv4 Parse = %+v, %v; want empty metadata", message4, err)
+			}
+			message6 := IPv6ControlMessage{HopLimit: 7, TrafficClass: 9, Dst: netip.MustParseAddr("2001:db8::1")}
+			if err := message6.Parse(wire); err != nil || message6 != (IPv6ControlMessage{}) {
+				t.Fatalf("IPv6 Parse = %+v, %v; want empty metadata", message6, err)
+			}
+			for _, v6 := range []bool{false, true} {
+				address, options, err := parseControlMessageForWrite(wire, v6)
+				if err != nil || address.IsValid() || options != (ipPacketOptions{}) {
+					t.Fatalf("IPv6 %v send control = %v/%+v, %v; want defaults", v6, address, options, err)
+				}
+			}
+			initial := SocketErrorControlMessage{Errno: 1, Offender: netip.MustParseAddr("192.0.2.1")}
+			message := initial
+			if err := message.Parse(wire); err == nil || err.Error() != "mipstack: socket-error control message not found" || message != initial {
+				t.Fatalf("socket-error Parse = %+v, %v; want unchanged receiver and not-found error", message, err)
+			}
+			if !bytes.Equal(wire, before) {
+				t.Fatal("short-header parsing modified its input")
 			}
 		})
 	}
@@ -745,9 +805,370 @@ func TestLinuxControlMessageTruncation(t *testing.T) {
 			}
 		})
 	}
-	writeControl := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, 31)
-	if _, _, err := parseControlMessageForWrite(writeControl[:len(writeControl)-1], true); err == nil {
-		t.Fatal("write ancillary with partial final padding parsed successfully")
+}
+
+func TestLinuxControlMessageFinalPadding(t *testing.T) {
+	for _, v6 := range []bool{false, true} {
+		var level, hopKind, classKind uint32 = linuxLevelIP, linuxIPTimeToLive, linuxIPTypeOfService
+		if v6 {
+			level, hopKind, classKind = linuxLevelIPv6, linuxIPv6HopLimit, linuxIPv6TrafficClass
+		}
+		last := appendLinuxControlInt32(nil, level, hopKind, 31)
+		for i := 20; i < len(last); i++ {
+			last[i] = 0xa5
+		}
+		last = append(last, bytes.Repeat([]byte{0xa5}, linuxControlHeaderSize)...)
+		for _, compound := range []bool{false, true} {
+			for length := 19; length <= len(last); length++ {
+				t.Run(fmt.Sprintf("IPv6-%v/compound-%v/length-%d", v6, compound, length), func(t *testing.T) {
+					var control []byte
+					if compound {
+						control = appendLinuxControlInt32(nil, level, classKind, 47)
+					}
+					control = append(control, last[:length]...)
+					before := append([]byte(nil), control...)
+					invalid := length < 20 || length == len(last)
+					for _, receiving := range []bool{false, true} {
+						_, options, err := parseLinuxIPControlValues(control, v6, receiving)
+						if invalid {
+							if err == nil {
+								t.Fatal("invalid control record was accepted")
+							}
+							continue
+						}
+						if err != nil || !options.hopLimitSet || options.hopLimit != 31 ||
+							compound && (!options.trafficClassSet || options.trafficClass != 47) {
+							t.Fatalf("receiving %v control = %+v, %v", receiving, options, err)
+						}
+					}
+					class := 0
+					if compound {
+						class = 47
+					}
+					if v6 {
+						initial := IPv6ControlMessage{HopLimit: 7, TrafficClass: 9}
+						message := initial
+						err := message.Parse(control)
+						if invalid {
+							if err == nil || message != initial {
+								t.Fatalf("invalid IPv6 Parse = %+v, %v", message, err)
+							}
+						} else if err != nil || message != (IPv6ControlMessage{HopLimit: 31, TrafficClass: class}) {
+							t.Fatalf("IPv6 Parse = %+v, %v", message, err)
+						}
+					} else {
+						initial := IPv4ControlMessage{TTL: 7, TOS: 9}
+						message := initial
+						err := message.Parse(control)
+						if invalid {
+							if err == nil || message != initial {
+								t.Fatalf("invalid IPv4 Parse = %+v, %v", message, err)
+							}
+						} else if err != nil || message != (IPv4ControlMessage{TTL: 31, TOS: class}) {
+							t.Fatalf("IPv4 Parse = %+v, %v", message, err)
+						}
+					}
+					if !bytes.Equal(control, before) {
+						t.Fatal("control parsing modified its input")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestLinuxControlMessageInvalidTrailingRecord(t *testing.T) {
+	for _, v6 := range []bool{false, true} {
+		var level, kind uint32 = linuxLevelIP, linuxIPTimeToLive
+		if v6 {
+			level, kind = linuxLevelIPv6, linuxIPv6HopLimit
+		}
+		valid := appendLinuxControlInt32(nil, level, kind, 31)
+		for _, test := range []struct {
+			name    string
+			length  uint64
+			payload []byte
+		}{
+			{name: "length below header", length: 15},
+			{name: "length beyond input", length: 20},
+			{name: "missing scalar", length: 16},
+			{name: "short scalar", length: 19, payload: []byte{31, 0, 0}},
+		} {
+			t.Run(fmt.Sprintf("IPv6-%v/%s", v6, test.name), func(t *testing.T) {
+				tail := make([]byte, linuxControlHeaderSize+len(test.payload))
+				binary.LittleEndian.PutUint64(tail[:8], test.length)
+				binary.LittleEndian.PutUint32(tail[8:12], level)
+				binary.LittleEndian.PutUint32(tail[12:16], kind)
+				copy(tail[linuxControlHeaderSize:], test.payload)
+				control := append(append([]byte(nil), valid...), tail...)
+				before := append([]byte(nil), control...)
+				if _, _, err := parseControlMessageForWrite(control, v6); err == nil {
+					t.Fatal("invalid complete trailing record accepted on write")
+				}
+				if v6 {
+					initial := IPv6ControlMessage{HopLimit: 7, TrafficClass: 9}
+					message := initial
+					if err := message.Parse(control); err == nil || message != initial {
+						t.Fatalf("invalid IPv6 Parse = %+v, %v", message, err)
+					}
+				} else {
+					initial := IPv4ControlMessage{TTL: 7, TOS: 9}
+					message := initial
+					if err := message.Parse(control); err == nil || message != initial {
+						t.Fatalf("invalid IPv4 Parse = %+v, %v", message, err)
+					}
+				}
+				errorControl, err := (SocketErrorControlMessage{Errno: 111, Origin: SocketErrorOriginICMP, Offender: netip.MustParseAddr("192.0.2.1")}).MarshalBinary()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if test.length < linuxControlHeaderSize || test.length > uint64(len(tail)) {
+					initial := SocketErrorControlMessage{Errno: 1}
+					message := initial
+					if err = message.Parse(append(errorControl, tail...)); err == nil || message != initial {
+						t.Fatalf("invalid socket-error framing Parse = %+v, %v", message, err)
+					}
+				}
+				if !bytes.Equal(control, before) {
+					t.Fatal("failed parsing modified its input")
+				}
+			})
+		}
+	}
+}
+
+func TestLinuxControlMessagePayloadLengths(t *testing.T) {
+	packetInfo6 := make([]byte, 20)
+	address := netip.MustParseAddr("2001:db8::1").As16()
+	copy(packetInfo6, address[:])
+	for _, test := range []struct {
+		name        string
+		level, kind uint32
+		data        []byte
+		v6, extra   bool
+	}{
+		{name: "IPv6 packet info", level: linuxLevelIPv6, kind: linuxIPv6PacketInfo, data: packetInfo6, v6: true, extra: true},
+		{name: "IPv6 flow info", level: linuxLevelIPv6, kind: linuxIPv6FlowInfo, data: []byte{0, 0, 0, 7}, v6: true, extra: true},
+		{name: "IPv4 packet info", level: linuxLevelIP, kind: linuxIPPacketInfo, data: make([]byte, 12)},
+		{name: "IPv4 TTL", level: linuxLevelIP, kind: linuxIPTimeToLive, data: []byte{31, 0, 0, 0}},
+		{name: "IPv6 hop limit", level: linuxLevelIPv6, kind: linuxIPv6HopLimit, data: []byte{31, 0, 0, 0}, v6: true},
+		{name: "IPv6 traffic class", level: linuxLevelIPv6, kind: linuxIPv6TrafficClass, data: []byte{47, 0, 0, 0}, v6: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var level, kind uint32 = linuxLevelIP, linuxIPTimeToLive
+			if test.v6 {
+				level, kind = linuxLevelIPv6, linuxIPv6HopLimit
+			}
+			for _, delta := range []int{-1, 0, 1, 4, 8} {
+				t.Run(fmt.Sprintf("extra-%d", delta), func(t *testing.T) {
+					data := bytes.Repeat([]byte{0xa5}, len(test.data)+8)
+					copy(data, test.data)
+					control := appendLinuxControl(nil, test.level, test.kind, data[:len(test.data)+delta])
+					control = appendLinuxControlInt32(control, level, kind, 61)
+					canonical := appendLinuxControl(nil, test.level, test.kind, test.data)
+					canonical = appendLinuxControlInt32(canonical, level, kind, 61)
+					for _, receiving := range []bool{false, true} {
+						address, options, err := parseLinuxIPControlValues(control, test.v6, receiving)
+						if delta < 0 || delta > 0 && !test.extra {
+							if err == nil {
+								t.Fatal("invalid payload length was accepted")
+							}
+							continue
+						}
+						wantAddress, wantOptions, wantErr := parseLinuxIPControlValues(canonical, test.v6, receiving)
+						if err != nil || wantErr != nil || address != wantAddress || options != wantOptions || options.hopLimit != 61 {
+							t.Fatalf("receiving %v control = %v/%+v, %v; want %v/%+v, %v", receiving, address, options, err, wantAddress, wantOptions, wantErr)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLinuxControlMessageWritePaths(t *testing.T) {
+	for _, v6 := range []bool{false, true} {
+		local, remote := netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("198.51.100.10")
+		if v6 {
+			local, remote = netip.MustParseAddr("2001:db8::10"), netip.MustParseAddr("2001:db8:1::10")
+		}
+		for _, mode := range []string{"UDP", "IP", "IP header included"} {
+			t.Run(fmt.Sprintf("IPv6-%v/%s", v6, mode), func(t *testing.T) {
+				defaults := DatagramSocketDefaults{HopLimit: 53, TrafficClass: 17, FlowLabel: 9}
+				stack, err := New(Config{
+					LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())},
+					UDP:            UDPSocketDefaults{DatagramSocketDefaults: defaults},
+					IP:             IPSocketDefaults{DatagramSocketDefaults: defaults},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer stack.Close()
+				var udp *UDPConn
+				var ip *IPConn
+				if mode == "UDP" {
+					connection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 50123))
+					if err != nil {
+						t.Fatal(err)
+					}
+					udp = connection.(*UDPConn)
+					defer udp.Close()
+				} else {
+					connection, err := stack.ListenIP(context.Background(), "ip:99", local)
+					if err != nil {
+						t.Fatal(err)
+					}
+					ip = connection.(*IPConn)
+					defer ip.Close()
+					if err = ip.SetIPHeaderIncludedOnWrite(mode == "IP header included"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, oversized := range []bool{false, true} {
+					var control []byte
+					if v6 {
+						data := make([]byte, 20)
+						address := local.As16()
+						copy(data, address[:])
+						if oversized {
+							data = append(data, 0xa5, 0xa5, 0xa5, 0xa5)
+						}
+						control = appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6PacketInfo, data)
+						data = []byte{0, 0, 0, 7}
+						if oversized {
+							data = append(data, 0xa5, 0xa5, 0xa5, 0xa5)
+						}
+						control = appendLinuxControl(control, linuxLevelIPv6, linuxIPv6FlowInfo, data)
+						control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6HopLimit, 31)
+						control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6TrafficClass, 47)
+					} else {
+						control = appendLinuxIPv4PacketInfoControl(nil, local, netip.Addr{})
+						control = appendLinuxControlInt32(control, linuxLevelIP, linuxIPTimeToLive, 31)
+						control = appendLinuxControlInt32(control, linuxLevelIP, linuxIPTypeOfService, 47)
+					}
+					type controlTest struct {
+						name              string
+						oob               []byte
+						defaults, invalid bool
+					}
+					tests := []controlTest{
+						{name: "partial padding", oob: control[:len(control)-1]},
+					}
+					for tail := 0; tail <= linuxControlHeaderSize; tail++ {
+						oob := append([]byte(nil), control...)
+						oob = append(oob, bytes.Repeat([]byte{0xa5}, tail)...)
+						tests = append(tests, controlTest{name: fmt.Sprintf("tail-%d", tail), oob: oob, invalid: tail == linuxControlHeaderSize})
+					}
+					for length := 0; length < linuxControlHeaderSize; length++ {
+						tests = append(tests, controlTest{name: fmt.Sprintf("short-%d", length), oob: bytes.Repeat([]byte{0xa5}, length), defaults: true})
+					}
+					methods := []string{"message", "batch single buffer", "batch scatter"}
+					if udp != nil {
+						methods = append(methods, "message addrport")
+					}
+					for _, test := range tests {
+						for _, method := range methods {
+							t.Run(fmt.Sprintf("oversized-%v/%s/%s", oversized, test.name, method), func(t *testing.T) {
+								before := append([]byte(nil), test.oob...)
+								payload := []byte("control boundaries")
+								var address net.Addr = ipNetAddr(remote)
+								if udp != nil {
+									address = net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 50124))
+								} else if mode == "IP header included" {
+									payload = buildIPPacketWithOptions(local, remote, 99, payload, 1, true, ipPacketOptions{hopLimit: 31, trafficClass: 47, flowLabel: 7})
+								}
+								batch := method == "batch single buffer" || method == "batch scatter"
+								if batch {
+									buffers := [][]byte{payload}
+									if method == "batch scatter" {
+										buffers = [][]byte{payload[:3], payload[3:]}
+									}
+									messages := []SocketMessage{{Buffers: buffers, OOB: test.oob, Addr: address}}
+									if test.invalid {
+										messages = []SocketMessage{
+											{Buffers: buffers, OOB: control, Addr: address},
+											{Buffers: buffers, OOB: test.oob, Addr: address, N: -1, NN: -1, Flags: -1},
+											{Buffers: buffers, OOB: control, Addr: address, N: -1, NN: -1, Flags: -1},
+										}
+									}
+									var n int
+									if udp != nil {
+										n, err = udp.WriteBatch(messages, 0)
+									} else {
+										n, err = ip.WriteBatch(messages, 0)
+									}
+									wantNN := len(test.oob)
+									if test.invalid {
+										wantNN = len(control)
+									}
+									if n != 1 || err != nil || messages[0].N != len(payload) || messages[0].NN != wantNN {
+										t.Fatalf("WriteBatch = %d, %v, message %+v", n, err, messages[0])
+									}
+									if test.invalid {
+										for _, message := range messages[1:] {
+											if message.N != -1 || message.NN != -1 || message.Flags != -1 {
+												t.Fatalf("unwritten batch suffix modified: %+v", message)
+											}
+										}
+										if udp != nil {
+											n, err = udp.WriteBatch(messages[1:2], 0)
+										} else {
+											n, err = ip.WriteBatch(messages[1:2], 0)
+										}
+										if n != 0 || err == nil || messages[1].N != -1 || messages[1].NN != -1 || messages[1].Flags != -1 {
+											t.Fatalf("invalid first WriteBatch = %d, %v, message %+v", n, err, messages[1])
+										}
+									}
+								} else {
+									var n, nn int
+									if method == "message addrport" {
+										n, nn, err = udp.WriteMsgUDPAddrPort(payload, test.oob, netip.AddrPortFrom(remote, 50124))
+									} else if udp != nil {
+										n, nn, err = udp.WriteMsgUDP(payload, test.oob, address.(*net.UDPAddr))
+									} else {
+										n, nn, err = ip.WriteMsgIP(payload, test.oob, address.(*net.IPAddr))
+									}
+									if test.invalid {
+										if err == nil || n != 0 || nn != 0 || stack.outbound.len() != 0 {
+											t.Fatalf("invalid WriteMsg = %d/%d, %v, queued %d packets", n, nn, err, stack.outbound.len())
+										}
+										if !bytes.Equal(test.oob, before) {
+											t.Fatal("failed write modified its control data")
+										}
+										return
+									}
+									if err != nil || n != len(payload) || nn != len(test.oob) {
+										t.Fatalf("WriteMsg = %d/%d, %v", n, nn, err)
+									}
+								}
+								hop, class, label := uint8(31), uint8(47), uint32(7)
+								if test.defaults && mode != "IP header included" {
+									hop, class, label = 53, 17, 9
+								}
+								packet, valid := parseIPPacket(readOutboundPacket(t, stack), false)
+								data := packet.payload
+								if udp != nil && valid {
+									data = data[udpHeaderSize:]
+								}
+								if !valid || packet.source != local || packet.target != remote || packet.hopLimit != hop || packet.trafficClass != class ||
+									v6 && packet.flowLabel != label || string(data) != "control boundaries" {
+									t.Fatalf("packet = %+v, parsed %v; want hop/class/label %d/%d/%d", packet, valid, hop, class, label)
+								}
+								if stack.outbound.len() != 0 || !bytes.Equal(test.oob, before) {
+									t.Fatal("write queued extra packets or modified its control data")
+								}
+							})
+						}
+					}
+					if !v6 {
+						break
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -763,6 +1184,13 @@ func FuzzControlMessageParsing(f *testing.F) {
 	f.Add(control6)
 	f.Add(error4)
 	f.Add(error6)
+	for _, control := range [][]byte{control4, control6, error4, error6} {
+		for _, tail := range []int{1, 7, 8, 15, 16} {
+			seed := append([]byte(nil), control...)
+			f.Add(append(seed, bytes.Repeat([]byte{0xa5}, tail)...))
+		}
+	}
+	f.Add(bytes.Repeat([]byte{0xa5}, linuxControlHeaderSize-1))
 	f.Fuzz(func(t *testing.T, control []byte) {
 		if len(control) > 4096 {
 			control = control[:4096]
@@ -940,6 +1368,171 @@ func FuzzIPControlMessageMarshal(f *testing.F) {
 			t.Fatalf("IPv4 control round trip = %+v, %v, want %+v", parsed, err, message)
 		}
 	})
+}
+
+func BenchmarkControlMessageParse(b *testing.B) {
+	control4, err := (&IPv4ControlMessage{TTL: 31, TOS: 0xb8, Src: netip.MustParseAddr("192.0.2.245")}).Marshal()
+	if err != nil {
+		b.Fatal(err)
+	}
+	control6, err := (&IPv6ControlMessage{HopLimit: 29, TrafficClass: 0x2e, FlowLabel: 0x12345, Src: netip.MustParseAddr("2001:db8::245")}).Marshal()
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, benchmark := range []struct {
+		name    string
+		control []byte
+		v6      bool
+	}{
+		{name: "Empty"},
+		{name: "IPv4", control: control4},
+		{name: "IPv6", control: control6, v6: true},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			for _, receiving := range []bool{false, true} {
+				name := "Write"
+				if receiving {
+					name = "Read"
+				}
+				b.Run(name, func(b *testing.B) {
+					b.ReportAllocs()
+					for i := 0; i < b.N; i++ {
+						if _, _, err := parseLinuxIPControlValues(benchmark.control, benchmark.v6, receiving); err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkSocketErrorControlMessageParse(b *testing.B) {
+	for _, address := range []string{"192.0.2.245", "2001:db8::245"} {
+		b.Run(address, func(b *testing.B) {
+			control, err := (SocketErrorControlMessage{Errno: 111, Offender: netip.MustParseAddr(address)}).MarshalBinary()
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var message SocketErrorControlMessage
+				if err := message.Parse(control); err != nil || message.Errno != 111 {
+					b.Fatalf("Parse = %+v, %v", message, err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkLinuxControlMessageWrite(b *testing.B) {
+	const payloadSize = 1200
+	for _, v6 := range []bool{false, true} {
+		local, remote := netip.MustParseAddr("192.0.2.245"), netip.MustParseAddr("198.51.100.245")
+		if v6 {
+			local, remote = netip.MustParseAddr("2001:db8::245"), netip.MustParseAddr("2001:db8:1::245")
+		}
+		for _, mode := range []string{"UDP", "IP", "IP header included"} {
+			for _, oob := range []bool{false, true} {
+				methods := []string{"message", "batch"}
+				if mode == "UDP" {
+					methods = append(methods, "message addrport")
+				}
+				for _, method := range methods {
+					b.Run(fmt.Sprintf("IPv6-%v/%s/OOB-%v/%s", v6, mode, oob, method), func(b *testing.B) {
+						stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+						if err != nil {
+							b.Fatal(err)
+						}
+						b.Cleanup(func() { _ = stack.Close() })
+						if err = stack.Start(); err != nil {
+							b.Fatal(err)
+						}
+						var udp *UDPConn
+						var ip *IPConn
+						var address net.Addr = ipNetAddr(remote)
+						if mode == "UDP" {
+							connection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 50123))
+							if err != nil {
+								b.Fatal(err)
+							}
+							udp = connection.(*UDPConn)
+							b.Cleanup(func() { _ = udp.Close() })
+							address = net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 50124))
+						} else {
+							connection, err := stack.ListenIP(context.Background(), "ip:99", local)
+							if err != nil {
+								b.Fatal(err)
+							}
+							ip = connection.(*IPConn)
+							b.Cleanup(func() { _ = ip.Close() })
+							if err = ip.SetIPHeaderIncludedOnWrite(mode == "IP header included"); err != nil {
+								b.Fatal(err)
+							}
+						}
+						var control []byte
+						if oob {
+							if v6 {
+								control, err = (&IPv6ControlMessage{Src: local, HopLimit: 31, TrafficClass: 47, FlowLabel: 7}).Marshal()
+							} else {
+								control, err = (&IPv4ControlMessage{Src: local, TTL: 31, TOS: 47}).Marshal()
+							}
+							if err != nil {
+								b.Fatal(err)
+							}
+						}
+						payload := make([]byte, payloadSize)
+						if mode == "IP header included" {
+							payload = buildIPPacketWithOptions(local, remote, 99, payload, 1, true, ipPacketOptions{hopLimit: 31, trafficClass: 47, flowLabel: 7})
+						}
+						count := 1
+						if method == "batch" {
+							count = 16
+						}
+						messages := make([]SocketMessage, count)
+						packets := make([][]byte, count)
+						sizes := make([]int, count)
+						for i := range messages {
+							messages[i] = SocketMessage{Buffers: [][]byte{payload[:400], payload[400:]}, OOB: control, Addr: address}
+							packets[i] = make([]byte, 1500)
+						}
+						b.SetBytes(int64(count * len(payload)))
+						b.ReportAllocs()
+						b.ResetTimer()
+						for i := 0; i < b.N; i++ {
+							var n, nn int
+							switch method {
+							case "batch":
+								if udp != nil {
+									n, err = udp.WriteBatch(messages, 0)
+								} else {
+									n, err = ip.WriteBatch(messages, 0)
+								}
+								if err != nil || n != count || messages[count-1].N != len(payload) || messages[count-1].NN != len(control) {
+									b.Fatalf("WriteBatch = %d, %v", n, err)
+								}
+							case "message addrport":
+								n, nn, err = udp.WriteMsgUDPAddrPort(payload, control, netip.AddrPortFrom(remote, 50124))
+							default:
+								if udp != nil {
+									n, nn, err = udp.WriteMsgUDP(payload, control, address.(*net.UDPAddr))
+								} else {
+									n, nn, err = ip.WriteMsgIP(payload, control, address.(*net.IPAddr))
+								}
+							}
+							if method != "batch" && (err != nil || n != len(payload) || nn != len(control)) {
+								b.Fatalf("WriteMsg = %d/%d, %v", n, nn, err)
+							}
+							if n, err = stack.Read(packets, sizes, 0); err != nil || n != count {
+								b.Fatalf("Stack.Read = %d, %v", n, err)
+							}
+						}
+					})
+				}
+			}
+		}
+	}
 }
 
 func BenchmarkControlMessageMarshal(b *testing.B) {

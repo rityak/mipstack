@@ -884,7 +884,9 @@ carry Linux `IPV6_FLOWINFO`; on writes this implementation follows the RFC 3542
 separation of the low 20-bit Flow Label from the wire Traffic Class. The wire
 Traffic Class is selected independently by `IPV6_TCLASS` or the socket default;
 `IPV6_FLOWINFO` does not override it. `IPConn` uses the same ancillary
-representation.
+representation. Like Linux, ancillary parsing stops when the remaining bytes
+cannot hold a complete control header, including after alignment padding;
+complete records still require valid lengths and payloads.
 
 `IPv4ControlMessage` and `IPv6ControlMessage` make that ancillary data
 structured rather than opaque. Their `Parse` methods decode OOB returned by a
@@ -1098,6 +1100,7 @@ TCP user timeout follows Linux `TCP_USER_TIMEOUT`: it applies only in
 synchronized states, returns `ETIMEDOUT`, does not change retransmission or
 keepalive probe timing, and bounds data that remains unacknowledged or unsent
 behind a zero window. Retransmission does not restart the absolute deadline.
+Changing the timeout does not restart an existing zero-window blocking episode.
 With no outstanding data or FIN, consecutive unanswered zero-window probes have a
 bounded retry budget; for an open connection, the final probe's response interval starts when its
 departure from the device-output queue is observed. Already-transmitted data or FIN
@@ -1108,9 +1111,11 @@ configured. Full `Close` retains a finite retry budget in either case. Accepted
 old ACKs still deliver valid data and selective acknowledgements, but do not
 reset unanswered keepalive probes or consume ECN CWR feedback. New receive
 data postpones idle and keepalive checks even when it carries an old ACK.
+Socket-option changes do not reset unanswered keepalive probes.
+Reenabling keepalive starts a new idle delay without resetting the probe count.
 When keepalive is enabled, user timeout replaces the probe-count close policy
 and is checked before a subsequent probe, after at least one probe has been
-sent and its interval has elapsed.
+sent and the next keepalive check is due.
 MIPS treats it as a local socket policy and does not advertise the optional
 RFC 5482 UTO option.
 

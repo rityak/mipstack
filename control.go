@@ -129,10 +129,9 @@ func (message *SocketErrorControlMessage) Parse(control []byte) error {
 	}
 	var parsed SocketErrorControlMessage
 	found := false
-	for len(control) != 0 {
-		if len(control) < linuxControlHeaderSize {
-			return errors.New("mipstack: truncated Linux control header")
-		}
+	// Linux CMSG_FIRSTHDR and CMSG_NXTHDR stop when the remaining bytes
+	// cannot hold a complete header, including after alignment padding.
+	for len(control) >= linuxControlHeaderSize {
 		length64 := binary.LittleEndian.Uint64(control[:8])
 		if length64 < linuxControlHeaderSize || length64 > uint64(len(control)) {
 			return errors.New("mipstack: invalid Linux control length")
@@ -155,10 +154,7 @@ func (message *SocketErrorControlMessage) Parse(control []byte) error {
 			// The payload is complete when cmsg_len fits. Linux may return
 			// only part of the final alignment padding; padding is not part
 			// of the parsed socket-error value.
-			if length <= len(control) {
-				break
-			}
-			return errors.New("mipstack: truncated Linux control padding")
+			break
 		}
 		control = control[aligned:]
 	}
@@ -662,10 +658,9 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 	var address netip.Addr
 	var options ipPacketOptions
 	var flowInfo uint32
-	for len(oob) != 0 {
-		if len(oob) < linuxControlHeaderSize {
-			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: truncated Linux IP control header")
-		}
+	// Linux CMSG_FIRSTHDR and CMSG_NXTHDR stop when the remaining bytes
+	// cannot hold a complete header, including after alignment padding.
+	for len(oob) >= linuxControlHeaderSize {
 		length64 := binary.LittleEndian.Uint64(oob[0:8])
 		if length64 < linuxControlHeaderSize || length64 > uint64(len(oob)) {
 			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid Linux IP control length")
@@ -696,7 +691,9 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 				address = candidate
 			}
 		case level == linuxLevelIPv6 && kind == linuxIPv6PacketInfo:
-			if !v6 || len(data) != 20 {
+			// Linux ip6_datagram_send_ctl accepts the in6_pktinfo prefix and
+			// ignores any additional payload within the same control record.
+			if !v6 || len(data) < 20 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 packet-info control message")
 			}
 			if binary.LittleEndian.Uint32(data[16:20]) != 0 {
@@ -748,7 +745,9 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 				options.trafficClass, options.trafficClassSet = byte(value), true
 			}
 		case level == linuxLevelIPv6 && kind == linuxIPv6FlowInfo:
-			if !v6 || len(data) != 4 {
+			// Linux IPV6_FLOWINFO requires at least one 32-bit value, rather
+			// than an exact payload length, and ignores the remaining bytes.
+			if !v6 || len(data) < 4 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 flow-info control message")
 			}
 			// Linux masks FLOWINFO to its low 28 bits for flow selection,
@@ -768,15 +767,10 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 		}
 		aligned := (length + linuxControlAlignment - 1) &^ (linuxControlAlignment - 1)
 		if aligned > len(oob) {
-			// Linux may expose a complete final payload without all alignment
-			// padding bytes. Padding is not part of the ancillary value, so it
-			// is safe to finish parsing a received control buffer here. Keep
-			// the write-side validation strict apart from the existing exact
-			// cmsg_len == len(oob) form, which has no padding at all.
-			if length == len(oob) || receiving && length < len(oob) {
-				break
-			}
-			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: truncated Linux IP control padding")
+			// RFC 3542 sections 5.2 and 5.3 exclude trailing alignment padding
+			// from cmsg_len. Like Linux CMSG_NXTHDR, accept a complete final
+			// record without requiring all padding bytes on reads or writes.
+			break
 		}
 		oob = oob[aligned:]
 	}

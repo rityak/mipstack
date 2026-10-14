@@ -693,11 +693,11 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 	if _, err = connection.(*IPConn).WriteToIP([]byte("late"), ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expired WriteToIP = %v, want deadline", err)
 	}
-	if _, _, err = connection.(*IPConn).WriteMsgIP([]byte("late"), []byte{1}, ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
+	if _, _, err = connection.(*IPConn).WriteMsgIP([]byte("late"), make([]byte, linuxControlHeaderSize), ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expired WriteMsgIP with invalid control = %v, want deadline", err)
 	}
 	wrongFamily := &net.IPAddr{IP: net.ParseIP("2001:db8::123")}
-	if _, _, err = connection.(*IPConn).WriteMsgIP([]byte("wrong-family"), []byte{1}, wrongFamily); err == nil {
+	if _, _, err = connection.(*IPConn).WriteMsgIP([]byte("wrong-family"), make([]byte, linuxControlHeaderSize), wrongFamily); err == nil {
 		t.Fatal("WriteMsgIP accepted an IPv6 destination on an IPv4 socket")
 	} else {
 		var addressError *net.AddrError

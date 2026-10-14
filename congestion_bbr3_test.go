@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/netip"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,10 +19,11 @@ type bbr3TailProbeRecorder struct {
 }
 
 type bbr3RenegingRecorder struct {
-	algorithm *bbr3CongestionControl
-	validLoss atomic.Uint64
-	staleLoss atomic.Uint64
-	lostBytes atomic.Uint64
+	algorithm    *bbr3CongestionControl
+	validLoss    atomic.Uint64
+	staleLoss    atomic.Uint64
+	lostBytes    atomic.Uint64
+	onPacketSent func()
 }
 
 func (r *bbr3RenegingRecorder) HandleCongestionEvent(event *CongestionEvent) {
@@ -34,6 +36,9 @@ func (r *bbr3RenegingRecorder) HandleCongestionEvent(event *CongestionEvent) {
 		r.lostBytes.Add(uint64(event.PacketBytes))
 	}
 	r.algorithm.HandleCongestionEvent(event)
+	if event.Type == CongestionEventPacketSent && r.onPacketSent != nil {
+		r.onPacketSent()
+	}
 }
 
 func (r *bbr3TailProbeRecorder) HandleCongestionEvent(event *CongestionEvent) {
@@ -292,9 +297,8 @@ func TestTCPBBR3SACKRenegingLossEvidence(t *testing.T) {
 }
 
 // TestTCPBBR3SACKRenegingAfterHostQueueDeparture exercises the Linux-style
-// host-queue barrier around SACK reneging. The first loss waits for its
-// original packet to leave the device queue; the peer then reneges on the
-// second SACKed range, which must likewise wait for that original packet's
+// host-queue barrier around SACK reneging. After the first loss is recovered,
+// the peer reneges on the second SACKed range, which must wait for its
 // departure before publishing loss without stale probe evidence.
 func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
 	link, stack, connection := newManuallyPumpedTCPConnection(t)
@@ -303,6 +307,19 @@ func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
 	builtin, _ := registeredCongestionControlFactory(CongestionControlBBR3)
 	definition := builtin.definition
 	definition.Name = "BBRv3-host-queue-reneging"
+	// Park after both original publications so the peer's SACK is queued
+	// before the actor can run a loss timer.
+	flightReady, releaseFlight := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseFlight) })
+	sent := 0
+	recorder.onPacketSent = func() {
+		sent++
+		if sent == 2 {
+			close(flightReady)
+			<-releaseFlight
+		}
+	}
 	definition.New = func(CongestionControlContext) CongestionController { return recorder }
 	factory, err := NewCongestionControlFactory(definition)
 	if err != nil {
@@ -322,9 +339,10 @@ func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
 	link.mu.Unlock()
 
 	type queuedData struct {
-		raw      []byte
-		slot     uint16
-		sequence uint32
+		raw        []byte
+		slot       uint16
+		sequence   uint32
+		generation uint64
 	}
 	snapshotData := func() []queuedData {
 		scheduler := stack.outbound.scheduler
@@ -349,6 +367,7 @@ func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
 			}
 			packets = append(packets, queuedData{
 				raw: append([]byte(nil), entry.packet...), slot: uint16(slot), sequence: segment.SequenceNumber,
+				generation: stack.outbound.slots[slot].Load() >> packetQueueSlotGenerationShift,
 			})
 		}
 		sort.Slice(packets, func(i, j int) bool {
@@ -361,42 +380,19 @@ func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
 	if n, err := connection.Write(payload); err != nil || n != len(payload) {
 		t.Fatalf("TCP Write = %d, %v", n, err)
 	}
-	var initial []queuedData
-	waitFor(t, time.Second, func() bool {
-		initial = snapshotData()
-		return len(initial) >= 2
-	})
+	select {
+	case <-flightReady:
+	case <-time.After(time.Second):
+		t.Fatal("initial flight was not published")
+	}
+	initial := snapshotData()
+	if len(initial) != 2 {
+		t.Fatalf("initial queued ranges = %d, want 2", len(initial))
+	}
 	first, second := initial[0], initial[1]
-	// Feed copies to the peer while retaining both queue-owned originals. This
-	// separates wire observation from device departure, as required by the
-	// host-queue loss rule.
-	if err = link.handleOutboundPacket(first.raw); err != nil {
-		t.Fatal(err)
-	}
-	if err = link.handleOutboundPacket(second.raw); err != nil {
-		t.Fatal(err)
-	}
-	// Serialize the SACK before waiting for the loss timer. Both original
-	// transmissions remain owned by the host queue at this point.
-	_ = connection.Info()
-
-	findDepartureWaiter := func() *packetQueueDepartureWaiter {
-		waiters := stack.outbound.departureWaiters.Load()
-		if waiters == nil {
-			return nil
-		}
-		for index := range waiters.slots {
-			if waiter := waiters.slots[index].Load(); waiter != nil {
-				return waiter
-			}
-		}
-		return nil
-	}
-	var firstWaiter *packetQueueDepartureWaiter
-	waitFor(t, 2*info.RetransmissionTimeout+time.Second, func() bool {
-		firstWaiter = findDepartureWaiter()
-		return firstWaiter != nil
-	})
+	// The first original leaves the queue before the peer can SACK the second.
+	// Recovery may then start on the ACK path or the RACK timer path without
+	// relying on the fixture's handshake RTT or packet-publication spacing.
 	entry, available := stack.outbound.tryDequeue()
 	if !available || entry.slot != first.slot {
 		if available {
@@ -413,6 +409,19 @@ func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
 	if err != nil || firstSegment.SequenceNumber != first.sequence {
 		t.Fatalf("departed first segment = %+v, %v", firstSegment, err)
 	}
+	if err = link.handleOutboundPacket(firstWire); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the second original queue-owned while the peer observes its copy.
+	if err = link.handleOutboundPacket(second.raw); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.inbound.len() != 0 })
+	// Resume with the SACK already queued. The second original remains
+	// host-owned throughout the first recovery.
+	releaseOnce.Do(func() { close(releaseFlight) })
+	_ = connection.Info()
+
 	var firstRetransmission queuedData
 	waitFor(t, time.Second, func() bool {
 		for _, packet := range snapshotData() {
@@ -428,11 +437,17 @@ func TestTCPBBR3SACKRenegingAfterHostQueueDeparture(t *testing.T) {
 	}
 	_ = connection.Info()
 
-	var secondWaiter *packetQueueDepartureWaiter
 	waitFor(t, 2*info.RetransmissionTimeout+time.Second, func() bool {
-		secondWaiter = findDepartureWaiter()
-		return secondWaiter != nil && secondWaiter != firstWaiter
+		waiters := stack.outbound.departureWaiters.Load()
+		if waiters == nil {
+			return false
+		}
+		waiter := waiters.slots[second.slot].Load()
+		return waiter != nil && waiter.generation == second.generation && waiter.departedAt.Load() == 0
 	})
+	if recorder.staleLoss.Load() != 0 {
+		t.Fatal("reneging loss was reported before the second original departed")
+	}
 	entry, available = stack.outbound.tryDequeue()
 	if !available || entry.slot != second.slot {
 		if available {

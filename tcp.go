@@ -73,6 +73,9 @@ const (
 	tcpActorWakeQuickACKEnable  = uint32(1 << 6)
 	tcpActorWakeQuickACKDisable = uint32(1 << 7)
 	tcpActorWakeQuickACKMask    = tcpActorWakeQuickACKEnable | tcpActorWakeQuickACKDisable
+	// tcpActorWakeKeepAliveEnable reports a disabled-to-enabled transition,
+	// including one coalesced with a preceding disable notification.
+	tcpActorWakeKeepAliveEnable = uint32(1 << 8)
 
 	// tcpMaximumPendingNetworkErrors preserves the former buffered-channel
 	// bound while allocating storage only for connections that receive ICMP.
@@ -1913,13 +1916,17 @@ type tcpRACKSample struct {
 }
 
 // tcpEstablishedLivenessState holds state first needed by asynchronous
-// network errors, keepalive probing, or a pure-persist user timeout. Keeping
-// it separate from path and recovery diagnostics avoids charging one cold
-// event for every unrelated optional field.
+// network errors or keepalive scheduling. Keeping it separate from path and
+// recovery diagnostics avoids charging one cold event for every unrelated
+// optional field.
 type tcpEstablishedLivenessState struct {
-	zeroWindowSince, lastKeepAlive time.Time
-	lastSoftError                  error
-	keepAliveProbes                int
+	lastKeepAlive   time.Time
+	lastSoftError   error
+	keepAliveProbes int
+	// keepAliveEnabledAt starts Linux's idle delay after keepalive is enabled.
+	// Earlier probes retain their count, but no longer own the next check;
+	// publishing the next probe clears this idle-delay override.
+	keepAliveEnabledAt monotonicStamp
 }
 
 // tcpEstablishedPathMTUState holds PLPMTUD search, black-hole fallback, and
@@ -1940,6 +1947,12 @@ type tcpEstablishedPathMTUState struct {
 type tcpSendTimerState struct {
 	baseDeadline time.Time
 	persistRTO   time.Duration
+	// persistSince records one zero-window blocking episode independently of
+	// TCP_USER_TIMEOUT, as in Linux. It starts when blocking begins rather
+	// than at Linux's first probe-timer expiry, so short local user timeouts
+	// need not wait for the first probe. Probe backoff and ACK responses that
+	// leave the window closed do not restart it.
+	persistSince monotonicStamp
 	// persistHostQueueToken identifies the last published probe's generation.
 	// Only its identity is retained: the queued time has already armed the
 	// deadline and is not needed to observe departure.
@@ -2584,9 +2597,8 @@ func (s *tcpEstablishedState) keepAliveEligible() bool {
 }
 
 // userTimeoutDeadline bounds outstanding sequence space by its send time or
-// unsent data by its pure-persist start. Only pure-persist timing needs lazy
-// liveness state.
-func (s *tcpEstablishedState) userTimeoutDeadline(now time.Time, timeout time.Duration) time.Time {
+// unsent data by the current pure-persist episode's start.
+func (s *tcpEstablishedState) userTimeoutDeadline(timeout time.Duration) time.Time {
 	if timeout <= 0 {
 		return time.Time{}
 	}
@@ -2598,17 +2610,8 @@ func (s *tcpEstablishedState) userTimeoutDeadline(now time.Time, timeout time.Du
 		}
 		oldest = s.connection.stack.timestampEpoch.Add(s.outstanding[index].firstSent)
 	}
-	offset := int(s.sendNext - s.sendUnacknowledged)
-	total, writeClosed, _ := s.connection.sendState()
-	zeroWindowBlocked := s.peerWindow == 0 && (offset < total || writeClosed && !s.localFINSent)
-	if zeroWindowBlocked && len(s.outstanding) == 0 {
-		liveness := s.ensureLivenessState()
-		if liveness.zeroWindowSince.IsZero() {
-			liveness.zeroWindowSince = now
-		}
-		oldest = liveness.zeroWindowSince
-	} else if s.livenessState != nil {
-		s.livenessState.zeroWindowSince = time.Time{}
+	if len(s.outstanding) == 0 && s.peerWindow == 0 && s.sendTimer.persistSince != 0 {
+		oldest = s.sendTimer.persistSince.time(s.connection.stack.timestampEpoch)
 	}
 	if oldest.IsZero() {
 		return time.Time{}
@@ -2757,13 +2760,22 @@ func (s *tcpEstablishedState) receiveActivityTime() time.Time {
 	return activity
 }
 
-// keepAliveDeadline preserves the previous probe's response interval while
-// postponing the next idle check when newly received data keeps the peer active.
+// keepAliveDeadline selects the idle or published-probe response deadline.
+// Reenabling keepalive starts a new idle delay without resetting probe counts.
 func (s *tcpEstablishedState) keepAliveDeadline(activity time.Time, config KeepAliveConfig) time.Time {
 	deadline := activity.Add(config.Idle)
-	if s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
-		if probeDeadline := s.livenessState.lastKeepAlive.Add(config.Interval); probeDeadline.After(deadline) {
-			deadline = probeDeadline
+	if liveness := s.livenessState; liveness != nil {
+		if liveness.keepAliveEnabledAt != 0 {
+			enabledAt := liveness.keepAliveEnabledAt.time(s.connection.stack.timestampEpoch)
+			if enabledAt.After(activity) {
+				deadline = enabledAt.Add(config.Idle)
+			}
+			return deadline
+		}
+		if liveness.keepAliveProbes != 0 {
+			if probeDeadline := liveness.lastKeepAlive.Add(config.Interval); probeDeadline.After(deadline) {
+				deadline = probeDeadline
+			}
 		}
 	}
 	return deadline
@@ -2917,11 +2929,9 @@ func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 		deadline = activity.Add(options.idleTimeout)
 	}
 	if options.userTimeout > 0 {
-		if userDeadline := s.userTimeoutDeadline(time.Now(), options.userTimeout); !userDeadline.IsZero() && (deadline.IsZero() || userDeadline.Before(deadline)) {
+		if userDeadline := s.userTimeoutDeadline(options.userTimeout); !userDeadline.IsZero() && (deadline.IsZero() || userDeadline.Before(deadline)) {
 			deadline = userDeadline
 		}
-	} else if s.livenessState != nil {
-		s.livenessState.zeroWindowSince = time.Time{}
 	}
 	// Linux bounds an outstanding zero-window flight by the later of its
 	// retransmission episode and the last accepted current ACK. Keep that
@@ -2935,8 +2945,8 @@ func (s *tcpEstablishedState) armLiveness(keepAliveOutputPending bool) {
 	}
 	if !keepAliveOutputPending && options.keepAlive && s.keepAliveEligible() {
 		// Linux tcp_keepalive_timer tests TCP_USER_TIMEOUT at a due probe
-		// check, before transmission. A published probe therefore gets its
-		// full Interval even when the inactivity timeout has already elapsed.
+		// check, before transmission. Unless keepalive is reenabled, a probe
+		// gets its full Interval even when the inactivity timeout has elapsed.
 		keepAliveDeadline := s.keepAliveDeadline(activity, options.keepAliveConfig)
 		if deadline.IsZero() || keepAliveDeadline.Before(deadline) {
 			deadline = keepAliveDeadline
@@ -3127,6 +3137,7 @@ func (s *tcpEstablishedState) updateRetransmissionTimer(update tcpRetransmission
 		s.persist = false
 		s.sendTimer.baseDeadline = time.Time{}
 		s.sendTimer.persistRTO = time.Second
+		s.sendTimer.persistSince = 0
 		s.persistUnanswered, s.persistClosed = 0, 0
 		s.sendTimer.persistHostQueueToken = 0
 	}
@@ -3205,9 +3216,12 @@ func (s *tcpEstablishedState) armPersist(sentAt time.Time, total int, writeClose
 		if s.sendTimer.persistRTO < s.rtt.rto {
 			s.sendTimer.persistRTO = s.rtt.rto
 		}
-		s.sendTimer.baseDeadline = time.Now().Add(s.sendTimer.persistRTO)
-		if !sentAt.IsZero() {
-			s.sendTimer.baseDeadline = sentAt.Add(s.sendTimer.persistRTO)
+		if sentAt.IsZero() {
+			sentAt = time.Now()
+		}
+		s.sendTimer.baseDeadline = sentAt.Add(s.sendTimer.persistRTO)
+		if s.sendTimer.persistSince == 0 {
+			s.sendTimer.persistSince = monotonicStampAt(s.connection.stack.timestampEpoch, sentAt)
 		}
 		s.persist = true
 	} else if s.peerWindow != 0 || !pending {
@@ -3216,6 +3230,7 @@ func (s *tcpEstablishedState) armPersist(sentAt time.Time, total int, writeClose
 			s.sendTimer.baseDeadline = time.Time{}
 		}
 		s.sendTimer.persistRTO = time.Second
+		s.sendTimer.persistSince = 0
 		s.persistUnanswered, s.persistClosed = 0, 0
 		s.sendTimer.persistHostQueueToken = 0
 	}
@@ -6255,7 +6270,19 @@ func (c *TCPConn) SetWriteDeadline(deadline time.Time) error {
 
 // SetKeepAlive enables or disables TCP keepalive probes.
 func (c *TCPConn) SetKeepAlive(enabled bool) error {
-	return c.updateSocketOptions(func() { c.keepAlive = enabled })
+	c.mu.Lock()
+	if c.userClosed || c.terminalErr != nil {
+		c.mu.Unlock()
+		return c.setOperationError(net.ErrClosed)
+	}
+	wake := tcpActorWakeOptions
+	if enabled && !c.keepAlive {
+		wake |= tcpActorWakeKeepAliveEnable
+	}
+	c.keepAlive = enabled
+	c.wakeActor(wake)
+	c.mu.Unlock()
+	return nil
 }
 
 // SetKeepAlivePeriod sets both the idle delay and probe interval. Use
@@ -8684,9 +8711,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		window, right, reserve := state.nextAdvertisedReceiveWindow()
 		// Linux tcp_keepalive_timer tests queued output and the terminal policy
 		// under the socket lock. Keep these reads together so a newly queued
-		// Write or FIN cannot be mistaken for an idle, failed peer.
+		// Write or FIN cannot be mistaken for an idle, failed peer. An enable
+		// notification must install its new Idle deadline before a probe or
+		// timeout decision can use the previous keepalive history.
 		c.mu.Lock()
-		if !c.keepAlive || len(state.outstanding) != 0 || int(state.sendNext-state.sendUnacknowledged) < c.sendBuffer.size || c.writeClosed && !state.localFINSent {
+		if !c.keepAlive || c.actorWakeFlags.Load()&tcpActorWakeKeepAliveEnable != 0 || len(state.outstanding) != 0 || int(state.sendNext-state.sendUnacknowledged) < c.sendBuffer.size || c.writeClosed && !state.localFINSent {
 			c.mu.Unlock()
 			keepAliveOutputWaiting = false
 			outputWindow.release()
@@ -8740,6 +8769,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		liveness := state.ensureLivenessState()
 		liveness.keepAliveProbes++
 		liveness.lastKeepAlive = hostQueue.queuedTime(c.stack.timestampEpoch)
+		liveness.keepAliveEnabledAt = 0
 		c.stack.stats.tcpKeepAliveProbes.Add(1)
 		keepAliveOutputWaiting = false
 		outputWindow.release()
@@ -9153,9 +9183,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				// state across a TCP_CONGESTION change.
 				options := c.socketOptions()
 				state.changeCongestionController(options.congestionFactory, options.maximumPacingRate)
-				if state.livenessState != nil {
-					state.livenessState.keepAliveProbes = 0
-					state.livenessState.lastKeepAlive = time.Time{}
+				// Linux TCP socket-option setters preserve published keepalive
+				// probes. Recompute policy without treating it as a peer response.
+				if wake&tcpActorWakeKeepAliveEnable != 0 && options.keepAlive {
+					// Linux tcp_set_keepalive restarts Idle on a disabled-to-enabled
+					// transition, even when unanswered probes are retained.
+					state.ensureLivenessState().keepAliveEnabledAt = monotonicStampAt(c.stack.timestampEpoch, time.Now())
 				}
 				keepAliveOutputWaiting = false
 				state.armLiveness(false)
@@ -9654,7 +9687,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if options.idleTimeout > 0 && !now.Before(activity.Add(options.idleTimeout)) {
 				return os.ErrDeadlineExceeded
 			}
-			if deadline := state.userTimeoutDeadline(now, options.userTimeout); !deadline.IsZero() && !now.Before(deadline) {
+			if deadline := state.userTimeoutDeadline(options.userTimeout); !deadline.IsZero() && !now.Before(deadline) {
 				return syscall.ETIMEDOUT
 			}
 			if err := state.zeroWindowTimeoutError(now, options.userTimeout); err != nil {

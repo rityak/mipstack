@@ -705,6 +705,130 @@ func TestTCPUserTimeoutClosesZeroWindowConnection(t *testing.T) {
 	}
 }
 
+func TestTCPUserTimeoutPreservesPersistHistory(t *testing.T) {
+	const timeout = time.Second
+	for _, mode := range []string{"enable after blocking", "disable and enable", "reopen and block again"} {
+		t.Run(mode, func(t *testing.T) {
+			link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.136"), netip.MustParseAddr("192.0.2.137"))
+			link.mu.Lock()
+			link.echoTCP, link.useTCPWindow = true, true
+			link.advertisedTCPWindow = 0
+			link.mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			connection, err := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.MustParseAddrPort("192.0.2.137:443"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := connection.(*TCPConn)
+			defer c.Close()
+			if err = c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			initial := []byte("close the window")
+			if n, err := c.Write(initial); err != nil || n != len(initial) {
+				t.Fatalf("initial Write = %d, %v", n, err)
+			}
+			received := make([]byte, len(initial))
+			if _, err := io.ReadFull(c, received); err != nil || !bytes.Equal(received, initial) {
+				t.Fatalf("initial echo = %q, %v", received, err)
+			}
+			waitFor(t, time.Second, func() bool {
+				info := c.Info()
+				return info.PeerWindow == 0 && info.BytesAcknowledged == uint64(len(initial)) && info.BytesInFlight == 0
+			})
+			if mode == "disable and enable" {
+				if err = c.SetUserTimeout(10 * timeout); err != nil {
+					t.Fatal(err)
+				}
+			}
+			blocked := []byte("blocked")
+			if n, err := c.Write(blocked); err != nil || n != len(blocked) {
+				t.Fatalf("blocked Write = %d, %v", n, err)
+			}
+			if info := c.Info(); info.PeerWindow != 0 || info.BytesSent != uint64(len(initial)) || info.BytesInFlight != 0 {
+				t.Fatalf("connection did not enter pure persist: %+v", info)
+			}
+			if mode == "disable and enable" {
+				if err = c.SetUserTimeout(0); err != nil {
+					t.Fatal(err)
+				}
+				if info := c.Info(); info.UserTimeout != 0 {
+					t.Fatalf("user timeout was not disabled: %+v", info)
+				}
+			}
+			// The blocked episode must already exceed the timeout before it is
+			// enabled, without relying on the probe's backoff or publication time.
+			select {
+			case <-c.done:
+				t.Fatalf("persist terminated with user timeout disabled: %+v", c.Info())
+			case <-time.After(timeout + timeout/2):
+			}
+
+			var restartedAt time.Time
+			if mode == "reopen and block again" {
+				port := uint16(c.LocalAddr().(*net.TCPAddr).Port)
+				link.mu.Lock()
+				peer := link.tcp[port]
+				sequence, acknowledgement := peer.serverNext, peer.clientNext
+				link.advertisedTCPWindow = 65535
+				link.mu.Unlock()
+				if err = link.deliverTCP(443, port, sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				if err = c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				received = make([]byte, len(blocked))
+				if _, err := io.ReadFull(c, received); err != nil || !bytes.Equal(received, blocked) {
+					t.Fatalf("echo after reopening = %q, %v", received, err)
+				}
+				waitFor(t, time.Second, func() bool {
+					info := c.Info()
+					return info.PeerWindow != 0 && info.BytesAcknowledged == uint64(len(initial)+len(blocked)) && info.BytesInFlight == 0
+				})
+				link.mu.Lock()
+				sequence, acknowledgement = peer.serverNext, peer.clientNext
+				link.advertisedTCPWindow = 0
+				link.mu.Unlock()
+				if err = link.deliverTCP(443, port, sequence, acknowledgement, TCPFlagACK, 0, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, time.Second, func() bool { return c.Info().PeerWindow == 0 })
+				restartedAt = time.Now()
+				if n, err := c.Write(blocked); err != nil || n != len(blocked) {
+					t.Fatalf("Write in the new persist episode = %d, %v", n, err)
+				}
+				if info := c.Info(); info.BytesSent != uint64(len(initial)+len(blocked)) || info.BytesInFlight != 0 {
+					t.Fatalf("new persist episode transmitted data: %+v", info)
+				}
+			}
+			if err = c.SetReadDeadline(time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			if err = c.SetUserTimeout(timeout); err != nil {
+				t.Fatal(err)
+			}
+			_ = c.Info()
+			wait := timeout / 2
+			if !restartedAt.IsZero() {
+				wait = 3 * timeout
+			}
+			select {
+			case <-c.done:
+			case <-time.After(wait):
+				t.Fatalf("user timeout did not apply to the persist episode: %+v", c.Info())
+			}
+			if !restartedAt.IsZero() && time.Since(restartedAt) < timeout*3/4 {
+				t.Fatalf("new persist episode reused the previous timeout age: %+v", c.Info())
+			}
+			if info := c.Info(); !errors.Is(info.LastError, syscall.ETIMEDOUT) {
+				t.Fatalf("persist user timeout = %+v", info)
+			}
+		})
+	}
+}
+
 func TestTCPUserTimeoutDisarmsAfterAcknowledgement(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.138"), netip.MustParseAddr("192.0.2.139"))
 	link.echoTCP = true
@@ -761,6 +885,341 @@ func TestTCPUserTimeoutOverridesKeepAliveCount(t *testing.T) {
 	elapsed := time.Since(started)
 	if elapsed < 100*time.Millisecond || !errors.Is(tcp.Info().LastError, syscall.ETIMEDOUT) {
 		t.Fatalf("keepalive user timeout after %v: %+v", elapsed, tcp.Info())
+	}
+}
+
+func TestTCPKeepAliveSocketOptionsPreserveProbeHistory(t *testing.T) {
+	config := KeepAliveConfig{Idle: 30 * time.Millisecond, Interval: 500 * time.Millisecond, Count: 1}
+	for _, test := range []struct {
+		name   string
+		update func(*TCPConn) error
+	}{
+		{name: "no delay", update: func(c *TCPConn) error { return c.SetNoDelay(false) }},
+		{name: "idle timeout", update: func(c *TCPConn) error { return c.SetIdleTimeout(10 * time.Second) }},
+		{name: "disabled user timeout", update: func(c *TCPConn) error { return c.SetUserTimeout(0) }},
+		{name: "enabled user timeout", update: func(c *TCPConn) error { return c.SetUserTimeout(75 * time.Millisecond) }},
+		{name: "pacing", update: func(c *TCPConn) error { return c.SetMaximumPacingRate(1024 * 1024) }},
+		{name: "congestion control", update: func(c *TCPConn) error { return c.SetCongestionControl(CongestionControlCUBIC) }},
+		{name: "keepalive configuration", update: func(c *TCPConn) error { return c.SetKeepAliveConfig(config) }},
+		{name: "disable and enable", update: func(c *TCPConn) error {
+			if err := c.SetKeepAlive(false); err != nil {
+				return err
+			}
+			if c.Info().KeepAlive {
+				return errors.New("keepalive was not disabled")
+			}
+			return c.SetKeepAlive(true)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			link, stack, c := newManuallyPumpedTCPConnection(t)
+			defer c.Close()
+			if err := c.SetKeepAliveConfig(config); err != nil {
+				t.Fatal(err)
+			}
+			enabledAt := time.Now()
+			if err := c.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			entry, available := waitTestPacketEntry(&stack.outbound, 2*time.Second)
+			if !available {
+				t.Fatal("keepalive probe was not published")
+			}
+			packet, valid := parseIPPacket(consumeTestPacket(&stack.outbound, entry), false)
+			if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || packet.payload[13] != TCPFlagACK ||
+				int(packet.payload[12]>>4)*4 != len(packet.payload) {
+				t.Fatalf("first output was not a keepalive probe: %+v", packet)
+			}
+			port := uint16(c.LocalAddr().(*net.TCPAddr).Port)
+			link.mu.Lock()
+			peer := link.tcp[port]
+			sequence, acknowledgement := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+			if binary.BigEndian.Uint32(packet.payload[4:8]) != acknowledgement-1 || binary.BigEndian.Uint32(packet.payload[8:12]) != sequence {
+				t.Fatalf("keepalive probe did not use SND.NXT-1: %+v", packet)
+			}
+			if info := c.Info(); info.State != TCPStateEstablished || info.LastError != nil || stack.Stats().TCPKeepAliveProbes != 1 {
+				t.Fatalf("keepalive probe history was not published: info=%+v stats=%+v", info, stack.Stats())
+			}
+			if err := test.update(c); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-c.done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("socket-option update prevented keepalive termination")
+			}
+			if elapsed := time.Since(enabledAt); test.name != "disable and enable" && elapsed < config.Interval*3/4 {
+				t.Fatalf("socket-option update closed the connection after %v, before the probe interval", elapsed)
+			}
+			if probes := stack.Stats().TCPKeepAliveProbes; probes != 1 || !errors.Is(c.Info().LastError, syscall.ETIMEDOUT) {
+				t.Fatalf("keepalive after option update = %d probes, %+v", probes, c.Info())
+			}
+		})
+	}
+}
+
+func TestTCPKeepAliveReenableRestartsIdleTimer(t *testing.T) {
+	config := KeepAliveConfig{Idle: 200 * time.Millisecond, Interval: time.Second, Count: 1}
+	for _, afterInterval := range []bool{false, true} {
+		for _, userTimeout := range []time.Duration{0, 75 * time.Millisecond} {
+			t.Run(fmt.Sprintf("after-interval-%v/user-timeout-%v", afterInterval, userTimeout), func(t *testing.T) {
+				_, stack, c := newManuallyPumpedTCPConnection(t)
+				defer c.Close()
+				if err := c.SetKeepAliveConfig(config); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.SetUserTimeout(userTimeout); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.SetKeepAlive(true); err != nil {
+					t.Fatal(err)
+				}
+				entry, available := waitTestPacketEntry(&stack.outbound, 2*time.Second)
+				if !available {
+					t.Fatal("keepalive probe was not published")
+				}
+				consumeTestPacket(&stack.outbound, entry)
+				if err := c.SetKeepAlive(false); err != nil {
+					t.Fatal(err)
+				}
+				if info := c.Info(); info.KeepAlive || info.State != TCPStateEstablished || stack.Stats().TCPKeepAliveProbes != 1 {
+					t.Fatalf("keepalive was not disabled after one probe: info=%+v stats=%+v", info, stack.Stats())
+				}
+				if afterInterval {
+					select {
+					case <-c.done:
+						t.Fatalf("disabled keepalive terminated the connection: %+v", c.Info())
+					case <-time.After(config.Interval + config.Interval/4):
+					}
+				}
+				reenabledAt := time.Now()
+				if err := c.SetKeepAlive(true); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-c.done:
+				case <-time.After(3 * config.Idle):
+					t.Fatalf("reenabling keepalive retained the old probe deadline: %+v", c.Info())
+				}
+				if elapsed := time.Since(reenabledAt); elapsed < config.Idle*3/4 {
+					t.Fatalf("reenabling keepalive closed the connection after %v, before Idle", elapsed)
+				}
+				if probes := stack.Stats().TCPKeepAliveProbes; probes != 1 || !errors.Is(c.Info().LastError, syscall.ETIMEDOUT) {
+					t.Fatalf("reenabling keepalive lost probe history: probes=%d info=%+v", probes, c.Info())
+				}
+			})
+		}
+	}
+}
+
+// TestTCPKeepAliveReenableWithPendingTimer orders a due keepalive timer ahead
+// of the option notification without synchronizing the two setters with Info.
+func TestTCPKeepAliveReenableWithPendingTimer(t *testing.T) {
+	config := KeepAliveConfig{Idle: 150 * time.Millisecond, Interval: 500 * time.Millisecond, Count: 1}
+	for _, policy := range []string{"probe count", "user timeout", "idle timeout"} {
+		t.Run(policy, func(t *testing.T) {
+			_, stack, c := newManuallyPumpedTCPConnection(t)
+			defer c.Close()
+			if err := c.SetKeepAliveConfig(config); err != nil {
+				t.Fatal(err)
+			}
+			if policy == "user timeout" {
+				if err := c.SetUserTimeout(50 * time.Millisecond); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := c.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			entry, available := waitTestPacketEntry(&stack.outbound, 2*time.Second)
+			if !available {
+				t.Fatal("initial keepalive probe was not published")
+			}
+			consumeTestPacket(&stack.outbound, entry)
+			waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+
+			// Pause the actor after it consumes an unrelated option notification,
+			// leaving the previous probe's timer armed while both setters run.
+			entered, resume := make(chan struct{}), make(chan struct{})
+			var resumed sync.Once
+			defer resumed.Do(func() { close(resume) })
+			factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+				Name: "keepalive-timer-order-test",
+				New: func(CongestionControlContext) CongestionController {
+					close(entered)
+					<-resume
+					return newRenoCongestionControl()
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetCongestionControlFactory(factory); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("actor did not enter the controller factory")
+			}
+			if policy == "idle timeout" {
+				if err := c.SetIdleTimeout(config.Interval / 2); err != nil {
+					t.Fatal(err)
+				}
+			}
+			time.Sleep(config.Interval + config.Interval/4)
+			if err := c.SetKeepAlive(false); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			// Retain the notification token until the old timer has had a turn.
+			// The enable flag remains published, as when select chooses the timer
+			// before the notification. Restore the token before awaiting Idle.
+			select {
+			case <-c.inbound.notify:
+			case <-time.After(time.Second):
+				t.Fatal("keepalive option notification was not queued")
+			}
+			resumed.Do(func() { close(resume) })
+			if policy == "idle timeout" {
+				select {
+				case <-c.done:
+				case <-time.After(time.Second):
+					t.Fatal("keepalive enable postponed the independent idle timeout")
+				}
+				if !errors.Is(c.Info().LastError, os.ErrDeadlineExceeded) {
+					t.Fatalf("idle timeout = %+v", c.Info())
+				}
+				return
+			}
+			select {
+			case <-c.done:
+				t.Fatalf("old keepalive timer closed the reenabled connection: %+v", c.Info())
+			case <-time.After(config.Idle / 2):
+			}
+			if probes := stack.Stats().TCPKeepAliveProbes; probes != 1 {
+				t.Fatalf("old timer published another probe: %d", probes)
+			}
+			restoredAt := time.Now()
+			select {
+			case c.inbound.notify <- struct{}{}:
+			default:
+			}
+			select {
+			case <-c.done:
+			case <-time.After(3 * config.Idle):
+				t.Fatal("reenabled keepalive did not apply its retained timeout policy")
+			}
+			if time.Since(restoredAt) < config.Idle*3/4 || stack.Stats().TCPKeepAliveProbes != 1 || !errors.Is(c.Info().LastError, syscall.ETIMEDOUT) {
+				t.Fatalf("reenabled keepalive lost its idle delay or probe history: %+v", c.Info())
+			}
+		})
+	}
+}
+
+// TestTCPKeepAliveReenableWithReturnedCapacity leaves the enable notification
+// unsequenced with a pending probe's output-capacity wake.
+func TestTCPKeepAliveReenableWithReturnedCapacity(t *testing.T) {
+	config := KeepAliveConfig{Idle: 200 * time.Millisecond, Interval: 100 * time.Millisecond, Count: 2}
+	for _, userTimeout := range []time.Duration{0, 3 * time.Second} {
+		t.Run(userTimeout.String(), func(t *testing.T) {
+			_, stack, c := newManuallyPumpedTCPConnection(t)
+			defer c.Close()
+			if err := c.SetKeepAliveConfig(config); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetUserTimeout(userTimeout); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			entry, available := waitTestPacketEntry(&stack.outbound, 2*time.Second)
+			if !available {
+				t.Fatal("initial keepalive probe was not published")
+			}
+			consumeTestPacket(&stack.outbound, entry)
+			waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+			var held []uint16
+			defer func() {
+				for _, slot := range held {
+					stack.outbound.releaseReserved(slot)
+				}
+			}()
+			for slot, ok := stack.outbound.tryReserve(); ok; slot, ok = stack.outbound.tryReserve() {
+				held = append(held, slot)
+			}
+			if len(held) != cap(stack.outbound.free) {
+				t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+			}
+			time.Sleep(config.Interval + config.Interval/2)
+			_ = c.Info()
+			_ = c.Info()
+			reenabledAt := time.Now()
+			if err := c.SetKeepAlive(false); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			last := len(held) - 1
+			stack.outbound.releaseReserved(held[last])
+			held = held[:last]
+			select {
+			case <-c.done:
+				t.Fatalf("returned capacity closed the reenabled connection: %+v", c.Info())
+			case <-time.After(config.Idle / 2):
+			}
+			if probes := stack.Stats().TCPKeepAliveProbes; probes != 1 {
+				t.Fatalf("returned capacity published a probe before Idle: %d", probes)
+			}
+			entry, available = waitTestPacketEntry(&stack.outbound, 3*config.Idle)
+			if !available {
+				t.Fatal("reenabled keepalive did not publish its next probe")
+			}
+			consumeTestPacket(&stack.outbound, entry)
+			waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 2 })
+			if elapsed := time.Since(reenabledAt); elapsed < config.Idle*3/4 {
+				t.Fatalf("reenabled probe published after %v, before Idle", elapsed)
+			}
+		})
+	}
+}
+
+func TestTCPKeepAliveEnableWake(t *testing.T) {
+	for _, current := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%v-to-%v", current, enabled), func(t *testing.T) {
+				c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				c.keepAlive = current
+				if err := c.SetKeepAlive(enabled); err != nil {
+					t.Fatal(err)
+				}
+				want := tcpActorWakeOptions
+				if !current && enabled {
+					want |= tcpActorWakeKeepAliveEnable
+				}
+				if got := c.takeActorWake(); got != want || c.keepAlive != enabled {
+					t.Fatalf("keepalive wake = %#x, want %#x; enabled = %v", got, want, c.keepAlive)
+				}
+			})
+		}
+	}
+	c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	for _, enabled := range []bool{true, false, true} {
+		if err := c.SetKeepAlive(enabled); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := c.takeActorWake(); got != tcpActorWakeOptions|tcpActorWakeKeepAliveEnable || !c.keepAlive {
+		t.Fatalf("coalesced keepalive transitions lost enable: flags=%#x enabled=%v", got, c.keepAlive)
+	}
+	c.userClosed = true
+	if err := c.SetKeepAlive(false); !errors.Is(err, net.ErrClosed) || c.takeActorWake() != 0 || !c.keepAlive {
+		t.Fatalf("closed connection changed keepalive: enabled=%v error=%v", c.keepAlive, err)
 	}
 }
 
@@ -6381,7 +6840,7 @@ func TestTCPPersistACKResetsOnlyUnansweredBudget(t *testing.T) {
 		t.Run(fmt.Sprintf("old-%v", old), func(t *testing.T) {
 			c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 			state := tcpEstablishedState{connection: c, sendUnacknowledged: 100, sendNext: 100, bytesAcknowledged: 100, peerMSS: 1200, peerWindow: 0, congestionWindow: 12000, slowStartThreshold: 12000,
-				persist: true, persistUnanswered: 14, persistClosed: 9, controller: newTCPCongestionController(CongestionControlReno)}
+				persist: true, persistUnanswered: 14, persistClosed: 9, sendTimer: tcpSendTimerState{persistSince: 1}, controller: newTCPCongestionController(CongestionControlReno)}
 			state.ensureLivenessState().lastSoftError = syscall.EHOSTUNREACH
 			ack := uint32(100)
 			if old {
@@ -6393,7 +6852,7 @@ func TestTCPPersistACKResetsOnlyUnansweredBudget(t *testing.T) {
 			if old {
 				want = 14
 			}
-			if state.persistUnanswered != want || state.persistClosed != 9 || state.peerWindow != 0 {
+			if state.persistUnanswered != want || state.persistClosed != 9 || state.peerWindow != 0 || state.sendTimer.persistSince != 1 {
 				t.Fatalf("ACK budget = %+v, window %d", state.sendTimer, state.peerWindow)
 			}
 			if old && !errors.Is(state.livenessState.lastSoftError, syscall.EHOSTUNREACH) || !old && state.livenessState.lastSoftError != nil {
@@ -10348,30 +10807,25 @@ func TestTCPZeroWindowLivenessUsesStableClocks(t *testing.T) {
 			if state.liveness != test.active {
 				t.Fatalf("liveness = %t, want %t", state.liveness, test.active)
 			}
+			started := state.sendTimer.persistSince
+			if (started != 0) == test.outstanding || state.livenessState != nil {
+				t.Fatal("pure-persist history was not independent of optional liveness state")
+			}
 			if !test.active {
-				if state.livenessState != nil {
-					t.Fatal("pure persist without user timeout allocated liveness state")
-				}
 				return
-			}
-			var started time.Time
-			if state.livenessState != nil {
-				started = state.livenessState.zeroWindowSince
-			}
-			if (state.livenessState != nil) != !test.outstanding {
-				t.Fatal("outstanding timing allocated state instead of reusing firstSent")
 			}
 			deadline := state.livenessDeadline
 			for i := 0; i < 5; i++ {
 				state.updateRetransmissionTimer(tcpRetransmissionReselect, now)
 				state.armLiveness(false)
-				if !state.livenessDeadline.Equal(deadline) || state.livenessState != nil && !state.livenessState.zeroWindowSince.Equal(started) {
+				if !state.livenessDeadline.Equal(deadline) || state.sendTimer.persistSince != started {
 					t.Fatal("timer reselection or liveness rearming moved the zero-window clock")
 				}
 			}
 			state.peerWindow = 65535
+			state.armPersist(time.Time{}, c.sendBuffer.size, false)
 			state.armLiveness(false)
-			if state.livenessState != nil && !state.livenessState.zeroWindowSince.IsZero() {
+			if state.sendTimer.persistSince != 0 {
 				t.Fatal("window reopening retained the zero-window clock")
 			}
 		})
@@ -11203,9 +11657,9 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 		{"socketDeadline", unsafe.Sizeof(socketDeadline{}), 16},
 		// BenchmarkTCPEstablishedStateAllocation measures the effective heap
 		// cost, including any runtime header, separately from this layout check.
-		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1520},
+		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1528},
 		{"tcpRACKSample", unsafe.Sizeof(tcpRACKSample{}), 48},
-		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
+		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 56},
 		{"tcpEstablishedPathMTUState", unsafe.Sizeof(tcpEstablishedPathMTUState{}), 120},
 		{"tcpRecoveryUndo", unsafe.Sizeof(tcpRecoveryUndo{}), 80},
 		{"tcpRecoveryTransportState", unsafe.Sizeof(tcpRecoveryTransportState{}), 56},
@@ -11605,15 +12059,82 @@ func TestTCPEmptyFlightTimerOwnership(t *testing.T) {
 	}
 }
 
-func TestTCPLivenessClearsDisabledUserTimeoutState(t *testing.T) {
-	zeroWindowSince := time.Now().Add(-time.Minute)
-	state := tcpEstablishedState{
-		connection:    new(TCPConn),
-		livenessState: &tcpEstablishedLivenessState{zeroWindowSince: zeroWindowSince},
+func TestTCPPersistHistoryIndependentOfUserTimeout(t *testing.T) {
+	started := time.Now().Add(-time.Minute)
+	c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	c.stack = &Stack{timestampEpoch: started}
+	c.sendBuffer.append([]byte("blocked"))
+	state := tcpEstablishedState{connection: c, rtt: rttEstimator{rto: time.Second}}
+	state.armPersist(started, c.sendBuffer.size, false)
+	history := state.sendTimer.persistSince
+	for _, timeout := range []time.Duration{0, 5 * time.Second, 0, 9 * time.Second} {
+		c.userTimeout = timeout
+		state.armLiveness(false)
+		if state.sendTimer.persistSince != history || history == 0 || state.livenessState != nil {
+			t.Fatal("changing user timeout moved persist history or allocated liveness state")
+		}
+		want := time.Time{}
+		if timeout != 0 {
+			want = started.Add(timeout)
+		}
+		if !state.livenessDeadline.Equal(want) || state.liveness != (timeout != 0) {
+			t.Fatalf("user timeout %v deadline = %v, want %v", timeout, state.livenessDeadline, want)
+		}
 	}
+	// Probe publication temporarily clears the scheduling flag before rearming.
+	state.persist = false
+	state.armPersist(started.Add(2*time.Second), c.sendBuffer.size, false)
 	state.armLiveness(false)
-	if !state.livenessState.zeroWindowSince.IsZero() {
-		t.Fatalf("disabled user timeout retained zero-window start %v", state.livenessState.zeroWindowSince)
+	if state.sendTimer.persistSince != history || !state.livenessDeadline.Equal(started.Add(c.userTimeout)) {
+		t.Fatal("probe rearming restarted the persist episode")
+	}
+	state.peerWindow = 65535
+	state.armPersist(time.Time{}, c.sendBuffer.size, false)
+	state.armLiveness(false)
+	if state.sendTimer.persistSince != 0 || state.liveness {
+		t.Fatal("window reopening retained persist history or its deadline")
+	}
+	state.peerWindow = 0
+	next := started.Add(10 * time.Second)
+	state.armPersist(next, c.sendBuffer.size, false)
+	state.armLiveness(false)
+	if !state.livenessDeadline.Equal(next.Add(c.userTimeout)) || state.sendTimer.persistSince == history {
+		t.Fatal("a new persist episode reused the old history")
+	}
+}
+
+func TestTCPPersistHistoryClearsOnExit(t *testing.T) {
+	for _, mode := range []string{"empty queue", "window reopened", "outstanding", "outstanding timer update", "FIN sent"} {
+		t.Run(mode, func(t *testing.T) {
+			started := time.Now()
+			c := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			c.stack = &Stack{timestampEpoch: started}
+			c.sendBuffer.append([]byte("blocked"))
+			state := tcpEstablishedState{connection: c, rtt: rttEstimator{rto: time.Second}}
+			state.armPersist(started, c.sendBuffer.size, false)
+			if state.sendTimer.persistSince == 0 {
+				t.Fatal("persist history was not established")
+			}
+			total, writeClosed := c.sendBuffer.size, false
+			switch mode {
+			case "empty queue":
+				total = 0
+			case "window reopened":
+				state.peerWindow = 65535
+			case "outstanding", "outstanding timer update":
+				state.outstanding = []sentTCPSegment{{sequence: 0, end: 1, firstSent: 0}}
+			case "FIN sent":
+				total, writeClosed, state.localFINSent = 0, true, true
+			}
+			if mode == "outstanding timer update" {
+				state.updateRetransmissionTimer(tcpRetransmissionPreserve, started)
+			} else {
+				state.armPersist(time.Time{}, total, writeClosed)
+			}
+			if state.sendTimer.persistSince != 0 || state.persist {
+				t.Fatalf("persist history survived %s: %+v", mode, state.sendTimer)
+			}
+		})
 	}
 }
 
@@ -11635,6 +12156,45 @@ func TestTCPLivenessDeadlineTracksActivity(t *testing.T) {
 	state.armLiveness(false)
 	if want := secondActivity.Add(idle); !state.liveness || state.livenessDeadline != want {
 		t.Fatalf("rearmed liveness = %t at %v, want true at %v", state.liveness, state.livenessDeadline, want)
+	}
+}
+
+func TestTCPLivenessKeepAliveEnableDeadline(t *testing.T) {
+	activity := time.Unix(1700000000, 0)
+	config := KeepAliveConfig{Idle: 30 * time.Second, Interval: 10 * time.Second, Count: 3}
+	for _, test := range []struct {
+		name                                    string
+		enabledAfter, probeAfter, receivedAfter time.Duration
+		deadlineAfter                           time.Duration
+		probes                                  int
+	}{
+		{name: "first enable", enabledAfter: time.Second, deadlineAfter: 31 * time.Second},
+		{name: "before previous check", enabledAfter: 31 * time.Second, probeAfter: 30 * time.Second, probes: 1, deadlineAfter: 61 * time.Second},
+		{name: "same clock tick", enabledAfter: 30 * time.Second, probeAfter: 30 * time.Second, probes: 1, deadlineAfter: 60 * time.Second},
+		{name: "after previous check", enabledAfter: 50 * time.Second, probeAfter: 30 * time.Second, probes: 1, deadlineAfter: 80 * time.Second},
+		{name: "received data postpones idle", enabledAfter: 31 * time.Second, probeAfter: 30 * time.Second, receivedAfter: 35 * time.Second, probes: 1, deadlineAfter: 65 * time.Second},
+		{name: "published probe resumes interval", probeAfter: 61 * time.Second, probes: 2, deadlineAfter: 71 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connection := &TCPConn{stack: &Stack{timestampEpoch: activity}}
+			liveness := &tcpEstablishedLivenessState{keepAliveProbes: test.probes}
+			if test.enabledAfter != 0 {
+				liveness.keepAliveEnabledAt = monotonicStampAt(activity, activity.Add(test.enabledAfter))
+			}
+			if test.probeAfter != 0 {
+				liveness.lastKeepAlive = activity.Add(test.probeAfter)
+			}
+			state := tcpEstablishedState{connection: connection, livenessState: liveness, lastActivity: activity}
+			if test.receivedAfter != 0 {
+				state.lastDataReceived = monotonicStampAt(activity, activity.Add(test.receivedAfter))
+			}
+			if got, want := state.keepAliveDeadline(state.receiveActivityTime(), config), activity.Add(test.deadlineAfter); !got.Equal(want) {
+				t.Fatalf("keepalive deadline = %v, want %v", got, want)
+			}
+			if liveness.keepAliveProbes != test.probes {
+				t.Fatal("keepalive scheduling reset published probe history")
+			}
+		})
 	}
 }
 
@@ -11702,7 +12262,7 @@ func TestTCPLivenessKeepAliveUserTimeoutDeadline(t *testing.T) {
 			if test.zeroWindow {
 				connection.sendBuffer.append([]byte("blocked"))
 				state.peerWindow = 0
-				state.livenessState.zeroWindowSince = activity.Add(32 * time.Second)
+				state.armPersist(activity.Add(32*time.Second), connection.sendBuffer.size, false)
 			}
 			state.armLiveness(test.pending)
 			var want time.Time

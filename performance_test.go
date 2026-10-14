@@ -98,6 +98,18 @@ func BenchmarkTCPEstablishedStateAllocation(b *testing.B) {
 	runtime.KeepAlive(states)
 }
 
+// BenchmarkTCPEstablishedLivenessAllocation measures the optional network-error
+// and keepalive state's effective heap allocation rather than its declared size.
+func BenchmarkTCPEstablishedLivenessAllocation(b *testing.B) {
+	states := make([]*tcpEstablishedLivenessState, 128)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		states[i%len(states)] = &tcpEstablishedLivenessState{}
+	}
+	runtime.KeepAlive(states)
+}
+
 func BenchmarkTCPControllerThroughput(b *testing.B) {
 	const size = 4 * 1024 * 1024
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {

@@ -2202,20 +2202,19 @@ func TestTCPKeepAliveInterop(t *testing.T) {
 
 // TestTCPKeepAliveUserTimeoutInterop verifies that a native gVisor ACK can
 // recover a probe whose user timeout already elapsed, and that a withheld ACK
-// closes the connection only at the next keepalive check.
+// closes the connection only at the next keepalive check, including after an
+// unrelated socket-option update or a keepalive restart.
 func TestTCPKeepAliveUserTimeoutInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
 		for _, mipstackListens := range []bool{false, true} {
 			mipstackListens := mipstackListens
-			for _, silent := range []bool{false, true} {
-				silent := silent
-				direction, response := "gvisor-listens", "acknowledged"
+			for _, response := range []string{"acknowledged", "silent", "silent option update", "silent keepalive restart", "silent delayed keepalive restart", "silent coalesced keepalive restart"} {
+				response := response
+				silent := response != "acknowledged"
+				direction := "gvisor-listens"
 				if mipstackListens {
 					direction = "mipstack-listens"
-				}
-				if silent {
-					response = "silent"
 				}
 				t.Run(family.name+"/"+direction+"/"+response, func(t *testing.T) {
 					keepAlive := mipstack.KeepAliveConfig{Idle: 150 * time.Millisecond, Interval: 500 * time.Millisecond, Count: 1}
@@ -2261,7 +2260,33 @@ func TestTCPKeepAliveUserTimeoutInterop(t *testing.T) {
 					case <-time.After(2 * time.Second):
 						t.Fatalf("gVisor did not acknowledge the keepalive probe; info=%+v", connection.Info())
 					}
-					time.Sleep(keepAlive.Interval / 5)
+					if response == "silent option update" {
+						if err := connection.SetNoDelay(false); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var reenabledAt time.Time
+					switch response {
+					case "silent keepalive restart", "silent delayed keepalive restart", "silent coalesced keepalive restart":
+						if err := connection.SetKeepAlive(false); err != nil {
+							t.Fatal(err)
+						}
+						if response != "silent coalesced keepalive restart" && connection.Info().KeepAlive {
+							t.Fatal("keepalive was not disabled")
+						}
+						if response == "silent delayed keepalive restart" {
+							time.Sleep(keepAlive.Interval + keepAlive.Interval/4)
+						}
+						reenabledAt = time.Now()
+						if err := connection.SetKeepAlive(true); err != nil {
+							t.Fatal(err)
+						}
+					}
+					delay := keepAlive.Interval / 5
+					if !reenabledAt.IsZero() {
+						delay = keepAlive.Idle / 5
+					}
+					time.Sleep(delay)
 					if info := connection.Info(); info.State != mipstack.TCPStateEstablished || info.LastError != nil {
 						t.Fatalf("connection closed before the next keepalive check: %+v", info)
 					}
@@ -2271,8 +2296,12 @@ func TestTCPKeepAliveUserTimeoutInterop(t *testing.T) {
 						if n, err := connection.Read(buffer[:]); n != 0 || !errors.Is(err, syscall.ETIMEDOUT) {
 							t.Fatalf("silent keepalive Read = %d, %v, want ETIMEDOUT", n, err)
 						}
-						if elapsed := observer.elapsed() - probe.sentAt; elapsed < keepAlive.Interval*3/4 {
-							t.Fatalf("silent peer closed %v after the probe, before the next check", elapsed)
+						elapsed, minimum := observer.elapsed()-probe.sentAt, keepAlive.Interval*3/4
+						if !reenabledAt.IsZero() {
+							elapsed, minimum = time.Since(reenabledAt), keepAlive.Idle*3/4
+						}
+						if elapsed < minimum {
+							t.Fatalf("silent peer closed after %v, before the keepalive check's %v minimum", elapsed, minimum)
 						}
 						if probes := network.mipstack.Stats().TCPKeepAliveProbes; probes != 1 {
 							t.Fatalf("published keepalive probes = %d, want 1", probes)
