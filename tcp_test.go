@@ -7347,7 +7347,7 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 	}{
 		{"TCPConn", unsafe.Sizeof(TCPConn{}), 688},
 		{"socketDeadline", unsafe.Sizeof(socketDeadline{}), 16},
-		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1520},
+		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1528},
 		{"tcpRACKSample", unsafe.Sizeof(tcpRACKSample{}), 48},
 		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
 		{"tcpEstablishedPathMTUState", unsafe.Sizeof(tcpEstablishedPathMTUState{}), 120},

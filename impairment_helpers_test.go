@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -115,6 +116,10 @@ type testImpairedLink struct {
 
 	mu    sync.Mutex
 	stats [2]testLinkDirectionStats
+
+	// extraLatency is added to both directions from now on; a test turns it on
+	// after the handshake to model queueing that only data experiences.
+	extraLatency atomic.Int64
 }
 
 // newTestImpairedLink starts packet pumps and one shared impairment scheduler.
@@ -252,7 +257,7 @@ func (l *testImpairedLink) schedulePacket(packets *testScheduledPackets, directi
 		transmissionEnd = transmissionStart.Add(serialization)
 		direction.nextTransmission = transmissionEnd
 	}
-	delay := condition.Latency + testLinkJitter(direction.random, condition.Jitter)
+	delay := condition.Latency + testLinkJitter(direction.random, condition.Jitter) + time.Duration(l.extraLatency.Load())
 	if delay < 0 {
 		delay = 0
 	}

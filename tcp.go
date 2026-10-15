@@ -1258,6 +1258,55 @@ func tcpReceiveWindowIncrease(capacity, mss int) int {
 	return threshold
 }
 
+// tcpReceiveRTT estimates the round trip from the receiver side using the
+// peer's timestamp echoes, as Linux tcp_rcv_rtt_measure_ts does. A connection
+// that only receives sends no data, so srtt keeps the handshake sample, which
+// through a local TUN is tens of microseconds while queued data takes
+// milliseconds. Receive tuning normalized to that srtt never sees more than a
+// sliver of a window per RTT and the buffer never grows (miray T-016).
+// Without timestamps there is no estimate and tuning keeps using srtt.
+type tcpReceiveRTT struct {
+	lastEcho uint32
+	rtt      uint32 // microseconds, smoothed; 0 until the first sample
+}
+
+// observe takes the current TSval and the TSecr of an in-order data segment.
+// As in Linux, only a new echo on a full-sized segment is sampled: a smaller
+// segment may have waited for the sending application, and a repeated echo
+// would time the gap between data segments rather than a round trip.
+func (r *tcpReceiveRTT) observe(now, echo uint32, fullSized bool) {
+	if echo == 0 || echo == r.lastEcho || !fullSized {
+		return
+	}
+	r.lastEcho = echo
+	delta := int32(now - echo)
+	if delta < 0 || delta > 60000 {
+		return
+	}
+	if delta == 0 {
+		delta = 1 // the TSval clock ticks in milliseconds
+	}
+	sample := uint32(delta) * 1000
+	if r.rtt == 0 {
+		r.rtt = sample
+	} else {
+		r.rtt = r.rtt - r.rtt/8 + sample/8
+	}
+}
+
+func (r *tcpReceiveRTT) duration() time.Duration {
+	return time.Duration(r.rtt) * time.Microsecond
+}
+
+// receiveTuningRTT is the RTT receive auto-tuning normalizes progress to: the
+// larger of srtt and the receiver-side estimate.
+func (s *tcpEstablishedState) receiveTuningRTT() time.Duration {
+	if rtt := s.receiveRTT.duration(); rtt > s.rtt.srtt {
+		return rtt
+	}
+	return s.rtt.srtt
+}
+
 // tcpBufferAutoTune measures useful byte progress over an RTT. Receive tuning
 // supplies application-consumed bytes; send tuning supplies acknowledged
 // bytes. Queue or congestion-window size alone is not evidence that a larger
@@ -1935,6 +1984,7 @@ type tcpEstablishedState struct {
 	lastTransmission, cwndUsageStamp    monotonicStamp
 	cwndUsed, transmissionOrder         uint32
 	receiveAutoTune, sendAutoTune       tcpBufferAutoTune
+	receiveRTT                          tcpReceiveRTT
 	hyStart                             tcpHyStart
 	// Recovery helpers remain nil until their corresponding loss evidence is
 	// observed. Once created they are connection-local and reused by the actor.
@@ -8750,7 +8800,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			}
 			if wake&tcpActorWakeWindow != 0 {
 				now := time.Now()
-				if target := state.receiveAutoTune.target(now, state.rtt.srtt, c.applicationReads.Load(), c.receiveMaximum); target > 0 {
+				if target := state.receiveAutoTune.target(now, state.receiveTuningRTT(), c.applicationReads.Load(), c.receiveMaximum); target > 0 {
 					c.growReceiveCapacity(target)
 				}
 				if c.discardingReads() {
@@ -8978,6 +9028,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					if receivedData {
 						state.observeReceivedData(receivedAt)
+						if timestampPresent {
+							state.receiveRTT.observe(c.stack.tcpTimestampAt(receivedAt), timestampEcho, len(segment.payload) >= state.receiveMSS)
+						}
 					}
 					if state.receiveNext != previousReceiveNext {
 						state.sackACKs = 0
