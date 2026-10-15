@@ -8801,7 +8801,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if wake&tcpActorWakeWindow != 0 {
 				now := time.Now()
 				if target := state.receiveAutoTune.target(now, state.receiveTuningRTT(), c.applicationReads.Load(), c.receiveMaximum); target > 0 {
-					c.growReceiveCapacity(target)
+					// target is twice the per-RTT progress, sized for a send queue.
+					// The receive window is capacity minus unread data, so double it
+					// to keep the offered window near twice the per-RTT progress, as
+					// Linux sizes rcvbuf. It is derived from consumed bytes only, so a
+					// slow application cannot inflate it.
+					c.growReceiveCapacity(2 * target)
 				}
 				if c.discardingReads() {
 					state.outOfOrder = nil

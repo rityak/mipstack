@@ -62,3 +62,31 @@ func TestTCPReceiveAutoTuningGrowsWithHandshakeRTTBelowDataRTT(t *testing.T) {
 		t.Fatalf("receive buffer stayed at %d (initial %d): auto-tuning did not grow", got, initial)
 	}
 }
+
+// The receive target is derived from bytes the application consumed: a slow
+// reader keeps the initial buffer however fast the sender is.
+func TestTCPReceiveAutoTuningIgnoresSlowReader(t *testing.T) {
+	sender, receiver, link := newTestTCPConnectionPair(t, "cubic", testLinkConditions{})
+	initial := receiver.Info().ReceiveBufferCapacity
+	link.extraLatency.Store(int64(5 * time.Millisecond))
+
+	go func() {
+		chunk := make([]byte, 64<<10)
+		for {
+			if _, err := sender.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	buffer := make([]byte, 16<<10)
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) { // ~1.6 MB/s, about 16 KB per 10 ms RTT
+		if _, err := receiver.Read(buffer); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := receiver.Info().ReceiveBufferCapacity; got != initial {
+		t.Fatalf("slow reader grew the receive buffer from %d to %d", initial, got)
+	}
+}
