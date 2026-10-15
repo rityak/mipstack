@@ -350,14 +350,14 @@ func (b *bbr3CongestionControl) handlePacingEvent(event *CongestionEvent) {
 
 // onRateSample advances the path model and returns updated cwnd and ssthresh.
 func (b *bbr3CongestionControl) onRateSample(window uint32, mss int, sample *tcpDeliveryRateSample) (uint32, uint32) {
-	packet := bbr3DecodePacketState(sample.packetState)
-	if packet.inflight == 0 {
-		packet.inflight = sample.priorInFlight
-	}
 	rate := b.updateBandwidth(sample)
 	b.updateLatestDeliverySignals(sample, rate)
 	b.updateCongestionSignals(sample, rate, window)
 	b.updateACKAggregation(sample, window, mss)
+	// Like Linux BBRv3's rate_sample, probe loss requires a selected
+	// transmission's tx.in_flight and tx.lost. Current flight cannot fill
+	// a missing snapshot: that would charge historical losses to this probe.
+	packet := bbr3DecodePacketState(sample.packetState)
 	b.checkStartupLoss(sample, packet, mss)
 	b.checkFullBandwidth(sample, rate)
 	threshold := b.checkDrain(sample, mss)
@@ -481,7 +481,7 @@ func (b *bbr3CongestionControl) checkStartupLoss(sample *tcpDeliveryRateSample, 
 	if sample.losses != 0 && b.lossEventsInRound < 15 {
 		b.lossEventsInRound++
 	}
-	if b.lossRoundStart && sample.fastRecovery && b.lossEventsInRound >= bbr3FullLossEvents && b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
+	if sample.PacketLossEvidenceValid() && b.lossRoundStart && sample.fastRecovery && b.lossEventsInRound >= bbr3FullLossEvents && b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
 		b.fullBandwidthReached = true
 		upper := b.quantizeWindowAt(b.modelWindowForBandwidth(b.maximumBandwidth(), 1, mss), mss, false)
 		if uint64(b.latestInflight) > upper {
@@ -629,12 +629,15 @@ func (b *bbr3CongestionControl) adaptUpperBounds(sample *tcpDeliveryRateSample, 
 			return true
 		}
 	}
-	if b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
+	if sample.PacketLossEvidenceValid() && b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
 		if b.probeSamples {
 			b.handleInflightTooHigh(packet.inflight, packet.applicationLimited, window, mss, sample.ackTime)
 		}
 		return false
 	}
+	// A SACK-selected transmission is not valid probe-loss evidence, but its
+	// tx.in_flight remains a safe delivered upper-bound observation. Linux BBRv3
+	// therefore still admits it when growing inflight_hi.
 	if b.inflightHigh != 0 && packet.inflight > b.inflightHigh {
 		b.inflightHigh = packet.inflight
 	}
@@ -771,11 +774,16 @@ func (b *bbr3CongestionControl) lossesSince(packet bbr3PacketSnapshot) uint64 {
 	return uint64(uint32(b.lost) - packet.lost)
 }
 
-// onPacketLost incorporates one transmission generation proven lost.
+// onPacketLost incorporates one transmission generation accounted as lost.
 func (b *bbr3CongestionControl) onPacketLost(event *CongestionEvent) {
 	b.syncDeliveryState(event.State)
 	b.noteLossRound()
-	if event.PacketBytes <= 0 || !b.probeSamples {
+	// RFC 2018 section 8 permits a receiver to renege on SACKed data. RFC 2018
+	// section 5 and RFC 6675 section 5.1 therefore require recovery to stop
+	// trusting the discarded SACK scoreboard. Linux BBRv3 follows that rule by
+	// ignoring a loss snapshot whose delivered timestamp was consumed, while
+	// retaining the loss in transport accounting.
+	if !event.PacketLossEvidenceValid || event.PacketBytes <= 0 || !b.probeSamples {
 		return
 	}
 	packet := bbr3DecodePacketState(event.PacketState)

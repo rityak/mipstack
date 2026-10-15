@@ -41,31 +41,22 @@ type synCookieOptions struct {
 	timestampNow     uint32
 }
 
-// synCookieKey returns the lazily initialized per-stack-listener secret and
-// fixes the advertised receive scale for one cookie period. A random source
-// failure is retried on a later SYN instead of permanently disabling cookies.
-func (state *tcpPassiveState) synCookieKey(now time.Time, windowScale uint8) ([16]byte, uint64, uint8, error) {
+// synCookieKey returns the lazily initialized per-stack secret and current
+// cookie period. A random source failure is retried on a later SYN instead of
+// permanently disabling cookies. Listener-specific receive policy is retained
+// by the listener, not by this shared passive dispatcher.
+func (state *tcpPassiveState) synCookieKey(now time.Time) ([16]byte, uint64, error) {
 	state.cookieMu.Lock()
 	defer state.cookieMu.Unlock()
 	if !state.cookieSet {
 		if _, err := rand.Read(state.cookieKey[:]); err != nil {
-			return [16]byte{}, 0, 0, err
+			return [16]byte{}, 0, err
 		}
 		state.cookieEpoch = now
 		state.cookieSet = true
 	}
 	period := synCookiePeriodNumber(now, state.cookieEpoch)
-	if !state.cookieScaleSet || period > state.cookieScalePeriod {
-		if state.cookieScaleSet {
-			state.previousScaleSet = true
-			state.previousScalePeriod = state.cookieScalePeriod
-			state.previousWindowScale = state.cookieWindowScale
-		}
-		state.cookieScaleSet = true
-		state.cookieScalePeriod = period
-		state.cookieWindowScale = windowScale
-	}
-	return state.cookieKey, period, state.cookieWindowScale, nil
+	return state.cookieKey, period, nil
 }
 
 // noteSYNCookie records the Linux-style recent-overflow window in which a
@@ -79,19 +70,17 @@ func (state *tcpPassiveState) noteSYNCookie(period uint64) {
 	state.cookieMu.Unlock()
 }
 
-// recentSYNCookieState returns the secret and per-period receive scales only
-// after this passive state issued a recent cookie.
-func (state *tcpPassiveState) recentSYNCookieState(now time.Time) ([16]byte, uint64, [2]uint64, [2]uint8, [2]bool, bool) {
+// recentSYNCookieState returns the secret and current validation period only
+// after this passive state issued a recent cookie. The final ACK still obtains
+// its receive scale from the listener that issued the matching SYN-cookie.
+func (state *tcpPassiveState) recentSYNCookieState(now time.Time) ([16]byte, uint64, bool) {
 	state.cookieMu.Lock()
 	defer state.cookieMu.Unlock()
 	period := synCookiePeriodNumber(now, state.cookieEpoch)
 	if !state.cookieSet || !state.cookieActive || period < state.cookiePeriod || period-state.cookiePeriod > 1 {
-		return [16]byte{}, 0, [2]uint64{}, [2]uint8{}, [2]bool{}, false
+		return [16]byte{}, 0, false
 	}
-	periods := [2]uint64{state.cookieScalePeriod, state.previousScalePeriod}
-	scales := [2]uint8{state.cookieWindowScale, state.previousWindowScale}
-	set := [2]bool{state.cookieScaleSet, state.previousScaleSet}
-	return state.cookieKey, period, periods, scales, set, true
+	return state.cookieKey, period, true
 }
 
 // sendSYNCookie replies to a SYN without allocating a TCPConn.
@@ -101,26 +90,34 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 		defaults = applyTCPSocketOptions(defaults, listener.options)
 	}
 	configuredScale := tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer)
-	secret, period, windowScale, err := state.synCookieKey(now, configuredScale)
+	secret, period, err := state.synCookieKey(now)
 	if err != nil {
 		return err
 	}
 	options, data := encodeSYNCookieOptions(syn, key.remote.Addr())
 	authenticatedData := synCookieAuthenticatedData(data, options.timestamp, options.ecn)
-	sequence := synCookieSequence(secret, key, syn.sequence, period, data, authenticatedData)
+	var generation uint64
+	if listener != nil {
+		generation = listener.cookieGeneration
+	}
+	sequence := synCookieSequence(secret, key, generation, syn.sequence, period, data, authenticatedData)
 	localMSS := tcpMSSForMTU(stack.mtuFor(key.remote.Addr()), key.local.Addr())
 	if localMSS < 1 {
 		return errors.New("mipstack: MTU is too small for TCP")
 	}
+	// RFC 7323 requires TSval to use the sender's current timestamp clock. Keep
+	// the cookie timestamp independent of the delayed input event time; ECN
+	// parity encoding must not move it ahead of that clock.
 	timestamp := stack.tcpTimestamp()
 	if options.timestamp {
-		timestamp &^= 1
-		if options.ecn {
-			timestamp |= 1
-		}
+		timestamp = synCookieTimestamp(timestamp, options.ecn)
 	}
 	var optionStorage [40]byte
-	tcpOptions := tcpPassiveSYNOptions(optionStorage[:0], localMSS, options.sack, options.windowScaling, options.timestamp, windowScale, timestamp, options.timestampNow)
+	advertisedScale := configuredScale
+	if listener != nil {
+		advertisedScale = listener.recordSYNCookieScale(period, configuredScale)
+	}
+	tcpOptions := tcpPassiveSYNOptions(optionStorage[:0], localMSS, options.sack, options.windowScaling, options.timestamp, advertisedScale, timestamp, options.timestampNow)
 	flags := byte(TCPFlagSYN | TCPFlagACK)
 	if options.ecn {
 		flags |= TCPFlagECE
@@ -134,13 +131,29 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 	return stack.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0, defaults.FlowLabel, flowLabelSet, outputFlowKey{})
 }
 
+// synCookieTimestamp encodes ECN in TSval's low bit without exceeding the
+// current clock, as Linux does for option-packed cookie timestamps.
+// RFC 7323 section 3.2 permits TSval zero. Timestamp negotiation is tracked
+// separately from TSval here, so Linux's SYN-ACK zero-value sentinel is not
+// needed; backward rounding also preserves parity across wraparound.
+func synCookieTimestamp(raw uint32, ecn bool) uint32 {
+	timestamp := raw &^ 1
+	if ecn {
+		timestamp |= 1
+	}
+	if tcpSequenceGreater(timestamp, raw) {
+		timestamp -= 2
+	}
+	return timestamp
+}
+
 // validateSYNCookie authenticates a final ACK against the current or previous
 // cookie period. attempted reports eligibility for authentication diagnostics.
-func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool, bool) {
+func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now time.Time, listener *TCPListener) (uint32, synCookieOptions, bool, bool) {
 	if ack.flags&TCPFlagACK == 0 || ack.flags&(TCPFlagSYN|TCPFlagRST) != 0 {
 		return 0, synCookieOptions{}, false, false
 	}
-	secret, period, scalePeriods, windowScales, scalesSet, active := state.recentSYNCookieState(now)
+	secret, period, active := state.recentSYNCookieState(now)
 	if !active {
 		return 0, synCookieOptions{}, false, false
 	}
@@ -151,10 +164,10 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	// Linux accepts a final ACK whose negotiated Timestamp option was removed
 	// in flight. Such an ACK cannot reveal whether the SYN-cookie was created
 	// with timestamps or ECN, so authenticate the three possible states (TS with
-	// ECN, TS without ECN, and no TS). A present zero TSecr is a separate Linux
-	// compatibility case: it proves that Timestamp was present but carries no
-	// recoverable ECN bit, so authenticate both ECN states and restore the
-	// connection with the conservative option values below.
+	// ECN, TS without ECN, and no TS). A present zero TSecr is ambiguous: RFC
+	// 7323 carries an unsigned 32-bit field, so zero cannot by itself prove
+	// that the option was removed; try both ECN states and let the authenticated
+	// cookie tag select the original negotiation.
 	var candidates [3]struct{ timestamp, ecn bool }
 	candidateCount := 1
 	if timestampPresent {
@@ -172,31 +185,25 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	}
 	valid := false
 	matchedTimestamp, matchedECN := false, false
-	localWindowScale := uint8(0)
+	matchedPeriod := uint64(0)
+	var generation uint64
+	if listener != nil {
+		generation = listener.cookieGeneration
+	}
 	for attempt := uint64(0); attempt < 2; attempt++ {
 		if attempt > period {
 			break
 		}
 		candidatePeriod := period - attempt
-		candidateScale, scaleFound := uint8(0), false
-		for index := range scalePeriods {
-			if scalesSet[index] && scalePeriods[index] == candidatePeriod {
-				candidateScale, scaleFound = windowScales[index], true
-				break
-			}
-		}
-		if !scaleFound {
-			continue
-		}
 		for candidateIndex := 0; candidateIndex < candidateCount; candidateIndex++ {
 			candidate := candidates[candidateIndex]
 			authenticatedData := synCookieAuthenticatedData(data, candidate.timestamp, candidate.ecn)
-			expected := synCookieSequence(secret, key, clientSequence, candidatePeriod, data, authenticatedData)
+			expected := synCookieSequence(secret, key, generation, clientSequence, candidatePeriod, data, authenticatedData)
 			if subtle.ConstantTimeEq(int32(expected), int32(serverSequence)) == 1 {
 				valid = true
 				matchedTimestamp = candidate.timestamp
 				matchedECN = candidate.ecn
-				localWindowScale = candidateScale
+				matchedPeriod = candidatePeriod
 			}
 		}
 	}
@@ -211,8 +218,25 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	if options.timestamp {
 		options.timestampNow = timestampValue
 	}
-	options.ecn = timestampPresent && timestampEcho != 0 && matchedECN
-	options.localWindowScale = localWindowScale
+	// RFC 7323 defines TSecr as an unsigned 32-bit value, but normal timestamp
+	// negotiation still expects it to echo the SYN-ACK's TSval. Linux therefore
+	// uses a conservative zero-echo fallback in its compact cookie decoder.
+	// MIPStack's cookie tag authenticates the Timestamp/ECN negotiation bits
+	// independently; it does not authenticate the TSval or TSecr values. A
+	// zero echo can therefore retain only the option state proved by that tag.
+	// This is deliberately more permissive than Linux for a zero-valued cookie
+	// timestamp and remains limited to the stateless compatibility path.
+	options.ecn = timestampPresent && matchedECN
+	if listener != nil && options.windowScaling {
+		localScale, ok := listener.lookupSYNCookieScale(matchedPeriod)
+		if !ok {
+			return 0, synCookieOptions{}, false, true
+		}
+		// The local scale is usable only when the peer's SYN offered Window
+		// Scale and the SYN-cookie could therefore advertise it. The final
+		// timestamp-less compatibility fallback below may still clear it.
+		options.localWindowScale = localScale
+	}
 	if !timestampPresent {
 		// Linux does not restore SACK or window scaling when
 		// cookie_timestamp_decode sees no Timestamp in the final ACK. MSS remains
@@ -221,16 +245,12 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 		options.sack = false
 		options.windowScaling = false
 		options.windowScale = 0
+		// Keep the local receive scale zero because this implementation suppresses
+		// peer window scaling on a no-Timestamp cookie SYN-ACK; the final ACK cannot
+		// prove a scale that was never advertised. A Timestamp-bearing ACK,
+		// including one with TSecr zero, restores the listener scale recorded for
+		// the SYN-cookie.
 		options.localWindowScale = 0
-	} else if timestampEcho == 0 {
-		// RFC 7323 requires an ACK to echo a recently received TSval once
-		// timestamps are negotiated. Linux accepts a zero TSecr as a
-		// compatibility case: Timestamp remains enabled, while SACK and ECN
-		// are disabled and the peer window scale becomes zero. The local
-		// receive scale is independent of this echoed cookie field.
-		options.sack = false
-		options.windowScaling = true
-		options.windowScale = 0
 	}
 	return serverSequence, options, true, true
 }
@@ -239,6 +259,16 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 // bits. Timestamp and ECN flags are authenticated separately.
 func encodeSYNCookieOptions(syn tcpSegment, remoteAddress netip.Addr) (synCookieOptions, uint32) {
 	mss, scale, scaling, sack, timestamp, timestampValue := parseTCPOptions(syn.optionBytes(), defaultTCPPeerMSS(remoteAddress), 65535)
+	if !timestamp {
+		// RFC 7323 fixes the window scale during the SYN exchange, and RFC
+		// 2018 requires SACK-Permitted to be negotiated by both SYNs. Linux
+		// may advertise these options in a cookie SYN-ACK, then clear them
+		// when a cookie ACK lacks Timestamp because its stateless recovery
+		// carries them in the Timestamp echo. MIPStack suppresses them before
+		// advertising instead, so the handshake never promises extensions
+		// that the conservative recovery path will drop.
+		scale, scaling, sack = 0, false, false
+	}
 	mssIndex := 0
 	for index, value := range synCookieMSSValues {
 		if int(value) > mss {
@@ -303,9 +333,12 @@ func synCookiePeriodNumber(now, epoch time.Time) uint64 {
 	return uint64(elapsed / synCookiePeriod)
 }
 
-// synCookieSequence authenticates one tuple and its compact option data.
-func synCookieSequence(secret [16]byte, key tcpKey, clientSequence uint32, period uint64, data, authenticatedData uint32) uint32 {
-	var input [51]byte
+// synCookieSequence authenticates one tuple, listener incarnation, and its
+// compact option data. The incarnation is not sent on the wire; it prevents a
+// cookie issued before listener replacement from being accepted by the new
+// listener while the passive cookie secret remains shared.
+func synCookieSequence(secret [16]byte, key tcpKey, generation uint64, clientSequence uint32, period uint64, data, authenticatedData uint32) uint32 {
+	var input [59]byte
 	if key.local.Addr().Is6() {
 		input[0] = 6
 	} else {
@@ -317,9 +350,10 @@ func synCookieSequence(secret [16]byte, key tcpKey, clientSequence uint32, perio
 	copy(input[17:33], remote[:])
 	binary.BigEndian.PutUint16(input[33:35], key.local.Port())
 	binary.BigEndian.PutUint16(input[35:37], key.remote.Port())
-	binary.BigEndian.PutUint32(input[37:41], clientSequence)
-	binary.BigEndian.PutUint64(input[41:49], period)
-	binary.BigEndian.PutUint16(input[49:51], uint16(authenticatedData))
+	binary.BigEndian.PutUint64(input[37:45], generation)
+	binary.BigEndian.PutUint32(input[45:49], clientSequence)
+	binary.BigEndian.PutUint64(input[49:57], period)
+	binary.BigEndian.PutUint16(input[57:59], uint16(authenticatedData))
 	tag := uint32(sipHash24(secret, input[:])) &^ synCookieDataMask
 	return tag | data
 }

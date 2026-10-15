@@ -1158,6 +1158,16 @@ func (s *Stack) handleMulticastICMPv6(packet ipPacket) error {
 // forwarded socket. It reports whether a transport or raw endpoint accepted
 // the error.
 func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
+	// Linux icmp_unreach ignores IPv4 reassembly-timeout errors before socket
+	// delivery: a lost fragment does not establish host unreachability and
+	// must not interrupt later reads or writes. This follows Linux's narrower
+	// reporting policy, rather than RFC 1122 section 3.2.2.4's requirement to
+	// pass all Time Exceeded messages to the transport layer. Raw ICMP input
+	// and the unhandled-message forwarder remain separate from socket errors.
+	if remoteError.Type == ICMPv4TypeTimeExceeded &&
+		remoteError.Code == ICMPv4TimeExceededCodeFragmentReassembly && remoteError.Reporter.Is4() {
+		return false
+	}
 	accepted := false
 	switch remoteError.QuotedProtocol {
 	case ProtocolUDP:
@@ -1330,20 +1340,24 @@ func (s *Stack) sendFragmentReassemblyTimeout(entry *ipPacketReassemblyEntry) er
 // packetInvokesICMPError follows a complete or first-fragment header chain
 // and applies the RFC 792/RFC 4443 recursive-error suppression rule.
 func packetInvokesICMPError(packet []byte) bool {
-	_, _, protocol, payload, ok := quotedIPPayload(packet)
+	source, _, protocol, payload, ok := quotedIPPayload(packet)
 	if !ok || len(payload) == 0 {
 		return false
 	}
-	if protocol == ProtocolICMPv6 {
-		return payload[0] < 128
-	}
-	if protocol == ProtocolICMPv4 {
+	// RFC 1122 section 3.2.2 and RFC 4443 section 2.4 suppress errors
+	// only for the invoking family's ICMP protocol. Linux likewise checks
+	// IPPROTO_ICMP in IPv4 and IPPROTO_ICMPV6 after IPv6 extension headers.
+	if source.Is4() {
+		if protocol != ProtocolICMPv4 {
+			return false
+		}
 		switch payload[0] {
 		case ICMPv4TypeDestinationUnreachable, 4, 5, ICMPv4TypeTimeExceeded, ICMPv4TypeParameterProblem:
 			return true
 		}
+		return false
 	}
-	return false
+	return protocol == ProtocolICMPv6 && payload[0] < 128
 }
 
 // parseICMPError extracts the quoted original packet from an ICMP error.
@@ -1531,8 +1545,7 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 			}
 			switch next {
 			case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
-				IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderAuthentication,
-				IPv6ExtensionHeaderMobility:
+				IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderAuthentication:
 				length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
 				if !valid {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
@@ -1551,6 +1564,9 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
 			default:
+				// RFC 6275 identifies Mobility messages as protocol 135, even
+				// with Payload Proto 59. Like Linux raw ICMPv6 error lookup,
+				// preserve that protocol rather than following it as an extension.
 				return source, target, next, payload[offset:], true
 			}
 		}

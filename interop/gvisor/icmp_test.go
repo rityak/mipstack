@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -152,6 +153,119 @@ func TestICMPErrorRXChecksumOffloadInterop(t *testing.T) {
 			}
 			if !mutated.Load() {
 				t.Fatal("offload error mutation did not run")
+			}
+		})
+	}
+}
+
+// TestReassemblyTimeoutSocketPolicyInterop sends first-fragment quotations
+// through gVisor's native raw endpoint. UDP replies provide a delivery barrier
+// before testing mipstack's IPv4 exception and unchanged IPv6 error reporting.
+func TestReassemblyTimeoutSocketPolicyInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			captured := make(chan []byte, 1)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: interopDefaultMTU,
+				mipstackToGVisor: func(packet []byte) bool {
+					select {
+					case captured <- append([]byte(nil), packet...):
+					default:
+					}
+					return true
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			opened, peer := openUDPPair(t, ctx, network, family, true)
+			defer opened.Close()
+			defer peer.Close()
+			connection := opened.(*mipstack.UDPConn)
+			if err := connection.SetReceiveErrors(true); err != nil {
+				t.Fatal(err)
+			}
+			if err := connection.SetPathMTUDiscovery(mipstack.PathMTUDiscoveryDont); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			_ = connection.SetDeadline(deadline)
+			_ = peer.SetDeadline(deadline)
+			request := bytes.Repeat([]byte{0x5a}, 2000)
+			if n, err := connection.Write(request); err != nil || n != len(request) {
+				t.Fatalf("fragmented request = %d, %v", n, err)
+			}
+			buffer := make([]byte, 4096)
+			if n, _, err := peer.ReadFrom(buffer); err != nil || !bytes.Equal(buffer[:n], request) {
+				t.Fatalf("gVisor reassembled request = %d, %v", n, err)
+			}
+			first := <-captured
+			parsed, err := mipstack.ParseIPPacket(first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fragment, ok := parsed.Fragment()
+			if !ok || fragment.Offset != 0 || !fragment.MoreFragments {
+				t.Fatalf("captured packet is not a first fragment: %+v", fragment)
+			}
+			quoteSize := header.IPv6MinimumSize + header.IPv6FragmentHeaderSize + header.UDPMinimumSize
+			if family.mipstackAddress.Is4() {
+				quoteSize = int(header.IPv4(first).HeaderLength()) + header.UDPMinimumSize
+			}
+			quote := first[:quoteSize]
+			var queue waiter.Queue
+			endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatal(tcpipErr.String())
+			}
+			defer endpoint.Close()
+			if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+				t.Fatal(tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+				t.Fatal(tcpipErr.String())
+			}
+			for _, code := range []uint8{1, 0} {
+				message := make([]byte, 8+len(quote))
+				copy(message[8:], quote)
+				if family.mipstackAddress.Is4() {
+					h := header.ICMPv4(message)
+					h.SetType(header.ICMPv4TimeExceeded)
+					h.SetCode(header.ICMPv4Code(code))
+					h.SetChecksum(^checksum.Checksum(message, 0))
+				} else {
+					h := header.ICMPv6(message[:8])
+					h.SetType(header.ICMPv6TimeExceeded)
+					h.SetCode(header.ICMPv6Code(code))
+					h.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+						Header: h, Src: gvisorAddress(family.gvisorAddress), Dst: gvisorAddress(family.mipstackAddress),
+						PayloadCsum: checksum.Checksum(message[8:], 0), PayloadLen: len(quote),
+					}))
+				}
+				if n, writeErr := endpoint.Write(bytes.NewReader(message), tcpip.WriteOptions{}); writeErr != nil || n != int64(len(message)) {
+					t.Fatalf("gVisor ICMP write = %d, %s", n, tcpipErrorString(writeErr))
+				}
+				reply := []byte{0x51, code}
+				if n, err := peer.WriteTo(reply, connection.LocalAddr()); err != nil || n != len(reply) {
+					t.Fatalf("gVisor reply = %d, %v", n, err)
+				}
+				n, readErr := connection.Read(buffer)
+				if family.mipstackAddress.Is6() || code == 0 {
+					var networkError mipstack.ICMPError
+					if n != 0 || !errors.As(readErr, &networkError) || networkError.Code != code || !bytes.Equal(networkError.QuotedPacket, quote) {
+						t.Fatalf("pending gVisor error = %d, %v", n, readErr)
+					}
+					queued, queueErr := connection.ReadError()
+					if queueErr != nil || !errors.As(queued, &networkError) || networkError.Code != code || !bytes.Equal(networkError.QuotedPacket, quote) {
+						t.Fatalf("extended gVisor error = %v, %v", queued, queueErr)
+					}
+					n, readErr = connection.Read(buffer)
+				}
+				if readErr != nil || !bytes.Equal(buffer[:n], reply) {
+					t.Fatalf("UDP reply after ICMP code %d = %d, %v, %x", code, n, readErr, buffer[:n])
+				}
+				if queued, queueErr := connection.ReadError(); queued != nil || !errors.Is(queueErr, syscall.EAGAIN) {
+					t.Fatalf("unexpected additional error: %v, %v", queued, queueErr)
+				}
 			}
 		})
 	}

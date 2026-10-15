@@ -280,7 +280,9 @@ fragmentation state, and resets the receiver for reuse. `Reset` explicitly
 abandons an incomplete packet. The type deliberately has no clock, goroutine,
 global capacity policy, or `Close`: callers multiplexing many datagrams remain
 responsible for their identity table, lifetime, and aggregate resource limits.
-`Stack` supplies that surrounding policy for live network traffic.
+`Stack` supplies that surrounding policy for live network traffic. ECN merging
+preserves CE and, like Linux, retains the offset-zero ECT codepoint for a mixed
+ECT(0)/ECT(1) datagram without CE; mixtures with Not-ECT are rejected.
 
 `IPPacket.UpperLayer` structurally walks IPv6 Hop-by-Hop, Destination Options,
 Routing, atomic Fragment, Authentication, and Mobility headers. ESP and
@@ -726,7 +728,10 @@ so deliberate small-buffer policies retain window precision while large-BDP
 connections can use their full automatic maximum. Calling `SetReadBuffer` or
 `SetWriteBuffer` locks that side to the application value and disables its
 automatic growth, matching the user-locked behavior of operating-system TCP
-stacks. Automatic growth follows application-consumed and acknowledged bytes
+stacks. A scaled receive window that was already advertised may temporarily
+admit at most one scale quantum of additional bytes while that promise is
+consumed; this bounded protocol remainder is separate from automatic buffer
+growth. Automatic growth follows application-consumed and acknowledged bytes
 per RTT rather than queue size or cwnd alone, so short-RTT scheduler batches do
 not inflate buffers. `SetCongestionControl`,
 `SetCongestionControlFactory`, `SetMaximumPacingRate`, and `SetTrafficClass`
@@ -766,14 +771,21 @@ writes on connected UDP or IP sockets retain `net.ErrWriteToConnected`.
 Validated asynchronous ICMP errors also match their mapped syscall errors;
 their details remain available through `errors.As` to `mipstack.ICMPError`.
 
+`TCPConn.CloseRead` closes the application receive direction without resetting
+TCP, discards buffered receive data, and wakes reads waiting for data.
+`TCPConn.CloseWrite` closes the send direction, wakes writes waiting for
+send-buffer space, and queues FIN after accepted bytes.
+Both leave the opposite direction open and return without waiting for an active
+read or write to finish. They do not cancel a blocked external `ReadFrom` source
+or `WriteTo` destination.
 `TCPConn.SetLinger` provides background graceful close, abortive close, and a
 bounded wait for acknowledgement. `UDPConn.SetReadBuffer` changes the receive
 queue's approximate retained-memory capacity; payload, per-datagram metadata,
 and queued asynchronous errors share the bound. `IPConn` applies the same policy.
 `SetReceiveErrors(true)` retains reportable asynchronous ICMP errors for
-nonblocking `ReadError`; an empty error queue returns `EAGAIN`. Ordinary reads,
-UDP writes, and header-included IP writes also report a pending error without
-removing its `ReadError` entry; protocol-payload IP writes do not report it.
+nonblocking `ReadError`; an empty error queue returns `EAGAIN`. Ordinary receive
+attempts, UDP writes, and header-included IP writes also report a pending error
+without removing its `ReadError` entry; protocol-payload IP writes do not report it.
 By default, unconnected sockets do not report asynchronous ICMP errors
 (correlated PMTU updates still apply), while connected sockets report hard
 errors before queued payloads. Disabling the option clears `ReadError` entries
@@ -788,16 +800,19 @@ and IP sockets retain no per-socket transmit queue, so `SetWriteBuffer` is a
 validated no-op and a write deadline is checked only before the attempt.
 
 UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
-`MessageFlagPeek` preserves a queued payload but consumes a pending socket error.
-Like Linux, a successful `MessageFlagErrorQueue` read consumes its queue entry
-and may rearm the ordinary error from the next entry. An error-queue read never
-blocks and returns the quoted failed payload, original destination in `Addr`,
-and a Linux `sock_extended_err` record in `OOB`.
+`MessageFlagPeek` preserves a queued payload but consumes a pending socket error
+when it is encountered as the first ordinary message. Like Linux, a successful
+`MessageFlagErrorQueue` read consumes its queue entry and may rearm the ordinary
+error from the next entry. An error-queue read never blocks and returns the
+quoted failed payload, original destination in `Addr`, and a Linux
+`sock_extended_err` record in `OOB`.
 `MessageFlagDontWait` makes the first batch read nonblocking. Writes are already
 nonblocking with respect to device capacity, so the flag is accepted without
 changing their admission result.
-`MessageFlagTruncated` requests the complete payload length and, along with
-`MessageFlagControlTruncated`, also reports output truncation. Source-fragmented
+`MessageFlagTruncated` requests the complete payload length for ordinary
+datagrams. Error-queue reads always report the copied payload length and use
+the flag only to indicate that the queued quote was longer. Along with
+`MessageFlagControlTruncated`, it reports output truncation. Source-fragmented
 external output admits fragments independently in wire order. Flow-aware
 overload can discard queued fragments like ordinary link loss, and a later
 admission failure leaves surviving fragments published. Local loopback output
@@ -865,16 +880,23 @@ on every host. `ReadMsgUDP` emits `IP_PKTINFO` or `IPV6_PKTINFO` for the packet
 destination plus TTL/Hop Limit and TOS/Traffic Class, with Linux
 `MSG_TRUNC`/`MSG_CTRUNC` flags. Passing that data to `WriteMsgUDP` selects the
 corresponding managed source and output header fields. IPv6 messages also
-carry Linux `IPV6_FLOWINFO`. `IPConn` uses the same ancillary representation.
+carry Linux `IPV6_FLOWINFO`; on writes this implementation follows the RFC 3542
+separation of the low 20-bit Flow Label from the wire Traffic Class. The wire
+Traffic Class is selected independently by `IPV6_TCLASS` or the socket default;
+`IPV6_FLOWINFO` does not override it. `IPConn` uses the same ancillary
+representation. Like Linux, ancillary parsing stops when the remaining bytes
+cannot hold a complete control header, including after alignment padding;
+complete records still require valid lengths and payloads.
 
 `IPv4ControlMessage` and `IPv6ControlMessage` make that ancillary data
 structured rather than opaque. Their `Parse` methods decode OOB returned by a
 message read; their `Marshal` methods encode `Src`, TTL/Hop Limit, and
 TOS/Traffic Class for a message write. `IPv6ControlMessage` also exposes the
-20-bit Flow Label. `Dst` is populated while parsing. `IfIndex` is always zero
-because MIPS has one embedding link. For IPv4, `IPv4ControlMessage.Parse` obtains
-`Dst` from the IP header destination (`ipi_addr`), while `Marshal` uses `Src`
-for source selection (`ipi_spec_dst`).
+20-bit Flow Label; a Hop Limit or Traffic Class of `-1` emits the RFC 3542
+kernel-default sentinel. `Dst` is populated while parsing. `IfIndex` is always
+zero because MIPS has one embedding link. For IPv4, `IPv4ControlMessage.Parse`
+obtains `Dst` from the IP header destination (`ipi_addr`), while `Marshal`
+uses `Src` for source selection (`ipi_spec_dst`).
 
 `UDPConn.ReadBatch`/`WriteBatch` and `IPConn.ReadBatch`/`WriteBatch` use the
 same `SocketMessage` layout as `x/net/ipv4` and `x/net/ipv6`: `Buffers` contains
@@ -884,9 +906,10 @@ its first message and then drains only the currently ready prefix;
 `MessageFlagDontWait` makes the first read nonblocking.
 `MessageFlagTruncated` and `MessageFlagControlTruncated` name the fixed Linux
 result bits returned on every host. Batch operations follow Linux
-`recvmmsg`/`sendmmsg` successful-prefix semantics: an error after one or more
-completed messages is deferred until the caller retries the unprocessed
-suffix, whose result fields remain unchanged.
+`recvmmsg`/`sendmmsg` successful-prefix semantics: when a pending socket error
+follows one or more completed messages, the prefix is returned and the error is
+left for the next socket operation; unprocessed messages and their result
+fields remain unchanged.
 Batch writes accept `MessageFlagDontWait`; other nonzero write flags return
 `EOPNOTSUPP`.
 
@@ -957,7 +980,9 @@ observational callback before an implementation is replaced or its connection
 actor exits. It permits controller-owned cleanup but must return promptly and
 must not start work that outlives it. Implementations must ignore unknown event
 types so a newer stack can add observations without changing the one-method
-controller interface.
+controller interface. When replacing an existing controller, the initialization
+event includes the current transport recovery phase; replacement alone does not
+return the connection to the open phase.
 
 `CongestionState` supplies the Linux-style connection view. Controllers may
 change cwnd and ssthresh directly during the event types that permit those
@@ -972,12 +997,21 @@ accessors, so sampler internals can evolve without changing controller code.
 retransmission callbacks and is required by custom pacers. A controller may
 attach a 64-bit `PacketState` value to each transmission generation; TCP
 returns it unchanged through the selected delivery-rate sample.
+`CongestionRateSample.PacketLossEvidenceValid` reports whether that selected
+generation may be used for loss attribution; a SACK-covered generation keeps
+its `PacketState` but returns false. A true result only excludes that SACK
+ambiguity; it does not imply that `PacketState` is present, that `Valid()` is
+true, that transmission events were enabled, or that retransmission
+attribution is otherwise unambiguous.
 `CongestionControlFeatureLossEvents` additionally retains that value until the
 generation is proven lost and reports per-generation SACK, RACK, RTO, and
-tail-loss-probe recovery events. `CongestionRateSample.TailLossProbeACK`
-identifies the Linux-style ambiguous ACK that exactly covers a retransmitted
-TLP range, allowing a model to preserve delivery signals until later ACK or
-DSACK evidence resolves the loss.
+tail-loss-probe recovery events. On a packet-loss event,
+`CongestionEvent.PacketLossEvidenceValid` qualifies the saved `PacketState`:
+SACK-reneging recovery cannot attribute loss to that old generation, nor can
+a delivery-rate controller use a snapshot already consumed by SACK.
+`CongestionRateSample.TailLossProbeACK` identifies the Linux-style ambiguous
+ACK that exactly covers a retransmitted TLP range, allowing a model to preserve
+delivery signals until later ACK or DSACK evidence resolves the loss.
 `CongestionControlFeatureCustomRecovery` opts into PRR, recovery-window, and
 spurious-undo window decisions. Without it TCP applies its RFC recovery
 defaults without dispatching those detailed stages; checkpoint and undo
@@ -992,8 +1026,10 @@ Validated network- and host-unreachable feedback for `SND.UNA` applies RFC
 connection's soft network error into a hard failure.
 On a SACK-negotiated connection, only newly reported scoreboard information
 counts toward RFC 6675 `DupAcks`; repeated cumulative ACKs and window-probe
-responses without new SACK data cannot manufacture a loss episode. The receive
-path preserves three prompt duplicate ACKs and then applies Linux-style bounded
+responses without new SACK data cannot manufacture a loss episode. An accepted
+reordered ACK can refresh TS.Recent and report SACK/DSACK without changing the
+send window or restarting the cumulative-ACK RTO. The receive path preserves
+three prompt duplicate ACKs and then applies Linux-style bounded
 SACK compression; the sender gives apparent SACK reneging a short grace period
 before clearing contradictory scoreboard state and entering timeout recovery.
 Initial Reno and CUBIC slow start use RFC 9406 HyStart++ and Conservative Slow
@@ -1004,8 +1040,9 @@ response bounds the restored congestion window and makes the RTO more
 conservative after a spurious timeout is detected. Reno and CUBIC also apply
 Linux-style RFC 2861 idle and application-limited congestion-window validation;
 model-based controllers retain their own window policy. TCP also handles
-overlap-aware receive reassembly, data-bearing zero-window probes, reset
-validation, deadlines, half-close, FIN states, and TIME_WAIT.
+overlap-aware receive reassembly, data-bearing zero-window probes, RFC 5961
+reset validation with Linux-compatible consumed-FIN and receive-SACK boundary
+handling, deadlines, half-close, FIN states, and TIME_WAIT.
 
 BBR is a byte-scaled implementation of Linux BBRv1. Each original or
 retransmitted range carries a Linux-style delivery snapshot; ACK processing
@@ -1065,7 +1102,22 @@ TCP user timeout follows Linux `TCP_USER_TIMEOUT`: it applies only in
 synchronized states, returns `ETIMEDOUT`, does not change retransmission or
 keepalive probe timing, and bounds data that remains unacknowledged or unsent
 behind a zero window. Retransmission does not restart the absolute deadline.
-When keepalive is enabled, user timeout replaces the probe-count close policy.
+Changing the timeout does not restart an existing zero-window blocking episode.
+With no outstanding data or FIN, consecutive unanswered zero-window probes have a
+bounded retry budget; for an open connection, the final probe's response interval starts when its
+departure from the device-output queue is observed. Already-transmitted data or FIN
+remains on the ordinary retransmission timer: current ACK responses keep an
+open connection alive even if the window remains closed, while silence is
+bounded by twice the maximum retransmission timeout unless a user timeout is
+configured. Full `Close` retains a finite retry budget in either case. Accepted
+old ACKs still deliver valid data and selective acknowledgements, but do not
+reset unanswered keepalive probes or consume ECN CWR feedback. New receive
+data postpones idle and keepalive checks even when it carries an old ACK.
+Socket-option changes do not reset unanswered keepalive probes.
+Reenabling keepalive starts a new idle delay without resetting the probe count.
+When keepalive is enabled, user timeout replaces the probe-count close policy
+and is checked before a subsequent probe, after at least one probe has been
+sent and the next keepalive check is due.
 MIPS treats it as a local socket policy and does not advertise the optional
 RFC 5482 UTO option.
 
@@ -1073,10 +1125,15 @@ When the SYN backlog or configured connection capacity is exhausted, passive
 open uses stateless SYN cookies instead of retaining another half-open
 connection. A per-stack random key authenticates the complete tuple, client
 sequence, recent time period, and negotiated options. A valid final ACK
-reconstructs the conservative MSS and authenticated negotiated options. If
-that ACK lacks Timestamp, the restored connection disables Timestamp, SACK,
-window scaling, and ECN. Forged or expired cookies do not allocate a
-connection.
+reconstructs the conservative MSS and authenticated negotiated options. If the
+SYN lacks Timestamp, the cookie SYN-ACK does not negotiate SACK or window
+scaling. If that ACK lacks Timestamp, the restored connection disables
+Timestamp, SACK, window scaling, and ECN. A Timestamp-bearing ACK with a zero
+TSecr is accepted as a stateless cookie compatibility case; RFC 7323's
+unsigned field alone cannot distinguish a zero-valued echo from a stripped
+echo. Cookie authentication still restores SACK, scaling, and ECN when they
+were negotiated. This is more permissive than Linux's conservative zero-echo
+fallback. Forged or expired cookies do not allocate a connection.
 
 Validated ICMP Packet Too Big errors maintain a bounded, expiring destination
 PMTU cache. Error type/code combinations and quoted TCP sequence spans are

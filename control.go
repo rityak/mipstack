@@ -26,6 +26,8 @@ const (
 	linuxLevelIPv6 = 41
 	// linuxIPv6FlowInfo is Linux IPV6_FLOWINFO.
 	linuxIPv6FlowInfo = 11
+	// linuxIPv6FlowInfoMask is Linux IPV6_FLOWINFO_MASK.
+	linuxIPv6FlowInfoMask = 0x0fffffff
 	// linuxIPv6ReceiveError is Linux IPV6_RECVERR.
 	linuxIPv6ReceiveError = 25
 	// linuxIPv6PacketInfo is Linux IPV6_PKTINFO.
@@ -127,10 +129,9 @@ func (message *SocketErrorControlMessage) Parse(control []byte) error {
 	}
 	var parsed SocketErrorControlMessage
 	found := false
-	for len(control) != 0 {
-		if len(control) < linuxControlHeaderSize {
-			return errors.New("mipstack: truncated Linux control header")
-		}
+	// Linux CMSG_FIRSTHDR and CMSG_NXTHDR stop when the remaining bytes
+	// cannot hold a complete header, including after alignment padding.
+	for len(control) >= linuxControlHeaderSize {
 		length64 := binary.LittleEndian.Uint64(control[:8])
 		if length64 < linuxControlHeaderSize || length64 > uint64(len(control)) {
 			return errors.New("mipstack: invalid Linux control length")
@@ -150,11 +151,10 @@ func (message *SocketErrorControlMessage) Parse(control []byte) error {
 		}
 		aligned := (length + linuxControlAlignment - 1) &^ (linuxControlAlignment - 1)
 		if aligned > len(control) {
-			if length == len(control) {
-				control = nil
-				break
-			}
-			return errors.New("mipstack: truncated Linux control padding")
+			// The payload is complete when cmsg_len fits. Linux may return
+			// only part of the final alignment padding; padding is not part
+			// of the parsed socket-error value.
+			break
 		}
 		control = control[aligned:]
 	}
@@ -321,10 +321,12 @@ func (message *IPv4ControlMessage) parseForWrite(control []byte) (ipPacketOption
 // always zero and a nonzero value cannot be marshaled.
 type IPv6ControlMessage struct {
 	// TrafficClass is the received or requested traffic-class byte. Zero
-	// selects the output default when marshaling.
+	// selects the output default when marshaling. -1 requests the RFC 3542
+	// kernel-default sentinel in an outbound ancillary message.
 	TrafficClass int
 	// HopLimit is the received or requested hop limit. A received value may be
-	// zero; zero selects the output default when marshaling.
+	// zero; zero selects the output default when marshaling. -1 requests the
+	// RFC 3542 kernel-default sentinel in an outbound ancillary message.
 	HopLimit int
 	// FlowLabel is the received or requested 20-bit IPv6 Flow Label. Zero
 	// selects automatic labeling when marshaling through this structured API.
@@ -371,11 +373,11 @@ func (message *IPv6ControlMessage) marshal(address netip.Addr, receiving bool) (
 		}
 		capacity += 40
 	}
-	if message.HopLimit < 0 || message.HopLimit > 255 {
-		return nil, errors.New("mipstack: IPv6 control-message hop limit must be between 0 and 255")
+	if message.HopLimit < -1 || message.HopLimit > 255 {
+		return nil, errors.New("mipstack: IPv6 control-message hop limit must be -1 or between 0 and 255")
 	}
-	if message.TrafficClass < 0 || message.TrafficClass > 255 {
-		return nil, errors.New("mipstack: IPv6 control-message traffic class must be between 0 and 255")
+	if message.TrafficClass < -1 || message.TrafficClass > 255 {
+		return nil, errors.New("mipstack: IPv6 control-message traffic class must be -1 or between 0 and 255")
 	}
 	if message.FlowLabel > ipv6MaximumFlowLabel {
 		return nil, errors.New("mipstack: IPv6 control-message flow label exceeds 20 bits")
@@ -405,7 +407,14 @@ func (message *IPv6ControlMessage) marshal(address netip.Addr, receiving bool) (
 	// carry an explicit all-zero flowinfo value.
 	if message.FlowLabel != 0 || receiving && message.TrafficClass != 0 {
 		var flowInfo [4]byte
-		binary.BigEndian.PutUint32(flowInfo[:], uint32(message.TrafficClass)<<20|message.FlowLabel)
+		// RFC 3542 defines the separate IPV6_TCLASS cmsg as the wire
+		// Traffic Class control; Linux's IPV6_FLOWINFO extension must not
+		// override it. A -1 sentinel contributes no class bits.
+		trafficClass := uint32(0)
+		if message.TrafficClass >= 0 {
+			trafficClass = uint32(message.TrafficClass)
+		}
+		binary.BigEndian.PutUint32(flowInfo[:], trafficClass<<20|message.FlowLabel)
 		control = appendLinuxControl(control, linuxLevelIPv6, linuxIPv6FlowInfo, flowInfo[:])
 	}
 	return control, nil
@@ -581,7 +590,8 @@ func linuxICMPErrno(networkError ICMPError) uint32 {
 	return linuxICMPErrorConversion(networkError).linuxErrno
 }
 
-// linuxDatagramICMPReport applies Linux UDP/raw IPv4 and IPv6 error policy.
+// linuxDatagramICMPReport applies Linux UDP/raw IPv4 and IPv6 reporting policy
+// to errors admitted by the common ICMP socket-delivery path.
 // The hard-error classification comes from Linux's ICMP conversion tables;
 // the PMTU mode exceptions mirror Linux udp_err, raw_err, udp6_err, and
 // rawv6_err rather than changing RFC PMTU processing.
@@ -642,13 +652,15 @@ func parseControlMessageForWrite(control []byte, v6 bool) (netip.Addr, ipPacketO
 // Empty control data selects routing and default header values. Receiving
 // permits the zero hop value that can be observed at a local destination.
 func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPacketOptions, error) {
+	// Linux processes repeated scalar ancillary values in order, so each later
+	// control message replaces the value decoded from an earlier one. FLOWINFO
+	// additionally rejects reserved-bit changes after a nonzero value.
 	var address netip.Addr
 	var options ipPacketOptions
-	var haveHopLimit, haveTrafficClass, haveTrafficClassControl, haveFlowLabel bool
-	for len(oob) != 0 {
-		if len(oob) < linuxControlHeaderSize {
-			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: truncated Linux IP control header")
-		}
+	var flowInfo uint32
+	// Linux CMSG_FIRSTHDR and CMSG_NXTHDR stop when the remaining bytes
+	// cannot hold a complete header, including after alignment padding.
+	for len(oob) >= linuxControlHeaderSize {
 		length64 := binary.LittleEndian.Uint64(oob[0:8])
 		if length64 < linuxControlHeaderSize || length64 > uint64(len(oob)) {
 			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid Linux IP control length")
@@ -669,85 +681,100 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 			if receiving {
 				candidate = netip.AddrFrom4([4]byte(data[8:12]))
 			}
-			if err := mergePacketInfoAddress(&address, candidate); err != nil {
-				return netip.Addr{}, ipPacketOptions{}, err
+			// Linux uses the last IP_PKTINFO source in a compound send
+			// control buffer; an unspecified IPv4 source clears an earlier
+			// per-packet choice. An unspecified receive destination remains
+			// a valid decoded ipi_addr value.
+			if !receiving && candidate.IsUnspecified() {
+				address = netip.Addr{}
+			} else {
+				address = candidate
 			}
 		case level == linuxLevelIPv6 && kind == linuxIPv6PacketInfo:
-			if !v6 || len(data) != 20 {
+			// Linux ip6_datagram_send_ctl accepts the in6_pktinfo prefix and
+			// ignores any additional payload within the same control record.
+			if !v6 || len(data) < 20 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 packet-info control message")
 			}
 			if binary.LittleEndian.Uint32(data[16:20]) != 0 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: nonzero packet-info interface index is not supported")
 			}
-			if err := mergePacketInfoAddress(&address, netip.AddrFrom16([16]byte(data[0:16]))); err != nil {
-				return netip.Addr{}, ipPacketOptions{}, err
+			candidate := netip.AddrFrom16([16]byte(data[0:16]))
+			// RFC 3542 permits an unspecified IPv6 packet-info address to
+			// request normal source selection. Like Linux, it does not erase
+			// an earlier concrete source in the same send operation.
+			if receiving || !candidate.IsUnspecified() {
+				address = candidate
 			}
 		case level == linuxLevelIP && kind == linuxIPTimeToLive:
 			value, err := linuxControlInt32(data)
-			if v6 || err != nil || value < 0 || !receiving && value == 0 || value > 255 || haveHopLimit {
+			if v6 || err != nil || value < 0 || !receiving && value == 0 || value > 255 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv4 TTL control message")
 			}
-			options.hopLimit, options.hopLimitSet, haveHopLimit = byte(value), true, true
+			options.hopLimit, options.hopLimitSet = byte(value), true
 		case level == linuxLevelIP && kind == linuxIPTypeOfService:
 			value, err := linuxControlByteOrInt32(data)
-			if v6 || err != nil || value < 0 || value > 255 || haveTrafficClassControl {
+			if v6 || err != nil || value < 0 || value > 255 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv4 TOS control message")
 			}
-			options.trafficClass, options.trafficClassSet, haveTrafficClass, haveTrafficClassControl = byte(value), true, true, true
+			options.trafficClass, options.trafficClassSet = byte(value), true
 		case level == linuxLevelIPv6 && kind == linuxIPv6HopLimit:
 			value, err := linuxControlInt32(data)
-			if !v6 || err != nil || value < 0 || value > 255 || haveHopLimit {
+			if !v6 || err != nil || value < -1 || value > 255 || receiving && value == -1 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 hop-limit control message")
 			}
-			options.hopLimit, options.hopLimitSet, haveHopLimit = byte(value), true, true
+			if value == -1 {
+				// RFC 3542 defines -1 as the kernel-default sentinel. Keep
+				// it out of the byte-valued packet options; normal output
+				// default selection then supplies the socket (or multicast)
+				// default instead of accidentally emitting 255.
+				options.hopLimit, options.hopLimitSet = 0, false
+			} else {
+				options.hopLimit, options.hopLimitSet = byte(value), true
+			}
 		case level == linuxLevelIPv6 && kind == linuxIPv6TrafficClass:
 			value, err := linuxControlInt32(data)
-			if !v6 || err != nil || value < 0 || value > 255 || haveTrafficClassControl || haveTrafficClass && options.trafficClass != byte(value) {
+			if !v6 || err != nil || value < -1 || value > 255 || receiving && value == -1 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 traffic-class control message")
 			}
-			options.trafficClass, options.trafficClassSet, haveTrafficClass, haveTrafficClassControl = byte(value), true, true, true
+			if value == -1 {
+				// The sentinel has the same default-selection treatment as
+				// IPV6_HOPLIMIT; it is never converted to an on-wire 255.
+				options.trafficClass, options.trafficClassSet = 0, false
+			} else {
+				options.trafficClass, options.trafficClassSet = byte(value), true
+			}
 		case level == linuxLevelIPv6 && kind == linuxIPv6FlowInfo:
-			if !v6 || len(data) != 4 || haveFlowLabel {
+			// Linux IPV6_FLOWINFO requires at least one 32-bit value, rather
+			// than an exact payload length, and ignores the remaining bytes.
+			if !v6 || len(data) < 4 {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 flow-info control message")
 			}
-			flowInfo := binary.BigEndian.Uint32(data)
-			if flowInfo>>28 != 0 {
-				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 flow-info control message")
+			// Linux masks FLOWINFO to its low 28 bits for flow selection,
+			// while IPV6_TCLASS independently controls the wire Traffic
+			// Class. Keep only the low 20-bit label for packet construction;
+			// this matches IPV6_FLOWINFO_MASK. Once a nonzero masked value
+			// was supplied, Linux rejects a later value with reserved bits
+			// set rather than silently accepting a conflicting control.
+			rawFlowInfo := binary.BigEndian.Uint32(data)
+			if flowInfo != 0 && (flowInfo^rawFlowInfo)&^linuxIPv6FlowInfoMask != 0 {
+				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: conflicting IPv6 flow-info reserved bits")
 			}
-			flowTrafficClass := byte(flowInfo >> 20)
-			if flowTrafficClass != 0 {
-				if haveTrafficClass && options.trafficClass != flowTrafficClass {
-					return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: conflicting IPv6 flow-info traffic class")
-				}
-				options.trafficClass, options.trafficClassSet, haveTrafficClass = flowTrafficClass, true, true
-			}
-			options.flowLabel, options.flowLabelSet, haveFlowLabel = flowInfo&ipv6MaximumFlowLabel, true, true
+			flowInfo = rawFlowInfo & linuxIPv6FlowInfoMask
+			options.flowLabel, options.flowLabelSet = flowInfo&ipv6MaximumFlowLabel, true
 		default:
 			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: unsupported Linux IP control message")
 		}
 		aligned := (length + linuxControlAlignment - 1) &^ (linuxControlAlignment - 1)
 		if aligned > len(oob) {
-			if length == len(oob) {
-				break
-			}
-			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: truncated Linux IP control padding")
+			// RFC 3542 sections 5.2 and 5.3 exclude trailing alignment padding
+			// from cmsg_len. Like Linux CMSG_NXTHDR, accept a complete final
+			// record without requiring all padding bytes on reads or writes.
+			break
 		}
 		oob = oob[aligned:]
 	}
 	return address, options, nil
-}
-
-// mergePacketInfoAddress accepts one consistent, non-unspecified packet-info
-// address.
-func mergePacketInfoAddress(current *netip.Addr, candidate netip.Addr) error {
-	if !candidate.IsValid() || candidate.IsUnspecified() {
-		return nil
-	}
-	if current.IsValid() && *current != candidate {
-		return errors.New("mipstack: conflicting packet-info addresses")
-	}
-	*current = candidate
-	return nil
 }
 
 // linuxControlInt32 decodes one Linux ancillary integer.

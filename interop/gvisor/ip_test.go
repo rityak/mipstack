@@ -1589,6 +1589,90 @@ func TestIPCompletePacketReassemblyInterop(t *testing.T) {
 	}
 }
 
+// TestIPMixedECTFragmentReassemblyInterop preserves native gVisor source
+// fragmentation and UDP checksums while mixing ECT codepoints on the link.
+// Both raw and UDP sockets receive the complete datagram, and the native
+// gVisor endpoint must receive the application's reply.
+func TestIPMixedECTFragmentReassemblyInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		for _, firstECT := range []byte{1, 2} {
+			t.Run(fmt.Sprintf("%s/offset-zero-ECT-%d", family.name, firstECT), func(t *testing.T) {
+				var fragmentCount atomic.Uint32
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1280,
+					gvisorToMipstack: func(packet []byte) bool {
+						offset, fragmented := ipFragmentOffset(packet)
+						if !fragmented {
+							return true
+						}
+						ecn := firstECT
+						if offset != 0 {
+							ecn = 3 - firstECT
+						}
+						if family.gvisorAddress.Is4() {
+							ip := header.IPv4(packet)
+							ip.SetTOS(0x28|ecn, 0)
+							ip.SetChecksum(0)
+							ip.SetChecksum(^ip.CalculateChecksum())
+						} else {
+							header.IPv6(packet).SetTOS(0x28|ecn, 0)
+						}
+						fragmentCount.Add(1)
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				rawNetwork := "ip4:udp"
+				if family.mipstackAddress.Is6() {
+					rawNetwork = "ip6:udp"
+				}
+				config := mipstack.ListenConfig{Options: []mipstack.SocketOption{mipstack.SocketOptions.IPHeaderIncludedOnRead(true)}}
+				rawConnection, err := config.ListenIP(ctx, network.mipstack, rawNetwork, family.mipstackAddress)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer rawConnection.Close()
+				_ = rawConnection.SetDeadline(time.Now().Add(5 * time.Second))
+				connection, peer := openUDPPair(t, ctx, network, family, false)
+				defer connection.Close()
+				defer peer.Close()
+				_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+				_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+				payload := patternedPayload(4096, 0xc3)
+				if n, err := connection.Write(payload); err != nil || n != len(payload) {
+					t.Fatalf("native gVisor fragmented write = %d, %v", n, err)
+				}
+				var packet [65535]byte
+				read, _, err := rawConnection.ReadFrom(packet[:])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := validateCompleteUDPInteropPacket(family, packet[:read], requireAddrPort(t, connection.LocalAddr()).Port(), requireAddrPort(t, peer.LocalAddr()).Port(), payload); err != nil {
+					t.Fatal(err)
+				}
+				class, _ := header.IPv4(packet[:read]).TOS()
+				if family.gvisorAddress.Is6() {
+					class, _ = header.IPv6(packet[:read]).TOS()
+				}
+				if class != 0x28|firstECT || fragmentCount.Load() < 2 {
+					t.Fatalf("reassembled class %d, fragment count %d; want %d and multiple fragments", class, fragmentCount.Load(), 0x28|firstECT)
+				}
+				read, source, err := peer.ReadFrom(packet[:])
+				if err != nil || !bytes.Equal(packet[:read], payload) {
+					t.Fatalf("mipstack UDP reassembly = %d, %v", read, err)
+				}
+				if n, err := peer.WriteTo(packet[:read], source); err != nil || n != len(payload) {
+					t.Fatalf("mipstack UDP reply = %d, %v", n, err)
+				}
+				if read, err := connection.Read(packet[:]); err != nil || !bytes.Equal(packet[:read], payload) {
+					t.Fatalf("native gVisor UDP reply = %d, %v", read, err)
+				}
+			})
+		}
+	}
+}
+
 // buildHeaderIncludedInteropPacket constructs a valid complete packet. IPv4
 // options exercise its variable header length; see TestIPHeaderIncludedInterop
 // for why the IPv6 interop packet intentionally has no extension header.

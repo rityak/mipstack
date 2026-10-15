@@ -411,7 +411,7 @@ func (option noDelaySocketOption) apply(set socketOptionSet, use socketOptionUse
 }
 
 // IdleTimeout closes newly created TCP connections after this duration
-// without an acceptable inbound segment. Zero explicitly disables the policy.
+// without a current ACK or new receive data. Zero explicitly disables the policy.
 // It is valid for ListenConfig.ListenTCP, Dialer.DialTCP, and
 // TCPForwarderRequest.Accept.
 func (SocketOptionFactory) IdleTimeout(timeout time.Duration) SocketOption {

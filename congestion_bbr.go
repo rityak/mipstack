@@ -262,6 +262,10 @@ type bbrCongestionControl struct {
 	nextSend               time.Time
 	pacingWakeDeadline     time.Time
 	pacingBurstRemaining   int
+	// deliveredAt follows Linux delivered_mstamp, including empty-flight
+	// restart. ACKs without new delivery and loss timers cannot advance it.
+	// Keeping it after pacing state preserves locality of the ACK counters.
+	deliveredAt time.Time
 }
 
 // newBBRCongestionControl constructs one independent BBR controller. Linux
@@ -276,6 +280,7 @@ func (b *bbrCongestionControl) HandleCongestionEvent(event *CongestionEvent) {
 	switch event.Type {
 	case CongestionEventInitialize:
 		b.syncDeliveryState(event.State)
+		b.deliveredAt = event.Time
 		b.maximumPacingRate = event.State.MaximumPacingRate
 		if event.State.MinimumRTT > 0 {
 			b.minimumRTT = event.State.MinimumRTT
@@ -288,6 +293,9 @@ func (b *bbrCongestionControl) HandleCongestionEvent(event *CongestionEvent) {
 		sample := event.RateSample
 		if sample == nil {
 			return
+		}
+		if sample.acked != 0 {
+			b.deliveredAt = event.Time
 		}
 		if sample.ackStamp != 0 {
 			b.deliveredStamp = sample.ackStamp
@@ -368,7 +376,7 @@ func (b *bbrCongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 	case CongestionRecoveryPRR, CongestionRecoveryExit, CongestionRecoveryPartialACK, CongestionRecoveryDuplicateACK:
 		event.State.CongestionWindow = event.Recovery.PreviousWindow
 	case CongestionRecoveryUndo:
-		b.undoRecovery(event.Time)
+		b.undoRecovery()
 		if event.State.CongestionWindow < b.priorWindow {
 			event.State.CongestionWindow = b.priorWindow
 		}
@@ -785,7 +793,7 @@ func (b *bbrCongestionControl) updateLongTermBandwidth(sample *tcpDeliveryRateSa
 		if b.mode == bbrProbeBandwidth && b.roundStart {
 			b.longTermRounds++
 			if b.longTermRounds >= bbrLongTermUseRounds {
-				b.resetLongTermBandwidth(sample.ackTime)
+				b.resetLongTermBandwidth()
 				b.resetProbeBandwidth(sample.ackTime)
 			}
 		}
@@ -795,11 +803,11 @@ func (b *bbrCongestionControl) updateLongTermBandwidth(sample *tcpDeliveryRateSa
 		if sample.losses == 0 {
 			return
 		}
-		b.resetLongTermInterval(sample.ackTime)
+		b.resetLongTermInterval()
 		b.longTermSampling = true
 	}
 	if sample.locallyLimited() {
-		b.resetLongTermBandwidth(sample.ackTime)
+		b.resetLongTermBandwidth()
 		return
 	}
 	if b.roundStart {
@@ -809,7 +817,7 @@ func (b *bbrCongestionControl) updateLongTermBandwidth(sample *tcpDeliveryRateSa
 		return
 	}
 	if b.longTermRounds > bbrLongTermMaximumRounds {
-		b.resetLongTermBandwidth(sample.ackTime)
+		b.resetLongTermBandwidth()
 		return
 	}
 	if sample.losses == 0 {
@@ -820,7 +828,10 @@ func (b *bbrCongestionControl) updateLongTermBandwidth(sample *tcpDeliveryRateSa
 	if delivered == 0 || float64(lost)/float64(delivered) < bbrLongTermLossRatio {
 		return
 	}
-	interval := sample.ackTime.Sub(b.longTermLastStamp)
+	// Linux measures policer intervals between delivery timestamps, not
+	// between ACK/loss observations. A late RTO must not lower the measured
+	// bandwidth merely by extending an interval with no delivered bytes.
+	interval := b.deliveredAt.Sub(b.longTermLastStamp)
 	if interval < time.Millisecond {
 		return
 	}
@@ -835,34 +846,34 @@ func (b *bbrCongestionControl) updateLongTermBandwidth(sample *tcpDeliveryRateSa
 		}
 	}
 	b.longTermBandwidth = rate
-	b.resetLongTermInterval(sample.ackTime)
+	b.resetLongTermInterval()
 }
 
 // resetLongTermInterval starts one policer measurement interval.
-func (b *bbrCongestionControl) resetLongTermInterval(now time.Time) {
-	b.longTermLastStamp = now
+func (b *bbrCongestionControl) resetLongTermInterval() {
+	b.longTermLastStamp = b.deliveredAt
 	b.longTermLastDelivered = b.delivered
 	b.longTermLastLost = b.totalLost
 	b.longTermRounds = 0
 }
 
 // resetLongTermBandwidth leaves policer mode and clears its samples.
-func (b *bbrCongestionControl) resetLongTermBandwidth(now time.Time) {
+func (b *bbrCongestionControl) resetLongTermBandwidth() {
 	b.longTermBandwidth = 0
 	b.longTermUseBandwidth = false
 	b.longTermSampling = false
-	b.resetLongTermInterval(now)
+	b.resetLongTermInterval()
 }
 
 // undoRecovery applies Linux bbr_undo_cwnd without rewinding delivery
 // accounting that newer per-transmission rate snapshots already reference.
-func (b *bbrCongestionControl) undoRecovery(now time.Time) {
+func (b *bbrCongestionControl) undoRecovery() {
 	b.fullBandwidth = 0
 	b.fullRounds = 0
 	b.recovery = false
 	b.lossRecovery = false
 	b.packetConservation = false
-	b.resetLongTermBandwidth(now)
+	b.resetLongTermBandwidth()
 }
 
 // saveWindow remembers a usable cwnd before recovery or ProbeRTT reduction.
@@ -880,6 +891,7 @@ func (b *bbrCongestionControl) saveWindow(window uint32) {
 // per-transmission delivery snapshot and invokes this after taking it.
 func (b *bbrCongestionControl) onDeliverySend(now time.Time, packetsOut, window uint32) uint32 {
 	if packetsOut == 0 {
+		b.deliveredAt = now
 		b.nextSend = time.Time{}
 		b.pacingWakeDeadline = time.Time{}
 		b.pacingBurstRemaining = 0

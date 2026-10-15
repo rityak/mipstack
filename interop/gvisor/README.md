@@ -14,10 +14,15 @@ The suite covers:
 - IPv4 MTUs 68, 576, 1,280, 1,420, 1,500, and 9,000, plus IPv6 MTUs 1,280,
   1,420, 1,500, and 9,000;
 - IPv4 and IPv6 TCP with either stack listening, simultaneous streams,
-  half-close processing, wildcard dual-stack listeners, closed-port and
+  half-close processing with blocked writers and paused packet reads,
+  wildcard dual-stack listeners, closed-port and
   established-connection resets, keepalive restart after bidirectional data,
-  receive-window closure and reopening, SYN, SYN-ACK, final-ACK, FIN, and data
-  retransmission after deterministic loss or reordering;
+  receive-window closure and reopening, native zero-window probe responses,
+  SYN, SYN-ACK, final-ACK, FIN, and data
+  retransmission after deterministic loss or reordering, and SYN-cookie
+  recovery when Timestamp is removed from the SYN or final ACK;
+- Reordered cumulative ACKs refreshing Timestamp echoes and carrying native
+  gVisor SACK feedback for selective recovery in both address families;
 - Reno, CUBIC, BBR, and BBRv3 mipstack senders recovering from loss against
   both active and passive gVisor connections, plus an unregistered local
   congestion-control factory receiving correct IPv4/IPv6 connection context;
@@ -28,7 +33,7 @@ The suite covers:
   against gVisor and delivered to its native sockets, and bidirectional ICMP
   Port Unreachable delivery;
 - UDP fragmentation and reassembly in both directions, including reordered
-  and duplicate IPv4 and IPv6 fragments;
+  and duplicate IPv4 and IPv6 fragments and mixed ECT(0)/ECT(1) codepoints;
 - bidirectional UDP and raw-IP ancillary data for destination address, TTL or
   Hop Limit, TOS or Traffic Class, and emitted IPv6 Flow Label;
 - creation-time TCP, UDP, and raw-IP socket policies in both address families,

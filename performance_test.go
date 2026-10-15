@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -85,6 +86,30 @@ func benchmarkTCPControllerConnection(b *testing.B, algorithm string, mtu uint32
 	return connection, server, bridge
 }
 
+// BenchmarkTCPEstablishedStateAllocation measures the allocator's effective
+// per-actor size, including any runtime header for pointer-bearing objects.
+func BenchmarkTCPEstablishedStateAllocation(b *testing.B) {
+	states := make([]*tcpEstablishedState, 128)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		states[i%len(states)] = &tcpEstablishedState{}
+	}
+	runtime.KeepAlive(states)
+}
+
+// BenchmarkTCPEstablishedLivenessAllocation measures the optional network-error
+// and keepalive state's effective heap allocation rather than its declared size.
+func BenchmarkTCPEstablishedLivenessAllocation(b *testing.B) {
+	states := make([]*tcpEstablishedLivenessState, 128)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		states[i%len(states)] = &tcpEstablishedLivenessState{}
+	}
+	runtime.KeepAlive(states)
+}
+
 func BenchmarkTCPControllerThroughput(b *testing.B) {
 	const size = 4 * 1024 * 1024
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
@@ -110,6 +135,7 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 					b.Fatal("echo payload mismatch")
 				}
 			}
+			b.StopTimer()
 			if tcp, ok := connection.(*TCPConn); ok {
 				info := tcp.Info()
 				stats := tcp.stack.Stats()
@@ -127,6 +153,7 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 				b.ReportMetric(float64(stats.TCPInboundQueueDrops), "queue-drops")
 				b.ReportMetric(float64(peerStats.InboundDroppedPackets), "peer-rx-drops")
 				b.ReportMetric(float64(peerStats.TCPInboundQueueDrops), "peer-queue-drops")
+				b.ReportMetric(float64(stats.OutboundPackets+peerStats.OutboundPackets)/float64(b.N), "wire-packets/op")
 				b.ReportMetric(float64(stats.TCPSACKRetransmissions), "sack-retransmissions")
 				b.ReportMetric(float64(stats.TCPRACKRetransmissions), "rack-retransmissions")
 				b.ReportMetric(float64(stats.TCPTailLossProbes), "tail-loss-probes")
@@ -139,6 +166,68 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 				b.ReportMetric(float64(bridge.peerDSACKs), "peer-dsack-acks")
 				bridge.mu.Unlock()
 			}
+		})
+	}
+}
+
+// BenchmarkTCPControllerFixedBufferThroughput holds both sockets' buffer
+// capacities constant so automatic tuning cannot change the allocation cost.
+func BenchmarkTCPControllerFixedBufferThroughput(b *testing.B) {
+	const size = 4 * 1024 * 1024
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		b.Run(algorithm, func(b *testing.B) {
+			connection, peer, _ := benchmarkTCPControllerConnection(b, algorithm, defaultMTU, false, RXChecksumOffload{})
+			sender := connection.(*TCPConn)
+			peer.mu.Lock()
+			receiver := peer.tcp[tcpKey{local: sender.key.remote, remote: sender.key.local}]
+			peer.mu.Unlock()
+			if receiver == nil {
+				b.Fatal("fixed-buffer benchmark has no peer connection")
+			}
+			for _, c := range []*TCPConn{sender, receiver} {
+				if err := c.SetReadBuffer(tcpReceiveCapacity); err != nil {
+					b.Fatal(err)
+				}
+				if err := c.SetWriteBuffer(tcpSendCapacity); err != nil {
+					b.Fatal(err)
+				}
+			}
+			payload := bytes.Repeat([]byte{0x5a}, size)
+			received := make([]byte, size)
+			b.ReportAllocs()
+			b.SetBytes(2 * size)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				written := make(chan error, 1)
+				go func() {
+					n, err := connection.Write(payload)
+					if err == nil && n != len(payload) {
+						err = io.ErrShortWrite
+					}
+					written <- err
+				}()
+				if _, err := io.ReadFull(connection, received); err != nil {
+					b.Fatal(err)
+				}
+				if err := <-written; err != nil {
+					b.Fatal(err)
+				}
+				if !bytes.Equal(received, payload) {
+					b.Fatal("fixed-buffer echo payload mismatch")
+				}
+			}
+			b.StopTimer()
+			for _, c := range []*TCPConn{sender, receiver} {
+				info := c.Info()
+				if info.SendBufferCapacity != tcpSendCapacity || info.ReceiveBufferCapacity != tcpReceiveCapacity {
+					b.Fatalf("fixed socket buffers changed: %+v", info)
+				}
+			}
+			clientStats, peerStats := sender.stack.Stats(), peer.Stats()
+			b.ReportMetric(float64(clientStats.OutboundPackets+peerStats.OutboundPackets)/float64(b.N), "wire-packets/op")
+			b.ReportMetric(float64(sender.inbound.peakBytes()), "client-inbound-queue-peak-B")
+			b.ReportMetric(float64(receiver.inbound.peakBytes()), "peer-inbound-queue-peak-B")
+			b.ReportMetric(float64(sender.Info().Retransmissions+receiver.Info().Retransmissions), "retransmissions")
 		})
 	}
 }
@@ -213,7 +302,7 @@ func BenchmarkTCPControllerLatency(b *testing.B) {
 	}
 }
 
-func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int) []net.Conn {
+func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int) ([]net.Conn, []net.Conn) {
 	b.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.211")
 	serverAddress := netip.MustParseAddr("192.0.2.212")
@@ -302,7 +391,7 @@ func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int
 		<-bridge.done
 		<-bridge.done
 	})
-	return connections
+	return connections, serverConnections
 }
 
 func BenchmarkTCPControllerConcurrency(b *testing.B) {
@@ -310,7 +399,7 @@ func BenchmarkTCPControllerConcurrency(b *testing.B) {
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		for _, count := range []int{16, 64, 256, 512, 1024, 2048, 4096, 8192} {
 			b.Run(fmt.Sprintf("%s-%d", algorithm, count), func(b *testing.B) {
-				connections := benchmarkTCPControllerConnections(b, algorithm, count)
+				connections, peerConnections := benchmarkTCPControllerConnections(b, algorithm, count)
 				payload := bytes.Repeat([]byte{0x6b}, size)
 				b.SetBytes(int64(2 * size * count))
 				b.ResetTimer()
@@ -341,6 +430,43 @@ func BenchmarkTCPControllerConcurrency(b *testing.B) {
 						}
 					}
 				}
+				b.StopTimer()
+				var retransmissions, queueDrops, window, sendCapacity uint64
+				for _, connection := range connections {
+					info := connection.(*TCPConn).Info()
+					retransmissions += info.Retransmissions
+					queueDrops += info.InboundQueueDrops
+					window += uint64(info.CongestionWindow)
+					sendCapacity += uint64(info.SendBufferCapacity)
+				}
+				var peerRetransmissions, peerQueueDrops, peerWindow, peerSendCapacity uint64
+				for _, connection := range peerConnections {
+					info := connection.(*TCPConn).Info()
+					peerRetransmissions += info.Retransmissions
+					peerQueueDrops += info.InboundQueueDrops
+					peerWindow += uint64(info.CongestionWindow)
+					peerSendCapacity += uint64(info.SendBufferCapacity)
+				}
+				stats := connections[0].(*TCPConn).stack.Stats()
+				peerStats := peerConnections[0].(*TCPConn).stack.Stats()
+				b.ReportMetric(float64(retransmissions), "retransmissions")
+				b.ReportMetric(float64(queueDrops), "connection-queue-drops")
+				b.ReportMetric(float64(window)/float64(count), "cwnd-B/flow")
+				b.ReportMetric(float64(sendCapacity)/float64(count), "send-buffer-B/flow")
+				b.ReportMetric(float64(stats.TCPTailLossProbes), "tail-loss-probes")
+				b.ReportMetric(float64(stats.TCPSACKRetransmissions), "sack-retransmissions")
+				b.ReportMetric(float64(stats.TCPRACKRetransmissions), "rack-retransmissions")
+				b.ReportMetric(float64(stats.InboundDroppedPackets), "rx-drops")
+				b.ReportMetric(float64(stats.TCPInboundQueueDrops), "queue-drops")
+				b.ReportMetric(float64(peerRetransmissions), "peer-retransmissions")
+				b.ReportMetric(float64(peerQueueDrops), "peer-connection-queue-drops")
+				b.ReportMetric(float64(peerWindow)/float64(count), "peer-cwnd-B/flow")
+				b.ReportMetric(float64(peerSendCapacity)/float64(count), "peer-send-buffer-B/flow")
+				b.ReportMetric(float64(peerStats.TCPTailLossProbes), "peer-tail-loss-probes")
+				b.ReportMetric(float64(peerStats.TCPSACKRetransmissions), "peer-sack-retransmissions")
+				b.ReportMetric(float64(peerStats.TCPRACKRetransmissions), "peer-rack-retransmissions")
+				b.ReportMetric(float64(peerStats.InboundDroppedPackets), "peer-rx-drops")
+				b.ReportMetric(float64(peerStats.TCPInboundQueueDrops), "peer-queue-drops")
 			})
 		}
 	}

@@ -127,13 +127,22 @@ func (c *cubicCongestionControl) restoreRecoveryCheckpoint() {
 // Linux's CA_EVENT_TX_START handling. Otherwise wall-clock idle time would
 // move the resumed flow far ahead on the cubic growth curve.
 func (c *cubicCongestionControl) onSend(now time.Time, flight uint32) {
-	if !c.applicationLimited.IsZero() {
-		if !c.epochStart.IsZero() && now.After(c.applicationLimited) {
-			c.epochStart = c.epochStart.Add(now.Sub(c.applicationLimited))
+	if !c.epochStart.IsZero() {
+		idleSince := c.applicationLimited
+		if idleSince.IsZero() && flight == 0 {
+			idleSince = c.lastSend
 		}
+		if !idleSince.IsZero() && now.After(idleSince) {
+			c.epochStart = c.epochStart.Add(now.Sub(idleSince))
+			// Linux clamps the shifted epoch to the returning transmission:
+			// the ACK that opened the epoch can postdate the last send.
+			if c.epochStart.After(now) {
+				c.epochStart = now
+			}
+		}
+	}
+	if !c.applicationLimited.IsZero() {
 		c.applicationLimited = time.Time{}
-	} else if flight == 0 && !c.epochStart.IsZero() && !c.lastSend.IsZero() && now.After(c.lastSend) {
-		c.epochStart = c.epochStart.Add(now.Sub(c.lastSend))
 	}
 	c.lastSend = now
 }
@@ -205,6 +214,11 @@ func (c *cubicCongestionControl) onACK(window, acknowledged uint32, mss int, now
 	if c.epochStart.IsZero() {
 		c.epochStart = now
 		c.estimate = current
+		// RFC 9438 section 4.10 sets cwnd_prior at the first loss-free
+		// slow-start exit. Later epochs retain the last congestion value.
+		if c.priorWindow == 0 {
+			c.priorWindow = current
+		}
 		if c.afterTimeout {
 			c.lastMaximum = current
 			c.origin = current
@@ -224,15 +238,25 @@ func (c *cubicCongestionControl) onACK(window, acknowledged uint32, mss int, now
 	}
 	c.estimate += alpha * float64(acknowledged) / float64(window)
 	elapsed := now.Sub(c.epochStart).Seconds()
-	curve := 0.4*math.Pow(elapsed-c.k, 3) + c.origin
-	target := 0.4*math.Pow(elapsed+smoothedRTT.Seconds()-c.k, 3) + c.origin
+	// A queued ACK can arrive before the send that resumed the epoch.
+	// RFC 9438 section 4.2 measures elapsed congestion-avoidance time,
+	// not a negative interval created by actor scheduling.
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	// RFC 9438 section 4.2 fixes the exponent at three; evaluate the cubic
+	// directly without a general exponentiation on each ACK.
+	curveOffset := elapsed - c.k
+	targetOffset := elapsed + smoothedRTT.Seconds() - c.k
+	curve := 0.4*(curveOffset*curveOffset*curveOffset) + c.origin
+	target := 0.4*(targetOffset*targetOffset*targetOffset) + c.origin
 	if target < current {
 		target = current
 	} else if maximum := 1.5 * current; target > maximum {
 		target = maximum
 	}
-	// RFC 9438 section 4.3 uses alpha=3*(1-beta)/(1+beta). For
-	// beta=0.7 this is 9/17, not Reno's full one-SMSS-per-RTT growth.
+	// RFC 9438 section 4.3 uses alpha=3*(1-beta)/(1+beta), or 9/17
+	// for beta=0.7, until W_est recovers cwnd_prior; alpha then becomes 1.
 	increment := float64(0)
 	if curve < c.estimate {
 		increment = (c.estimate - current) * float64(mss)

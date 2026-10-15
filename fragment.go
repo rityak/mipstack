@@ -606,9 +606,7 @@ func (r *ipPacketReassemblyState) finishWire() []byte {
 		return nil
 	}
 	dontFragment := !r.v6 && r.maxDFSize != 0 && r.maxDFSize == r.maxSize
-	packet := buildReassembledPacket(r, dontFragment)
-	setPacketECN(packet, ecn)
-	return packet
+	return buildReassembledPacket(r, dontFragment, ecn)
 }
 
 // runFragmentCleaner releases incomplete sets even when no later fragments
@@ -744,13 +742,14 @@ func fragmentRangeState(pieces []fragmentPiece, start, end int) (covered, overla
 
 // buildReassembledPacket removes fragmentation state while preserving the
 // complete offset-zero IPv4 header or IPv6 Per-Fragment header chain.
-func buildReassembledPacket(state *ipPacketReassemblyState, dontFragment bool) []byte {
+func buildReassembledPacket(state *ipPacketReassemblyState, dontFragment bool, ecn byte) []byte {
 	if !state.v6 {
 		if len(state.header) < 20 || len(state.header)+state.total > 65535 {
 			return nil
 		}
 		packet := make([]byte, len(state.header)+state.total)
 		copy(packet, state.header)
+		packet[1] |= ecn
 		for _, piece := range state.pieces {
 			copy(packet[len(state.header)+piece.offset:], piece.data)
 		}
@@ -769,6 +768,7 @@ func buildReassembledPacket(state *ipPacketReassemblyState, dontFragment bool) [
 	}
 	packet := make([]byte, len(state.header)+state.total)
 	copy(packet, state.header)
+	packet[1] |= ecn << 4
 	packet[state.nextHeader] = state.protocol
 	for _, piece := range state.pieces {
 		copy(packet[len(state.header)+piece.offset:], piece.data)
@@ -999,21 +999,17 @@ func ipv6FirstFragmentUpperLayerLength(protocol byte, payload []byte) (int, bool
 	return required, required <= len(payload)
 }
 
-// fragmentECN applies the RFC 3168 section 5.3 table used by Linux to the OR
-// mask of ECN codepoints observed in one datagram.
+// fragmentECN returns the ECN bits to OR into the offset-zero fragment's
+// header. RFC 3168 section 5.3 propagates CE; Linux also accepts ECT(0)/ECT(1)
+// mixtures without CE and preserves the offset-zero codepoint in that case.
 func fragmentECN(mask byte) (byte, bool) {
 	switch mask {
-	case 1 << 0:
+	case 1 << 0, 1 << 1, 1 << 2, 1<<1 | 1<<2:
 		return 0, true
-	case 1 << 1:
-		return 1, true
-	case 1 << 2:
-		return 2, true
 	case 1 << 3, 1<<3 | 1<<1, 1<<3 | 1<<2, 1<<3 | 1<<1 | 1<<2:
 		return 3, true
 	default:
-		// Linux's ip_frag_ecn_table rejects every unlisted combination,
-		// including ECT(0) mixed with ECT(1) without a CE fragment.
+		// Not-ECT mixed with an ECN-capable fragment is inconsistent.
 		return 0, false
 	}
 }

@@ -30,13 +30,36 @@ func TestBuiltInCongestionControllerLayouts(t *testing.T) {
 	}{
 		{"Reno", unsafe.Sizeof(renoCongestionControl{}), 16},
 		{"CUBIC", unsafe.Sizeof(cubicCongestionControl{}), 256},
-		{"BBR", unsafe.Sizeof(bbrCongestionControl{}), 360},
+		{"BBR", unsafe.Sizeof(bbrCongestionControl{}), 384},
 		{"BBRv3", unsafe.Sizeof(bbr3CongestionControl{}), 400},
 	}
 	for _, test := range tests {
 		if test.got != test.want {
 			t.Errorf("%s controller size = %d, want %d; reassess the lossy-connection allocation class", test.name, test.got, test.want)
 		}
+	}
+}
+
+var benchmarkCreatedCongestionController CongestionController
+
+// BenchmarkCongestionControllerAllocation measures the heap allocation class,
+// rather than assuming that every change in raw struct size saves heap memory.
+func BenchmarkCongestionControllerAllocation(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		new  func() CongestionController
+	}{
+		{name: CongestionControlReno, new: func() CongestionController { return newRenoCongestionControl() }},
+		{name: CongestionControlCUBIC, new: func() CongestionController { return newCUBICCongestionControl() }},
+		{name: CongestionControlBBR, new: func() CongestionController { return newBBRCongestionControl() }},
+		{name: CongestionControlBBR3, new: func() CongestionController { return newBBR3CongestionControl() }},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for iteration := 0; iteration < b.N; iteration++ {
+				benchmarkCreatedCongestionController = test.new()
+			}
+		})
 	}
 }
 
@@ -100,7 +123,7 @@ func TestCongestionControllerComposesDeliverySamplingWithCommonPacing(t *testing
 	if !controller.usesDeliveryRate() || controller.customPacing() {
 		t.Fatalf("capabilities = delivery %t custom pacing %t", controller.usesDeliveryRate(), controller.customPacing())
 	}
-	controller.initialize(time.Unix(100, 0), 0, time.Millisecond, 10_000, 20_000, 1000, 1)
+	controller.initialize(CongestionPhaseOpen, time.Unix(100, 0), 0, time.Millisecond, 10_000, 20_000, 1000, 1)
 	snapshot, window := controller.onDataSend(1000, 1000, time.Unix(100, 0), 2, 0, 10_000, 0, time.Millisecond, 20_000)
 	if snapshot.deliveredStamp == 0 || window != 10_000 || controller.pacingSegments != 1 {
 		t.Fatalf("delivery send = stamp %d window %d pacing segments %d", snapshot.deliveredStamp, window, controller.pacingSegments)
@@ -233,7 +256,7 @@ func TestMaximumPacingRateLimitsEveryController(t *testing.T) {
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		controller := newTCPCongestionController(algorithm)
 		controller.setMaximumPacingRate(limit)
-		controller.initialize(time.Unix(99, 0), 0, time.Millisecond, 10*mss, 20*mss, mss, 1)
+		controller.initialize(CongestionPhaseOpen, time.Unix(99, 0), 0, time.Millisecond, 10*mss, 20*mss, mss, 1)
 		if algorithm == CongestionControlBBR {
 			bbrState(t, &controller).pacingRate = 1_000_000
 			if rate := bbrState(t, &controller).effectivePacingRate(); rate != float64(limit) {
@@ -275,7 +298,7 @@ func TestMaximumPacingRateLimitsEveryController(t *testing.T) {
 func TestMaximumPacingRateChangeInvalidatesPacingSchedule(t *testing.T) {
 	start := time.Unix(100, 0)
 	controller := newTCPCongestionController(CongestionControlBBR)
-	controller.initialize(start, 0, time.Millisecond, 10_000, 20_000, 1000, 1)
+	controller.initialize(CongestionPhaseOpen, start, 0, time.Millisecond, 10_000, 20_000, 1000, 1)
 	controller.pacingNext = start.Add(time.Second)
 	bbrState(t, &controller).nextSend = start.Add(2 * time.Second)
 	bbrState(t, &controller).pacingWakeDeadline = start.Add(1500 * time.Millisecond)
@@ -478,7 +501,7 @@ func TestBBRSpuriousRecoveryRestoresPriorWindow(t *testing.T) {
 		t.Run(algorithm, func(t *testing.T) {
 			controller := newTCPCongestionController(algorithm)
 			now := time.Unix(100, 0)
-			_, _ = controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, priorWindow, ^uint32(0)>>1, mss, 1)
+			_, _ = controller.initialize(CongestionPhaseOpen, now, 10*time.Millisecond, 20*time.Millisecond, priorWindow, ^uint32(0)>>1, mss, 1)
 			threshold := controller.onTimeout(priorWindow, priorWindow, ^uint32(0)>>1, mss, now)
 			window, _ := controller.undoRecovery(now.Add(time.Second), uint32(mss), 5*mss, threshold, 5*mss, mss, CongestionPhaseOpen)
 			if window != priorWindow {

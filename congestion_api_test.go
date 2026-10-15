@@ -32,6 +32,7 @@ type congestionAPIRecorder struct {
 	windowGrowth  uint32
 	undoWindow    uint32
 	undoThreshold uint32
+	initialPhase  CongestionPhase
 }
 
 type congestionAPILifecycle struct {
@@ -46,6 +47,7 @@ type congestionAPILossRecorder struct {
 	lostState     uint64
 	lostBytes     int
 	totalLost     uint64
+	lossEvidence  bool
 	tailRecovered bool
 	nextState     uint64
 }
@@ -112,6 +114,7 @@ func (c *congestionAPILossRecorder) HandleCongestionEvent(event *CongestionEvent
 		c.lostState = event.PacketState
 		c.lostBytes = event.PacketBytes
 		c.totalLost = event.State.LostBytes
+		c.lossEvidence = event.PacketLossEvidenceValid
 	case CongestionEventTailLossProbeRecovered:
 		c.tailRecovered = true
 	}
@@ -133,6 +136,8 @@ func (c *congestionAPILifecycle) HandleCongestionEvent(event *CongestionEvent) {
 func (c *congestionAPIRecorder) HandleCongestionEvent(event *CongestionEvent) {
 	c.events = append(c.events, event.Type)
 	switch event.Type {
+	case CongestionEventInitialize:
+		c.initialPhase = event.State.Phase
 	case CongestionEventACK:
 		if event.RateSample != nil {
 			c.rateSample = *event.RateSample
@@ -155,6 +160,94 @@ func (c *congestionAPIRecorder) HandleCongestionEvent(event *CongestionEvent) {
 		c.recoveries = append(c.recoveries, event.Recovery)
 	case CongestionEventStateChanged:
 		c.phases = append(c.phases, event.State.Phase)
+	}
+}
+
+func TestTCPControllerReplacementPreservesPhase(t *testing.T) {
+	for _, phase := range []struct {
+		name  string
+		value CongestionPhase
+	}{
+		{name: "Open", value: CongestionPhaseOpen},
+		{name: "Disorder", value: CongestionPhaseDisorder},
+		{name: "CWR", value: CongestionPhaseCWR},
+		{name: "Recovery", value: CongestionPhaseRecovery},
+		{name: "Loss", value: CongestionPhaseLoss},
+	} {
+		for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3, "custom", "same factory"} {
+			t.Run(phase.name+"/"+algorithm, func(t *testing.T) {
+				now := time.Now()
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: now}
+				connection.sendBuffer.append(make([]byte, 3000))
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(CongestionControlCUBIC),
+					peerMSS: 1000, peerWindow: 20_000, peerSACK: true,
+					sendUnacknowledged: 1000, sendNext: 4000,
+					congestionWindow: 8000, slowStartThreshold: 4000, rtt: newRTTEstimator(time.Millisecond),
+					fastRecovery: phase.value == CongestionPhaseRecovery, recoveryPoint: 3000,
+					rtoRecovery: phase.value == CongestionPhaseLoss, rtoRecoveryPoint: 3000,
+					ecnRecoveryActive: phase.value == CongestionPhaseCWR, ecnRecoveryPoint: 3000,
+					prrPriorFlight: 3000, prrDelivered: 1000, prrOut: 1000,
+					outstanding: []sentTCPSegment{
+						{sequence: 1000, end: 2000}, {sequence: 2000, end: 3000}, {sequence: 3000, end: 4000},
+					},
+					undo: &tcpRecoveryUndo{active: true},
+				}
+				state.controller.initialize(phase.value, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, state.peerMSS, 1)
+				before := state.recoveryTransportState(false)
+				recorder := &congestionAPIRecorder{}
+				factory := state.controller.factory
+				if algorithm != "same factory" {
+					definition := CongestionControlDefinition{Name: nextCongestionAPITestName()}
+					if algorithm == "custom" {
+						definition.New = func(CongestionControlContext) CongestionController { return recorder }
+					} else {
+						registered, _ := registeredCongestionControlFactory(algorithm)
+						definition = registered.definition
+						definition.Name = nextCongestionAPITestName()
+					}
+					var err error
+					factory, err = NewCongestionControlFactory(definition)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				previous := state.controller.algorithm
+				state.changeCongestionController(factory, 0)
+				defer func() {
+					state.controller.release(time.Now(), state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt, state.rtt.minimum)
+				}()
+				if after := state.recoveryTransportState(false); after != before || state.congestionWindow != 8000 || state.slowStartThreshold != 4000 {
+					t.Fatalf("replacement changed transport recovery: before %+v after %+v cwnd %d ssthresh %d", before, after, state.congestionWindow, state.slowStartThreshold)
+				}
+				if algorithm == "same factory" {
+					if state.controller.algorithm != previous || !state.undo.active {
+						t.Fatal("unchanged factory replaced controller-private state")
+					}
+				} else if state.undo.active {
+					t.Fatal("replacement retained the old controller's undo checkpoint")
+				}
+				if algorithm == "custom" {
+					if recorder.initialPhase != phase.value || len(recorder.events) != 1 || recorder.events[0] != CongestionEventInitialize {
+						t.Fatalf("replacement initialization = phase %v events %v", recorder.initialPhase, recorder.events)
+					}
+				}
+				if phase.value == CongestionPhaseDisorder {
+					return
+				}
+				segment := tcpSegment{acknowledgement: 2000, flags: TCPFlagACK, window: 20_000}
+				state.processAcknowledgment(&segment, now.Add(time.Millisecond), 0)
+				if state.controller.state.Phase != phase.value {
+					t.Fatalf("partial ACK changed phase to %v, want %v", state.controller.state.Phase, phase.value)
+				}
+				segment.acknowledgement = 4000
+				state.processAcknowledgment(&segment, now.Add(2*time.Millisecond), 0)
+				if state.controller.state.Phase != CongestionPhaseOpen || state.fastRecovery || state.rtoRecovery || len(state.outstanding) != 0 {
+					t.Fatal("full ACK did not complete transport recovery")
+				}
+			})
+		}
 	}
 }
 
@@ -582,14 +675,14 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 			CongestionControlFeatureLossEvents,
 	})
 	now := time.Unix(100, 0)
-	controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 40_000, 1000, 1)
+	controller.initialize(CongestionPhaseOpen, now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 40_000, 1000, 1)
 	_, _ = controller.onDataSend(1000, 1000, now, 2, 0, 20_000, 0, 20*time.Millisecond, 40_000)
 	segment := sentTCPSegment{sequence: 1, end: 1001, congestionPacketState: controller.transmissionState()}
 	if segment.congestionPacketState != 1 {
 		t.Fatalf("original packet state = %d, want 1", segment.congestionPacketState)
 	}
-	controller.notePacketLoss(&segment, 1000, false, now.Add(time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
-	if recorder.lostState != 1 || recorder.lostBytes != 1000 || recorder.totalLost != 1000 {
+	controller.notePacketLoss(&segment, 1000, false, true, now.Add(time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lostState != 1 || recorder.lostBytes != 1000 || recorder.totalLost != 1000 || !recorder.lossEvidence {
 		t.Fatalf("first loss = state %d bytes %d total %d", recorder.lostState, recorder.lostBytes, recorder.totalLost)
 	}
 	segment.congestionPacketState = 0
@@ -598,13 +691,83 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 	if segment.congestionPacketState != 2 {
 		t.Fatalf("retransmission packet state = %d, want 2", segment.congestionPacketState)
 	}
-	controller.notePacketLoss(&segment, 1000, true, now.Add(2*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
-	if recorder.lostState != 2 || recorder.totalLost != 2000 {
+	controller.notePacketLoss(&segment, 1000, true, true, now.Add(2*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lostState != 2 || recorder.totalLost != 2000 || !recorder.lossEvidence {
 		t.Fatalf("retransmission loss = state %d total %d", recorder.lostState, recorder.totalLost)
+	}
+	renege := sentTCPSegment{sequence: 2001, end: 3001, congestionPacketState: 3}
+	controller.notePacketLoss(&renege, 1000, false, false, now.Add(3*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lossEvidence || recorder.lostState != 3 || recorder.lostBytes != 1000 || recorder.totalLost != 3000 {
+		t.Fatalf("reneging loss = state:%d bytes:%d total:%d evidence:%t", recorder.lostState, recorder.lostBytes, recorder.totalLost, recorder.lossEvidence)
 	}
 	controller.onTailLossProbeRecovered(now.Add(3*time.Millisecond), 1000, segment.congestionPacketState, 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
 	if !recorder.tailRecovered {
 		t.Fatal("tail-loss-probe recovery event was not delivered")
+	}
+}
+
+func TestCongestionLossEvidenceAfterSACKReneging(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	for _, duringACK := range []bool{false, true} {
+		t.Run(fmt.Sprintf("during-ACK-%t", duringACK), func(t *testing.T) {
+			recorder := new(congestionAPILossRecorder)
+			controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+				Name: "reneged-transmission", New: func(CongestionControlContext) CongestionController { return recorder },
+				Features: CongestionControlFeatureDeliveryRate | CongestionControlFeatureTransmissionEvents | CongestionControlFeatureLossEvents,
+			})
+			controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, 20_000, 40_000, mss, 1)
+			snapshot, _ := controller.onDataSend(mss, mss, now, 1, 0, 20_000, 0, time.Millisecond, 40_000)
+			segment := sentTCPSegment{sequence: 100, end: 100 + mss, state: sentTCPSegmentTransmitted,
+				delivery: snapshot, congestionPacketState: controller.transmissionState()}
+			outstanding, _, _, _, _, _ := applyTCPSACK([]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 100 + mss}}, now)
+			segment = outstanding[0]
+			if segment.delivery.deliveredStamp != 0 {
+				t.Fatal("SACK did not consume the delivery snapshot")
+			}
+			// Once reneging clears the scoreboard, a later ordinary RTO or RACK
+			// loss must still reject this old generation's loss snapshot.
+			segment.state.set(sentTCPSegmentSACKed, false)
+			controller.notePacketLoss(&segment, recordTCPSegmentLoss(&segment, true), duringACK, true, now.Add(time.Millisecond), 20_000, 40_000, mss, mss, time.Millisecond)
+			if recorder.lossEvidence || recorder.lostState != 1 || recorder.totalLost != mss {
+				t.Fatalf("old generation = evidence:%t state:%d lost:%d", recorder.lossEvidence, recorder.lostState, recorder.totalLost)
+			}
+			segment.advanceTransmissionGeneration()
+			segment.delivery = controller.onRetransmit(mss, mss, now.Add(2*time.Millisecond), monotonicStamp(2*time.Millisecond)+1, 20_000, mss, mss, time.Millisecond, 40_000)
+			segment.congestionPacketState = controller.transmissionState()
+			controller.notePacketLoss(&segment, recordTCPSegmentLoss(&segment, true), duringACK, true, now.Add(3*time.Millisecond), 20_000, 40_000, mss, mss, time.Millisecond)
+			if !recorder.lossEvidence || recorder.lostState != 2 || recorder.totalLost != 2*mss {
+				t.Fatalf("new generation = evidence:%t state:%d lost:%d", recorder.lossEvidence, recorder.lostState, recorder.totalLost)
+			}
+		})
+	}
+}
+
+func TestCongestionDeliverySamplePreservesSACKPacketState(t *testing.T) {
+	recorder := &congestionAPIRecorder{}
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name:     "delivery-state",
+		New:      func(CongestionControlContext) CongestionController { return recorder },
+		Features: CongestionControlFeatureDeliveryRate,
+	})
+	now := time.Unix(100, 0)
+	controller.initialize(CongestionPhaseOpen, now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 40_000, 1000, 1)
+	segment := sentTCPSegment{
+		sequence: 1, end: 1001,
+		state:                 sentTCPSegmentTransmitted | sentTCPSegmentSACKed,
+		congestionPacketState: 0x1234,
+		hostQueue:             packetQueueTicket{queuedAt: 2},
+		delivery:              tcpDeliverySnapshot{firstSent: 1, deliveredStamp: 1, deliveredFlags: 100},
+	}
+	sample := new(tcpDeliveryRateSample)
+	sample.observe(segment)
+	controller.finishDeliveryRateSample(sample, 1000, 1000, 0, now.Add(time.Millisecond), 3, 0, time.Millisecond, 0, false)
+	controller.onDeliveryRateSample(20_000, 40_000, 1000, segment.end, sample)
+	if got := recorder.rateSample.PacketState(); got != 0x1234 {
+		t.Fatalf("delivery callback PacketState = %#x, want %#x", got, uint64(0x1234))
+	}
+	if recorder.rateSample.PacketLossEvidenceValid() {
+		t.Fatal("delivery callback restored loss evidence for a SACKed generation")
 	}
 }
 
@@ -638,6 +801,19 @@ func TestSentTCPSegmentLayout(t *testing.T) {
 	}
 	if offset := unsafe.Offsetof(segment.transmissionOrder); offset != 60 {
 		t.Fatalf("transmission order offset = %d, want 60", offset)
+	}
+}
+
+func TestCongestionEventLayout(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit layout assertion")
+	}
+	event := CongestionEvent{}
+	if size := unsafe.Sizeof(event); size != 216 {
+		t.Fatalf("CongestionEvent size = %d, want 216", size)
+	}
+	if offset, mark := unsafe.Offsetof(event.PacketLossEvidenceValid), unsafe.Offsetof(event.MarkApplicationLimited); offset != mark+1 {
+		t.Fatalf("loss-evidence flag offset = %d, want immediately after application-limited flag at %d", offset, mark)
 	}
 }
 
@@ -692,7 +868,7 @@ func TestCongestionControlFactoryCreatesIndependentControllers(t *testing.T) {
 		t.Fatalf("definition was not preserved: features %#x multiplier %d", first.features, first.sendBufferMultiplier())
 	}
 
-	first.initialize(time.Unix(100, 0), 10*time.Millisecond, 20*time.Millisecond, 10_000, 20_000, 1000, 1)
+	first.initialize(CongestionPhaseOpen, time.Unix(100, 0), 10*time.Millisecond, 20*time.Millisecond, 10_000, 20_000, 1000, 1)
 	sample := tcpDeliveryRateSample{
 		priorDelivered: 2, priorDeliveredTotal: 2, delivered: 1000, acked: 1000, losses: 25,
 		priorInFlight: 5000, inFlight: 4000, interval: 10 * time.Millisecond,
@@ -803,7 +979,7 @@ func TestCongestionControllerLifecycleAndMutableInitialState(t *testing.T) {
 	if len(lifecycle.events) != 0 {
 		t.Fatalf("controller received %v before initialization", lifecycle.events)
 	}
-	window, threshold := controller.initialize(time.Unix(100, 0), 10*time.Millisecond, 20*time.Millisecond, 10_000, 20_000, 1000, 1)
+	window, threshold := controller.initialize(CongestionPhaseOpen, time.Unix(100, 0), 10*time.Millisecond, 20*time.Millisecond, 10_000, 20_000, 1000, 1)
 	if window != 12_000 || threshold != 24_000 || lifecycle.maximumRate != 500_000 {
 		t.Fatalf("initialized state = window %d threshold %d max rate %d", window, threshold, lifecycle.maximumRate)
 	}
@@ -822,7 +998,7 @@ func TestCongestionRecoveryUsesStableEventStages(t *testing.T) {
 		Name: "recovery-events",
 		New:  func(CongestionControlContext) CongestionController { return recorder }, Features: CongestionControlFeatureCustomRecovery,
 	})
-	_, _ = controller.initialize(time.Unix(99, 0), 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
+	_, _ = controller.initialize(CongestionPhaseOpen, time.Unix(99, 0), 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
 	controller.checkpointRecovery(time.Unix(100, 0), 20_000, 10_000, 15_000, 1000)
 	if flight := controller.recoveryFlight(time.Unix(100, 0), 15_000, 12_000); flight != 15_000 {
 		t.Fatalf("custom recovery flight = %d, want 15000", flight)
@@ -882,7 +1058,7 @@ func TestCongestionControllerSkipsOptionalEventFamilies(t *testing.T) {
 		New:  func(CongestionControlContext) CongestionController { return recorder },
 	})
 	start := time.Unix(100, 0)
-	controller.initialize(start, 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
+	controller.initialize(CongestionPhaseOpen, start, 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
 	_, _ = controller.onDataSend(1000, 1000, start, 2, 0, 20_000, 0, 20*time.Millisecond, 10_000)
 	_ = controller.onRetransmit(1000, 1000, start, 3, 20_000, 1000, 1000, 20*time.Millisecond, 10_000)
 	controller.checkpointRecovery(start, 20_000, 10_000, 10_000, 1000)

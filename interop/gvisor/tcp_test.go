@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -281,6 +282,152 @@ func TestTCPReadWithBufferInterop(t *testing.T) {
 	}
 }
 
+// TestTCPOldACKTimestampInterop sends native gVisor data with a reordered
+// cumulative ACK and a newer timestamp. The application receives the stream,
+// mipstack echoes the new timestamp, and gVisor completes the half-close.
+func TestTCPOldACKTimestampInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var armed, translated atomic.Bool
+			var expectedEcho, expectedACK atomic.Uint32
+			echoed := make(chan uint32, 1)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if !ok || !armed.Load() || segment.Flags().Contains(header.TCPFlagSyn) {
+						return true
+					}
+					if size != 0 {
+						segment.SetAckNumber(segment.AckNumber() - 1)
+						expectedACK.Store(segment.SequenceNumber() + uint32(size))
+					}
+					if !rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) {
+						if size != 0 {
+							expectedEcho.Store(value + 1000)
+						}
+						return value + 1000, echo
+					}) {
+						return false
+					}
+					translated.Store(true)
+					return true
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if !ok || !translated.Load() || segment.Flags().Contains(header.TCPFlagSyn) {
+						return true
+					}
+					if size == 0 && segment.AckNumber() == expectedACK.Load() {
+						select {
+						case echoed <- segment.ParsedOptions().TSEcr:
+						default:
+						}
+					}
+					return rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) { return value, echo - 1000 })
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer client.Close()
+			defer server.Close()
+			exchangeTCPPayload(t, client, server, []byte("seed"))
+			connection := client.(*mipstack.TCPConn)
+			deadline := time.Now().Add(5 * time.Second)
+			for connection.Info().BytesInFlight != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("seed was not cumulatively acknowledged")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			armed.Store(true)
+			exchangeTCPPayload(t, server, client, []byte("old ACK timestamp"))
+			select {
+			case echo := <-echoed:
+				if want := expectedEcho.Load(); echo != want {
+					t.Fatalf("old ACK timestamp echo = %d, want %d", echo, want)
+				}
+			case <-ctx.Done():
+				t.Fatal("mipstack did not acknowledge native gVisor data")
+			}
+			if err := server.(*gonet.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			var data [1]byte
+			if n, err := client.Read(data[:]); n != 0 || !errors.Is(err, io.EOF) {
+				t.Fatalf("native gVisor half-close = %d, %v, want EOF", n, err)
+			}
+		})
+	}
+}
+
+// TestTCPOldACKSACKRecoveryInterop reorders native gVisor SACK feedback after
+// dropping one mipstack data range. Every byte must reach the gVisor socket
+// through selective recovery, rather than waiting for a cumulative-ACK RTO.
+func TestTCPOldACKSACKRecoveryInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		for _, algorithm := range []string{mipstack.CongestionControlReno, mipstack.CongestionControlCUBIC, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3} {
+			t.Run(family.name+"/"+algorithm, func(t *testing.T) {
+				var armed, dropped atomic.Bool
+				var gap, rewritten atomic.Uint32
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					tcp: mipstack.TCPSocketDefaults{CongestionControl: algorithm},
+					mipstackToGVisor: func(packet []byte) bool {
+						segment, size, ok := tcpSegment(packet)
+						if ok && size != 0 && armed.Load() && dropped.CompareAndSwap(false, true) {
+							gap.Store(segment.SequenceNumber())
+							return false
+						}
+						return true
+					},
+					gvisorToMipstack: func(packet []byte) bool {
+						segment, _, ok := tcpSegment(packet)
+						if !ok || !dropped.Load() || segment.AckNumber() != gap.Load() || !tcpHasSACKOption(segment) {
+							return true
+						}
+						segment.SetAckNumber(segment.AckNumber() - 1)
+						segment.SetChecksum(0)
+						partial := header.PseudoHeaderChecksum(tcp.ProtocolNumber, gvisorAddress(family.gvisorAddress), gvisorAddress(family.mipstackAddress), uint16(len(segment)))
+						segment.SetChecksum(^checksum.Checksum(segment, partial))
+						rewritten.Add(1)
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, false)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				exchangeTCPPayload(t, client, server, []byte("seed"))
+				connection := client.(*mipstack.TCPConn)
+				deadline := time.Now().Add(5 * time.Second)
+				for connection.Info().BytesInFlight != 0 {
+					if time.Now().After(deadline) {
+						t.Fatal("seed was not cumulatively acknowledged")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				before := network.mipstack.Stats()
+				armed.Store(true)
+				exchangeTCPPayload(t, client, server, patternedPayload(128*1024, 71))
+				stats := network.mipstack.Stats()
+				retransmissions := stats.TCPRetransmissions - before.TCPRetransmissions
+				selective := stats.TCPSACKRetransmissions - before.TCPSACKRetransmissions
+				// The link loses only this data range. Total retransmissions must
+				// all be selective; an RTO or retransmitted TLP cannot make a
+				// delayed but otherwise successful socket transfer pass.
+				if !dropped.Load() || rewritten.Load() == 0 || selective == 0 || retransmissions != selective {
+					t.Fatalf("old ACK selective recovery = dropped %t rewritten %d total retransmissions %d SACK retransmissions %d RACK retransmissions %d", dropped.Load(), rewritten.Load(), retransmissions, selective, stats.TCPRACKRetransmissions-before.TCPRACKRetransmissions)
+				}
+			})
+		}
+	}
+}
+
 // TestTCPMissingTimestampInterop verifies that a real gVisor-to-mipstack
 // packet path still completes streams when an in-path device removes the
 // negotiated Timestamp option from non-SYN segments. The hook delivers the
@@ -324,11 +471,144 @@ func TestTCPMissingTimestampInterop(t *testing.T) {
 	}
 }
 
+// TestTCPHighFrequencyTimestampInterop translates gVisor's millisecond TSval
+// to a microsecond-scale clock crossing zero, and translates echoed values
+// back before gVisor receives them. Application reads verify stale-data
+// rejection and recovery through a real gVisor retransmission. Long-idle
+// TS.Recent expiry is covered separately by mipstack's arrival-time tests.
+func TestTCPHighFrequencyTimestampInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{false, true} {
+			mipstackListens := mipstackListens
+			t.Run(fmt.Sprintf("%s/listens-%t", family.name, mipstackListens), func(t *testing.T) {
+				var mu sync.Mutex
+				var initial, last, stale uint32
+				var initialized, rejectData bool
+				var wraps, stalePackets, rewriteFailures int
+				originals := make(map[uint32]uint32)
+				staleSent := make(chan struct{}, 1)
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					gvisorToMipstack: func(packet []byte) bool {
+						tcpHeader, payloadLength, ok := tcpSegment(packet)
+						if !ok || !tcpHeader.ParsedOptions().TS {
+							return true
+						}
+						mu.Lock()
+						defer mu.Unlock()
+						// Keep retries off the wire until the application has checked
+						// rejection. Repeatedly corrupting them would create an
+						// artificial duplicate-ACK/fast-retransmit feedback loop.
+						if rejectData && payloadLength != 0 && stalePackets != 0 {
+							return false
+						}
+						if rejectData && payloadLength != 0 {
+							// Give the stale segment a distinct payload so an erroneous late
+							// delivery cannot look like gVisor's unmodified retransmission.
+							tcpHeader.Payload()[0] ^= 0x80
+						}
+						if !rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) {
+							if !initialized {
+								initial = value
+								initialized = true
+							}
+							mapped := ^uint32(0) - 999 + (value-initial)*1000
+							if int32(mapped-last) > 0 && mapped < last {
+								wraps++
+							}
+							last = mapped
+							if rejectData && payloadLength != 0 {
+								mapped = stale
+								stalePackets++
+								select {
+								case staleSent <- struct{}{}:
+								default:
+								}
+							}
+							originals[mapped] = value
+							return mapped, echo
+						}) {
+							rewriteFailures++
+						}
+						return true
+					},
+					mipstackToGVisor: func(packet []byte) bool {
+						tcpHeader, _, ok := tcpSegment(packet)
+						if !ok || !tcpHeader.ParsedOptions().TS {
+							return true
+						}
+						mu.Lock()
+						defer mu.Unlock()
+						if !rewriteTCPTimestamps(packet, func(value, echo uint32) (uint32, uint32) {
+							if original, ok := originals[echo]; ok {
+								echo = original
+							} else if echo != 0 {
+								rewriteFailures++
+							}
+							return value, echo
+						}) {
+							rewriteFailures++
+						}
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				mipstackConnection, gvisorConnection := client, server
+				if mipstackListens {
+					mipstackConnection, gvisorConnection = server, client
+				}
+				exchangeTCPPayload(t, gvisorConnection, mipstackConnection, []byte("before wrap"))
+				// Advancing gVisor's native millisecond clock by at least two ticks
+				// crosses zero in the translated clock without crossing its half-space.
+				time.Sleep(3 * time.Millisecond)
+				exchangeTCPPayload(t, gvisorConnection, mipstackConnection, []byte("after wrap"))
+				mu.Lock()
+				stale, rejectData = last-1_000_000, true
+				mu.Unlock()
+				payload := []byte("retransmitted after PAWS rejection")
+				_ = gvisorConnection.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if n, err := gvisorConnection.Write(payload); err != nil || n != len(payload) {
+					t.Fatalf("gVisor write = %d, %v", n, err)
+				}
+				select {
+				case <-staleSent:
+				case <-ctx.Done():
+					t.Fatal("gVisor data did not reach the timestamp translator")
+				}
+				_ = mipstackConnection.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+				buffer := make([]byte, len(payload))
+				if n, err := mipstackConnection.Read(buffer); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("stale gVisor data delivered %q, %v", buffer[:n], err)
+				}
+				mu.Lock()
+				rejectData = false
+				mu.Unlock()
+				_ = mipstackConnection.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if _, err := io.ReadFull(mipstackConnection, buffer); err != nil || !bytes.Equal(buffer, payload) {
+					t.Fatalf("gVisor retransmission delivered %q, %v", buffer, err)
+				}
+				exerciseFullDuplexTCP(t, client, server, 32*1024)
+				mu.Lock()
+				defer mu.Unlock()
+				if wraps == 0 || stalePackets == 0 || rewriteFailures != 0 {
+					t.Fatalf("timestamp translation: wraps=%d, stale packets=%d, failures=%d", wraps, stalePackets, rewriteFailures)
+				}
+			})
+		}
+	}
+}
+
 // TestTCPSYNCookieOptionRecoveryInterop verifies that native gVisor
 // connections can complete through a mipstack SYN-cookie when a middlebox
-// removes Timestamp or clears TSecr in the final ACK. The first half-open
-// handshake fills the SYN backlog; the second handshake is validated from the
-// wire and restores only the extensions proved by the received options.
+// removes Timestamp from the SYN or final ACK, or clears the final TSecr.
+// The first half-open handshake fills the SYN backlog; the second is validated
+// from the wire and restores extensions proved by the cookie and final ACK.
 func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 	scenarios := []struct {
 		name             string
@@ -336,10 +616,15 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 		wantTimestamp    bool
 		wantWindowScale  bool
 		wantPeerScale    uint8
+		wantSACK         bool
 		wantReceiveScale bool
+		stripSYN         bool
 	}{
+		{name: "no-timestamp-syn", rewrite: stripTCPTimestamp, stripSYN: true},
 		{name: "missing-timestamp", rewrite: stripTCPTimestamp},
-		{name: "zero-tsecr", rewrite: func(packet []byte) bool { return rewriteTCPTimestampEcho(packet, 0) }, wantTimestamp: true, wantWindowScale: true, wantReceiveScale: true},
+		{name: "zero-tsecr", rewrite: func(packet []byte) bool {
+			return rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 0 })
+		}, wantTimestamp: true, wantWindowScale: true, wantPeerScale: 7, wantSACK: true, wantReceiveScale: true},
 	}
 	for scenarioIndex, scenario := range scenarios {
 		scenarioIndex, scenario := scenarioIndex, scenario
@@ -351,15 +636,26 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					firstClientPort := serverPort + 1
 					secondClientPort := serverPort + 2
 					var (
-						firstACKDropped atomic.Bool
-						rewrittenACK    atomic.Bool
+						firstACKDropped     atomic.Bool
+						rewrittenHandshake  atomic.Bool
+						cookieSYNACKChecked atomic.Bool
+						cookieSYNACKInvalid atomic.Bool
 					)
 					network := newInteropNetworkWithOptions(t, interopNetworkOptions{
 						families: []interopFamily{family},
 						mtu:      1500,
 						gvisorToMipstack: func(packet []byte) bool {
 							tcpHeader, _, ok := tcpSegment(packet)
-							if !ok || tcpHeader.DestinationPort() != serverPort || tcpHeader.Flags().Contains(header.TCPFlagSyn) || !tcpHeader.Flags().Contains(header.TCPFlagAck) {
+							if !ok || tcpHeader.DestinationPort() != serverPort {
+								return true
+							}
+							if tcpHeader.Flags().Contains(header.TCPFlagSyn) {
+								if scenario.stripSYN && tcpHeader.SourcePort() == secondClientPort && scenario.rewrite(packet) {
+									rewrittenHandshake.Store(true)
+								}
+								return true
+							}
+							if !tcpHeader.Flags().Contains(header.TCPFlagAck) {
 								return true
 							}
 							switch tcpHeader.SourcePort() {
@@ -367,12 +663,28 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 								firstACKDropped.Store(true)
 								return false
 							case secondClientPort:
-								if rewrittenACK.CompareAndSwap(false, true) {
+								if !scenario.stripSYN && rewrittenHandshake.CompareAndSwap(false, true) {
 									if !scenario.rewrite(packet) {
-										rewrittenACK.Store(false)
+										rewrittenHandshake.Store(false)
 									}
 								}
 							}
+							return true
+						},
+						mipstackToGVisor: func(packet []byte) bool {
+							tcpHeader, _, ok := tcpSegment(packet)
+							if !ok || tcpHeader.DestinationPort() != secondClientPort || !tcpHeader.Flags().Contains(header.TCPFlagSyn|header.TCPFlagAck) {
+								return true
+							}
+							options := header.ParseSynOptions(tcpHeader.Options(), true)
+							if scenario.stripSYN {
+								if options.TS || options.WS != -1 || options.SACKPermitted {
+									cookieSYNACKInvalid.Store(true)
+								}
+							} else if !options.TS || options.TSVal == 0 {
+								cookieSYNACKInvalid.Store(true)
+							}
+							cookieSYNACKChecked.Store(true)
 							return true
 						},
 					})
@@ -419,11 +731,14 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					}
 					defer second.Close()
 					rewriteDeadline := time.Now().Add(2 * time.Second)
-					for !rewrittenACK.Load() && time.Now().Before(rewriteDeadline) {
+					for !rewrittenHandshake.Load() && time.Now().Before(rewriteDeadline) {
 						time.Sleep(time.Millisecond)
 					}
-					if !rewrittenACK.Load() {
-						t.Fatalf("SYN-cookie final ACK was not rewritten for %s", scenario.name)
+					if !rewrittenHandshake.Load() {
+						t.Fatalf("SYN-cookie handshake was not rewritten for %s", scenario.name)
+					}
+					if !cookieSYNACKChecked.Load() || cookieSYNACKInvalid.Load() {
+						t.Fatalf("invalid cookie SYN-ACK options for %s", scenario.name)
 					}
 					accepted, err := listener.Accept()
 					if err != nil {
@@ -432,7 +747,7 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					defer accepted.Close()
 					connection := accepted.(*mipstack.TCPConn)
 					info := connection.Info()
-					if info.State != mipstack.TCPStateEstablished || info.Timestamps != scenario.wantTimestamp || info.SACK ||
+					if info.State != mipstack.TCPStateEstablished || info.Timestamps != scenario.wantTimestamp || info.SACK != scenario.wantSACK ||
 						info.WindowScaling != scenario.wantWindowScale || info.PeerWindowScale != scenario.wantPeerScale ||
 						(!scenario.wantReceiveScale && info.ReceiveWindowScale != 0) ||
 						(scenario.wantReceiveScale && info.ReceiveWindowScale == 0) {
@@ -442,8 +757,12 @@ func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
 					if listenerInfo.SYNCookiesSent == 0 || listenerInfo.SYNCookiesAccepted == 0 {
 						t.Fatalf("SYN-cookie counters = sent:%d accepted:%d", listenerInfo.SYNCookiesSent, listenerInfo.SYNCookiesAccepted)
 					}
-					exchangeTCPPayload(t, second, accepted, patternedPayload(4096, 43))
-					exchangeTCPPayload(t, accepted, second, patternedPayload(4096, 47))
+					payloadSize := 4096
+					if scenario.stripSYN {
+						payloadSize = 128 * 1024
+					}
+					exchangeTCPPayload(t, second, accepted, patternedPayload(payloadSize, 43))
+					exchangeTCPPayload(t, accepted, second, patternedPayload(payloadSize, 47))
 
 					select {
 					case connection := <-firstResult:
@@ -473,7 +792,7 @@ func TestTCPActiveInvalidTimestampEchoInterop(t *testing.T) {
 					if !ok || !tcpHeader.Flags().Contains(header.TCPFlagSyn) || !tcpHeader.Flags().Contains(header.TCPFlagAck) {
 						return true
 					}
-					if rewriteTCPTimestampEcho(packet, 1<<30) {
+					if rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 1 << 30 }) {
 						rewritten.Store(true)
 					}
 					return true
@@ -521,7 +840,7 @@ func TestTCPPassiveInvalidTimestampEchoInterop(t *testing.T) {
 						!tcpHeader.Flags().Contains(header.TCPFlagAck) {
 						return true
 					}
-					if rewriteTCPTimestampEcho(packet, 1<<30) {
+					if rewriteTCPTimestamps(packet, func(value, _ uint32) (uint32, uint32) { return value, 1 << 30 }) {
 						rewritten.Add(1)
 					}
 					return true
@@ -1475,6 +1794,182 @@ func TestTCPEstablishedResetInterop(t *testing.T) {
 	}
 }
 
+// TestTCPReceiveBoundaryResetInterop observes application-visible termination
+// after a native gVisor abort. The FIN case changes only the reset sequence to
+// model peers that reuse their FIN sequence; the receive-hole case delivers
+// gVisor's reset unchanged after verifying mipstack's real SACK feedback.
+func TestTCPReceiveBoundaryResetInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, scenario := range []string{"consumed-FIN", "receive-SACK"} {
+			scenario := scenario
+			t.Run(family.name+"/"+scenario, func(t *testing.T) {
+				firstData := make(chan uint32, 1)
+				sackEnds := make(chan uint32, 32)
+				resets := make(chan uint32, 1)
+				var firstSequence, finSequence uint32
+				var haveData, haveFIN, resetDelivered bool
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					gvisorToMipstack: func(packet []byte) bool {
+						segment, payloadLength, ok := tcpSegment(packet)
+						if !ok {
+							return true
+						}
+						if segment.Flags()&header.TCPFlagFin != 0 {
+							finSequence = segment.SequenceNumber() + uint32(payloadLength)
+							haveFIN = true
+						}
+						if segment.Flags()&header.TCPFlagRst != 0 {
+							// Suppress later stateless resets: termination must
+							// follow the native abort, not a challenge-ACK round trip.
+							if resetDelivered {
+								return false
+							}
+							resetDelivered = true
+							if scenario == "consumed-FIN" && haveFIN {
+								segment.SetSequenceNumber(finSequence)
+								segment.SetChecksum(0)
+								partial := header.PseudoHeaderChecksum(header.TCPProtocolNumber, gvisorAddress(family.gvisorAddress), gvisorAddress(family.mipstackAddress), uint16(len(segment)))
+								segment.SetChecksum(^checksum.Checksum(segment, partial))
+							}
+							select {
+							case resets <- segment.SequenceNumber():
+							default:
+							}
+						}
+						if scenario == "receive-SACK" && payloadLength != 0 {
+							if !haveData {
+								firstSequence, haveData = segment.SequenceNumber(), true
+								firstData <- firstSequence
+							}
+							// Keep the initial hole open through retransmission so
+							// the abort cannot accidentally become an exact RCV.NXT reset.
+							return segment.SequenceNumber() != firstSequence
+						}
+						return true
+					},
+					mipstackToGVisor: func(packet []byte) bool {
+						segment, _, ok := tcpSegment(packet)
+						if ok {
+							for _, block := range header.ParseTCPOptions(segment.Options()).SACKBlocks {
+								select {
+								case sackEnds <- uint32(block.End):
+								default:
+								}
+							}
+						}
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				const port = 44982
+				var queue waiter.Queue
+				listener, tcpipErr := network.gvisor.NewEndpoint(tcp.ProtocolNumber, family.networkProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatal(tcpipErr.String())
+				}
+				defer listener.Close()
+				if tcpipErr = listener.Bind(gvisorFullAddress(family.gvisorAddress, port)); tcpipErr != nil {
+					t.Fatal(tcpipErr.String())
+				}
+				// A backlog of one triggers gVisor's SYN-cookie path, which
+				// does not retain SACK negotiation for this receive-hole test.
+				if tcpipErr = listener.Listen(16); tcpipErr != nil {
+					t.Fatal(tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				defer queue.EventUnregister(&entry)
+				type dialResult struct {
+					connection net.Conn
+					err        error
+				}
+				dialed := make(chan dialResult, 1)
+				go func() {
+					connection, err := network.mipstack.DialTCP(ctx, family.tcpNetwork, netip.AddrPort{}, netipAddrPort(family.gvisorAddress, port))
+					dialed <- dialResult{connection, err}
+				}()
+				accepted, acceptedQueue, err := acceptGVisorTCP(ctx, listener, notifications)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer accepted.Close()
+				result := <-dialed
+				if result.err != nil {
+					t.Fatal(result.err)
+				}
+				connection := result.connection.(*mipstack.TCPConn)
+				defer connection.Close()
+				_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+				var resetSequence uint32
+				if scenario == "consumed-FIN" {
+					if tcpipErr = accepted.Shutdown(tcpip.ShutdownWrite); tcpipErr != nil {
+						t.Fatal(tcpipErr.String())
+					}
+					if n, err := connection.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+						t.Fatalf("Read after native FIN = %d, %v, want EOF", n, err)
+					}
+					if info := connection.Info(); info.State != mipstack.TCPStateCloseWait {
+						t.Fatalf("state after peer FIN = %s, want CLOSE-WAIT", info.State)
+					}
+				} else {
+					accepted.SocketOptions().SetDelayOption(false)
+					peer := gonet.NewTCPConn(acceptedQueue, accepted)
+					_ = peer.SetWriteDeadline(time.Now().Add(3 * time.Second))
+					payload := patternedPayload(6000, 137)
+					if n, err := peer.Write(payload); n != len(payload) || err != nil {
+						t.Fatalf("native data Write = %d, %v", n, err)
+					}
+					select {
+					case sequence := <-firstData:
+						resetSequence = sequence + uint32(len(payload))
+					case <-ctx.Done():
+						t.Fatal("gVisor emitted no data")
+					}
+					observed := false
+					var observedEnds []uint32
+					for !observed {
+						select {
+						case end := <-sackEnds:
+							observedEnds = append(observedEnds, end)
+							observed = end == resetSequence
+						case <-ctx.Done():
+							t.Fatalf("mipstack did not SACK end %d: observed %v, info %+v", resetSequence, observedEnds, connection.Info())
+						}
+					}
+				}
+				accepted.SocketOptions().SetLinger(tcpip.LingerOption{Enabled: true})
+				accepted.Close()
+				if scenario == "receive-SACK" {
+					if n, err := connection.Read(make([]byte, 1)); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+						t.Fatalf("Read after native SACK-edge abort = %d, %v, want ECONNRESET", n, err)
+					}
+				}
+				deadline := time.Now().Add(time.Second)
+				for {
+					info := connection.Info()
+					if info.State == mipstack.TCPStateClosed && errors.Is(info.LastError, syscall.ECONNRESET) {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("state after peer abort = %+v, want ECONNRESET", info)
+					}
+					time.Sleep(time.Millisecond)
+				}
+				select {
+				case sequence := <-resets:
+					if scenario == "receive-SACK" && sequence != resetSequence {
+						t.Fatalf("native RST sequence = %d, want SACK end %d", sequence, resetSequence)
+					}
+				case <-ctx.Done():
+					t.Fatal("native abort emitted no reset")
+				}
+			})
+		}
+	}
+}
+
 // TestTCPImpairedLinkInterop verifies bidirectional recovery when the bridge
 // drops or reorders the first TCP data packets emitted by both stacks.
 func TestTCPImpairedLinkInterop(t *testing.T) {
@@ -1705,6 +2200,299 @@ func TestTCPKeepAliveInterop(t *testing.T) {
 	}
 }
 
+// TestTCPKeepAliveUserTimeoutInterop verifies that a native gVisor ACK can
+// recover a probe whose user timeout already elapsed, and that a withheld ACK
+// closes the connection only at the next keepalive check, including after an
+// unrelated socket-option update or a keepalive restart.
+func TestTCPKeepAliveUserTimeoutInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{false, true} {
+			mipstackListens := mipstackListens
+			for _, response := range []string{"acknowledged", "silent", "silent option update", "silent keepalive restart", "silent delayed keepalive restart", "silent coalesced keepalive restart"} {
+				response := response
+				silent := response != "acknowledged"
+				direction := "gvisor-listens"
+				if mipstackListens {
+					direction = "mipstack-listens"
+				}
+				t.Run(family.name+"/"+direction+"/"+response, func(t *testing.T) {
+					keepAlive := mipstack.KeepAliveConfig{Idle: 150 * time.Millisecond, Interval: 500 * time.Millisecond, Count: 1}
+					observer := newTCPKeepAliveObserver()
+					ackHeld, release := make(chan struct{}), make(chan struct{})
+					var releaseOnce sync.Once
+					held := false
+					var probe tcpKeepAliveObservation
+					network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+						families: []interopFamily{family}, mtu: 1500,
+						tcp:              mipstack.TCPSocketDefaults{KeepAlive: true, KeepAliveConfig: keepAlive, UserTimeout: 100 * time.Millisecond},
+						mipstackToGVisor: observer.observeOutbound,
+						gvisorToMipstack: func(packet []byte) bool {
+							tcpHeader, size, ok := tcpSegment(packet)
+							if ok && size == 0 && tcpHeader.Flags() == header.TCPFlagAck && !held {
+								select {
+								case probe = <-observer.probes:
+									held = true
+									close(ackHeld)
+									if silent {
+										return false
+									}
+									<-release
+								default:
+								}
+							}
+							return observer.observeInbound(packet)
+						},
+					})
+					t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+					defer listener.Close()
+					defer client.Close()
+					defer server.Close()
+					connection, ok := client.(*mipstack.TCPConn)
+					if !ok {
+						connection = server.(*mipstack.TCPConn)
+					}
+					select {
+					case <-ackHeld:
+					case <-time.After(2 * time.Second):
+						t.Fatalf("gVisor did not acknowledge the keepalive probe; info=%+v", connection.Info())
+					}
+					if response == "silent option update" {
+						if err := connection.SetNoDelay(false); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var reenabledAt time.Time
+					switch response {
+					case "silent keepalive restart", "silent delayed keepalive restart", "silent coalesced keepalive restart":
+						if err := connection.SetKeepAlive(false); err != nil {
+							t.Fatal(err)
+						}
+						if response != "silent coalesced keepalive restart" && connection.Info().KeepAlive {
+							t.Fatal("keepalive was not disabled")
+						}
+						if response == "silent delayed keepalive restart" {
+							time.Sleep(keepAlive.Interval + keepAlive.Interval/4)
+						}
+						reenabledAt = time.Now()
+						if err := connection.SetKeepAlive(true); err != nil {
+							t.Fatal(err)
+						}
+					}
+					delay := keepAlive.Interval / 5
+					if !reenabledAt.IsZero() {
+						delay = keepAlive.Idle / 5
+					}
+					time.Sleep(delay)
+					if info := connection.Info(); info.State != mipstack.TCPStateEstablished || info.LastError != nil {
+						t.Fatalf("connection closed before the next keepalive check: %+v", info)
+					}
+					if silent {
+						_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+						var buffer [1]byte
+						if n, err := connection.Read(buffer[:]); n != 0 || !errors.Is(err, syscall.ETIMEDOUT) {
+							t.Fatalf("silent keepalive Read = %d, %v, want ETIMEDOUT", n, err)
+						}
+						elapsed, minimum := observer.elapsed()-probe.sentAt, keepAlive.Interval*3/4
+						if !reenabledAt.IsZero() {
+							elapsed, minimum = time.Since(reenabledAt), keepAlive.Idle*3/4
+						}
+						if elapsed < minimum {
+							t.Fatalf("silent peer closed after %v, before the keepalive check's %v minimum", elapsed, minimum)
+						}
+						if probes := network.mipstack.Stats().TCPKeepAliveProbes; probes != 1 {
+							t.Fatalf("published keepalive probes = %d, want 1", probes)
+						}
+						return
+					}
+					releaseOnce.Do(func() { close(release) })
+					select {
+					case <-observer.probes:
+					case <-time.After((keepAlive.Idle + keepAlive.Interval) / 2):
+						t.Fatalf("gVisor ACK did not restart the probe series with Idle; info=%+v", connection.Info())
+					}
+					exchangeTCPPayload(t, client, server, patternedPayload(32*1024, 29))
+					exchangeTCPPayload(t, server, client, patternedPayload(32*1024, 71))
+					exerciseFullDuplexTCP(t, client, server, 16*1024)
+				})
+			}
+		}
+	}
+}
+
+// TestTCPCloseWriteBlockedWriterInterop verifies that a half-close interrupts
+// mipstack send-buffer waits without losing the accepted prefix, including
+// when its external packet reader stops. gVisor consumes that prefix and FIN
+// through its TCP socket and then sends a response in the open direction,
+// even while the application's source Reader remains blocked.
+func TestTCPCloseWriteBlockedWriterInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		for _, mipstackListens := range []bool{false, true} {
+			for _, mode := range []string{"Write", "ReadFrom", "Reader", "StoppedStackRead", "ReadFromStoppedStackRead"} {
+				direction := "gvisor-listens"
+				if mipstackListens {
+					direction = "mipstack-listens"
+				}
+				t.Run(family.name+"/"+direction+"/"+mode, func(t *testing.T) {
+					const capacity = 4096
+					paused, resume := make(chan struct{}), make(chan struct{})
+					var pauseOnce, resumeOnce sync.Once
+					network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+						families: []interopFamily{family}, mtu: 1500,
+						tcp: mipstack.TCPSocketDefaults{ReceiveBuffer: capacity, MaximumReceiveBuffer: capacity, SendBuffer: capacity, MaximumSendBuffer: capacity},
+						mipstackToGVisor: func(packet []byte) bool {
+							if mode == "StoppedStackRead" || mode == "ReadFromStoppedStackRead" {
+								_, size, ok := tcpSegment(packet)
+								if ok && size > 0 {
+									pauseOnce.Do(func() { close(paused); <-resume })
+								}
+							}
+							return true
+						},
+					})
+					resumeRead := func() { resumeOnce.Do(func() { close(resume) }) }
+					t.Cleanup(resumeRead)
+					if err := network.gvisor.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpip.TCPReceiveBufferSizeRangeOption{
+						Min: capacity, Default: capacity, Max: capacity,
+					}); err != nil {
+						t.Fatalf("gVisor receive buffer: %s", err.String())
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+					defer listener.Close()
+					defer client.Close()
+					defer server.Close()
+					connection, peer := client, server
+					if mipstackListens {
+						connection, peer = server, client
+					}
+					sender := connection.(*mipstack.TCPConn)
+					payload := patternedPayload(64*1024, 173)
+					type writeResult struct {
+						n   int64
+						err error
+					}
+					written := make(chan writeResult, 1)
+					var pipeWriter *io.PipeWriter
+					if mode == "Reader" {
+						reader, writer := io.Pipe()
+						pipeWriter = writer
+						t.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
+						go func() {
+							n, err := sender.ReadFrom(reader)
+							written <- writeResult{n, err}
+						}()
+						payload = []byte("queued before the blocked source")
+						if n, err := writer.Write(payload); err != nil || n != len(payload) {
+							t.Fatalf("source Write = %d, %v", n, err)
+						}
+					} else {
+						go func() {
+							if mode == "ReadFrom" || mode == "ReadFromStoppedStackRead" {
+								n, err := sender.ReadFrom(bytes.NewReader(payload))
+								written <- writeResult{n, err}
+							} else {
+								n, err := sender.Write(payload)
+								written <- writeResult{int64(n), err}
+							}
+						}()
+					}
+					if mode == "StoppedStackRead" || mode == "ReadFromStoppedStackRead" {
+						select {
+						case <-paused:
+						case <-time.After(2 * time.Second):
+							t.Fatal("external packet reader did not stop")
+						}
+					}
+					ready := false
+					for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+						info := sender.Info()
+						if mode == "Reader" {
+							ready = info.BytesAcknowledged == uint64(len(payload))
+						} else {
+							ready = info.SendBufferSize == capacity &&
+								(info.PeerWindow == 0 || mode == "StoppedStackRead" || mode == "ReadFromStoppedStackRead")
+						}
+						if ready {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+					if !ready {
+						t.Fatalf("sender did not reach blocked state: %+v", sender.Info())
+					}
+					select {
+					case result := <-written:
+						t.Fatalf("writer returned before half-close: %+v", result)
+					default:
+					}
+					closed := make(chan error, 1)
+					go func() { closed <- sender.CloseWrite() }()
+					select {
+					case err := <-closed:
+						if err != nil {
+							t.Fatalf("CloseWrite: %v", err)
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatal("CloseWrite waited for the writer")
+					}
+					var result writeResult
+					expected := payload
+					if pipeWriter == nil {
+						select {
+						case result = <-written:
+						case <-time.After(2 * time.Second):
+							t.Fatal("writer did not observe half-close")
+						}
+						if result.n <= 0 || result.n >= int64(len(payload)) || !errors.Is(result.err, net.ErrClosed) {
+							t.Fatalf("interrupted write = %d, %v", result.n, result.err)
+						}
+						expected = payload[:int(result.n)]
+					}
+					resumeRead()
+					_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+					received, err := io.ReadAll(peer)
+					if err != nil || !bytes.Equal(received, expected) {
+						t.Fatalf("gVisor accepted prefix before EOF = %d bytes, %v; want %d matching bytes", len(received), err, len(expected))
+					}
+					response := patternedPayload(512, 179)
+					if n, err := peer.Write(response); err != nil || n != len(response) {
+						t.Fatalf("gVisor reverse Write = %d, %v", n, err)
+					}
+					if err := peer.(*gonet.TCPConn).CloseWrite(); err != nil {
+						t.Fatal(err)
+					}
+					_ = sender.SetReadDeadline(time.Now().Add(5 * time.Second))
+					received, err = io.ReadAll(sender)
+					if err != nil || !bytes.Equal(received, response) {
+						t.Fatalf("mipstack reverse stream before EOF = %d bytes, %v", len(received), err)
+					}
+					if pipeWriter != nil {
+						select {
+						case result := <-written:
+							t.Fatalf("ReadFrom returned before source EOF: %+v", result)
+						default:
+						}
+						_ = pipeWriter.Close()
+						select {
+						case result = <-written:
+						case <-time.After(2 * time.Second):
+							t.Fatal("ReadFrom did not return after source EOF")
+						}
+						if result.n != int64(len(payload)) || result.err != nil {
+							t.Fatalf("ReadFrom after source EOF = %d, %v", result.n, result.err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestTCPReceiveWindowReopenInterop verifies that gVisor honors a zero window
 // advertised by mipstack and resumes after application reads reopen it.
 func TestTCPReceiveWindowReopenInterop(t *testing.T) {
@@ -1757,6 +2545,218 @@ func TestTCPReceiveWindowReopenInterop(t *testing.T) {
 			}
 			if info := connection.Info(); info.BytesReceived != uint64(len(payload)) || info.ReceiveBufferSize != 0 {
 				t.Fatalf("mipstack post-window TCP info = received:%d buffered:%d", info.BytesReceived, info.ReceiveBufferSize)
+			}
+		})
+	}
+}
+
+// TestTCPPersistProbeResponseInterop verifies that native gVisor zero-window
+// replies keep mipstack's sender alive and that reads reopen the window.
+func TestTCPPersistProbeResponseInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var probes, responses atomic.Uint32
+			var peerACK, probeSequence atomic.Uint32
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					segment, _, ok := tcpSegment(packet)
+					if ok && segment.Flags().Contains(header.TCPFlagAck) && !segment.Flags().Contains(header.TCPFlagSyn) {
+						peerACK.Store(segment.AckNumber())
+						if probes.Load() != 0 && segment.WindowSize() == 0 && segment.AckNumber() == probeSequence.Load()+1 {
+							responses.Add(1)
+						}
+					}
+					return true
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if ok && size == 1 && segment.Flags() == header.TCPFlagAck && segment.SequenceNumber()+1 == peerACK.Load() {
+						probeSequence.Store(segment.SequenceNumber())
+						probes.Add(1)
+					}
+					return true
+				},
+			})
+			limits := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 4096, Max: 4096}
+			if err := network.gvisor.SetTransportProtocolOption(tcp.ProtocolNumber, &limits); err != nil {
+				t.Fatalf("set gVisor receive limits: %s", err.String())
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer server.Close()
+			defer client.Close()
+			deadline := time.Now().Add(15 * time.Second)
+			if err := client.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			payload := patternedPayload(256*1024, 159)
+			written := make(chan error, 1)
+			go func() {
+				n, err := client.Write(payload)
+				if err == nil && n != len(payload) {
+					err = io.ErrShortWrite
+				}
+				written <- err
+			}()
+			probeDeadline := time.Now().Add(10 * time.Second)
+			for (probes.Load() < 2 || responses.Load() < 2) && time.Now().Before(probeDeadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			connection := client.(*mipstack.TCPConn)
+			if info := connection.Info(); probes.Load() < 2 || responses.Load() < 2 || info.PeerWindow != 0 || info.State != mipstack.TCPStateEstablished {
+				t.Fatalf("zero-window replies: probes=%d responses=%d info=%+v", probes.Load(), responses.Load(), info)
+			}
+			received := make([]byte, len(payload))
+			if _, err := io.ReadFull(server, received); err != nil || !bytes.Equal(received, payload) {
+				t.Fatalf("read after reopening gVisor window: %v", err)
+			}
+			if err := <-written; err != nil {
+				t.Fatal(err)
+			}
+			exchangeTCPPayload(t, server, client, patternedPayload(4096, 161))
+		})
+	}
+}
+
+// TestTCPZeroWindowOutstandingResponseInterop verifies native gVisor replies
+// to mipstack's outstanding-data retries and delivery after the window reopens.
+func TestTCPZeroWindowOutstandingResponseInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var widened atomic.Bool
+			var captured atomic.Bool
+			var zeroACK, responses atomic.Uint32
+			retryPacket := make(chan []byte, 1)
+			zeroReplies := make(chan uint32, 16)
+			seen := make(map[uint32]bool)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					segment, _, ok := tcpSegment(packet)
+					if !ok {
+						return true
+					}
+					if segment.Flags() == header.TCPFlagSyn|header.TCPFlagAck {
+						// gVisor does not shrink its advertised window. Enlarge only
+						// the SYN-ACK's grant to reproduce a peer that subsequently
+						// shrinks it; all established ACKs remain native and unchanged.
+						segment.SetWindowSize(65535)
+						segment.SetChecksum(0)
+						partial := header.PseudoHeaderChecksum(tcp.ProtocolNumber, gvisorAddress(family.gvisorAddress), gvisorAddress(family.mipstackAddress), uint16(len(segment)))
+						segment.SetChecksum(^checksum.Checksum(segment, partial))
+						widened.Store(true)
+					} else if segment.Flags() == header.TCPFlagAck && segment.WindowSize() == 0 {
+						zeroACK.Store(segment.AckNumber())
+						responses.Add(1)
+						select {
+						case zeroReplies <- segment.AckNumber():
+						default:
+						}
+					}
+					return true
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					segment, size, ok := tcpSegment(packet)
+					if !ok || size == 0 {
+						return true
+					}
+					sequence := segment.SequenceNumber()
+					repeated := seen[sequence]
+					seen[sequence] = true
+					if repeated && responses.Load() != 0 && sequence == zeroACK.Load() && !captured.Swap(true) {
+						// Hold one natural RTO packet so an earlier queued ACK cannot
+						// be mistaken for the receiver's response to its delivery.
+						retryPacket <- append([]byte(nil), packet...)
+						return false
+					}
+					return true
+				},
+			})
+			limits := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 4096, Max: 4096}
+			if err := network.gvisor.SetTransportProtocolOption(tcp.ProtocolNumber, &limits); err != nil {
+				t.Fatalf("set gVisor receive limits: %s", err.String())
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer server.Close()
+			defer client.Close()
+			deadline := time.Now().Add(8 * time.Second)
+			if err := client.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			connection := client.(*mipstack.TCPConn)
+			payload := patternedPayload(3*connection.Info().MaximumSegmentSize, 163)
+			if n, err := client.Write(payload); err != nil || n != len(payload) {
+				t.Fatalf("mipstack outstanding Write = %d, %v", n, err)
+			}
+			for until := time.Now().Add(time.Second); time.Now().Before(until); {
+				if info := connection.Info(); info.PeerWindow == 0 && info.BytesSent > info.BytesAcknowledged {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if info := connection.Info(); info.PeerWindow != 0 || info.BytesSent <= info.BytesAcknowledged {
+				t.Fatalf("gVisor did not close its window with outstanding data: %+v", info)
+			}
+			// Release one receive segment so native retries can be processed.
+			// The remaining free space stays below gVisor's window-reopen threshold.
+			received := make([]byte, len(payload))
+			prefix := connection.Info().MaximumSegmentSize
+			if n, err := io.ReadFull(server, received[:prefix]); err != nil || n != prefix {
+				t.Fatalf("gVisor partial read = %d/%d bytes, %v", n, prefix, err)
+			}
+			var retry []byte
+			select {
+			case retry = <-retryPacket:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("outstanding zero-window retry was not observed: %+v", connection.Info())
+			}
+			for len(zeroReplies) != 0 {
+				<-zeroReplies
+			}
+			select {
+			case ack := <-zeroReplies:
+				t.Fatalf("unexpected zero-window ACK %d before retry delivery", ack)
+			case <-time.After(100 * time.Millisecond):
+			}
+			segment, _, ok := tcpSegment(retry)
+			if !ok {
+				t.Fatal("invalid held retry packet")
+			}
+			if err := network.deliverToGVisor(retry); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case ack := <-zeroReplies:
+				if ack != segment.SequenceNumber() {
+					t.Fatalf("native zero-window response ACK = %d, want %d", ack, segment.SequenceNumber())
+				}
+			case <-time.After(time.Second):
+				t.Fatal("gVisor did not respond to the delivered RTO packet")
+			}
+			if info := connection.Info(); !widened.Load() || info.PeerWindow != 0 || info.BytesSent <= info.BytesAcknowledged || info.Retransmissions == 0 {
+				t.Fatalf("outstanding zero-window response = widened:%t replies:%d info:%+v", widened.Load(), responses.Load(), info)
+			}
+			if stats := network.mipstack.Stats(); stats.TCPZeroWindowProbes != 0 || stats.TCPTailLossProbes != 0 {
+				t.Fatalf("outstanding flight used a persist or tail-loss probe: %+v", stats)
+			}
+			if n, err := io.ReadFull(server, received[prefix:]); err != nil || !bytes.Equal(received, payload) {
+				t.Fatalf("gVisor read after reopening = %d/%d bytes, %v; %+v", n+prefix, len(payload), err, connection.Info())
+			}
+			exchangeTCPPayload(t, server, client, patternedPayload(4096, 165))
+			if info := connection.Info(); info.LastError != nil || info.State != mipstack.TCPStateEstablished {
+				t.Fatalf("resumed outstanding connection = %+v", info)
 			}
 		})
 	}
@@ -2116,7 +3116,7 @@ func stripTCPTimestamp(packet []byte) bool {
 	}
 	tcpHeader := header.TCP(packet[transportOffset:wireEnd])
 	oldHeaderSize := int(tcpHeader.DataOffset())
-	if oldHeaderSize < header.TCPMinimumSize || oldHeaderSize > len(tcpHeader) || tcpHeader.Flags().Contains(header.TCPFlagSyn) {
+	if oldHeaderSize < header.TCPMinimumSize || oldHeaderSize > len(tcpHeader) {
 		return false
 	}
 	var compact [40]byte
@@ -2186,10 +3186,10 @@ func stripTCPTimestamp(packet []byte) bool {
 	return true
 }
 
-// rewriteTCPTimestampEcho replaces one valid TCP Timestamp echo in a complete
-// IP packet through gVisor's wire headers. It models a middlebox changing
-// TSecr without making the impairment depend on mipstack's codecs.
-func rewriteTCPTimestampEcho(packet []byte, echo uint32) bool {
+// rewriteTCPTimestamps rewrites one valid TCP Timestamp option in a complete
+// IP packet through gVisor's wire headers. It models clock translation or
+// echo corruption without making the impairment depend on mipstack's codecs.
+func rewriteTCPTimestamps(packet []byte, rewrite func(value, echo uint32) (uint32, uint32)) bool {
 	if len(packet) == 0 {
 		return false
 	}
@@ -2247,13 +3247,17 @@ func rewriteTCPTimestampEcho(packet []byte, echo uint32) bool {
 		}
 		length := int(options[1])
 		if kind == header.TCPOptionTS && length == header.TCPOptionTSLength {
+			oldValue := binary.BigEndian.Uint32(options[2:6])
 			oldEcho := binary.BigEndian.Uint32(options[6:10])
 			oldChecksum := tcpHeader.Checksum()
+			value, echo := rewrite(oldValue, oldEcho)
+			binary.BigEndian.PutUint32(options[2:6], value)
 			binary.BigEndian.PutUint32(options[6:10], echo)
 			tcpHeader.SetChecksum(0)
 			partial := header.PseudoHeaderChecksum(header.TCPProtocolNumber, source, target, uint16(wireEnd-transportOffset))
 			tcpHeader.SetChecksum(^checksum.Checksum(tcpHeader, partial))
 			if checksum.Checksum(tcpHeader, partial) != 0xffff {
+				binary.BigEndian.PutUint32(options[2:6], oldValue)
 				binary.BigEndian.PutUint32(options[6:10], oldEcho)
 				tcpHeader.SetChecksum(oldChecksum)
 				return false

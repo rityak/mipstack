@@ -1241,8 +1241,8 @@ func (f *ICMPForwarder) Info() ForwarderInfo {
 }
 
 // admitSegment coalesces one valid initial SYN into the bounded request set.
-// handled remains true for a duplicate or capacity drop, preserving the
-// normal forwarder dispatch contract; admitted reports whether a request
+// handled remains true for a duplicate, policy drop, or capacity drop,
+// preserving the normal dispatch contract; admitted reports whether a request
 // (new or already coalesced) covers the SYN and may replace a passive owner.
 func (f *TCPForwarder) admitSegment(segment tcpSegment, key tcpKey) (handled, admitted bool) {
 	if key.remote.Port() == 0 || segment.flags&TCPFlagSYN == 0 || segment.flags&(TCPFlagACK|TCPFlagRST|TCPFlagFIN) != 0 {
@@ -1257,7 +1257,9 @@ func (f *TCPForwarder) admitSegment(segment tcpSegment, key tcpKey) (handled, ad
 		f.mu.Unlock()
 		return true, true
 	}
-	if len(f.requests) >= f.maxInFlight {
+	// UpdateConfig publishes policy before scanning under f.mu. Rechecking
+	// here prevents an in-flight SYN from adding an invalid request after the scan.
+	if len(f.requests) >= f.maxInFlight || !f.stack.network.Load().acceptsInboundDestination(key.local.Addr()) {
 		f.dropped.Add(1)
 		f.mu.Unlock()
 		f.stack.stats.inboundDroppedPackets.Add(1)

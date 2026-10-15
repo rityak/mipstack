@@ -27,6 +27,24 @@ func mustCodecVector(t testing.TB, wire string) []byte {
 	return decoded
 }
 
+// setPacketECN updates the two ECN bits and repairs the IPv4 header checksum.
+func setPacketECN(packet []byte, ecn byte) {
+	if len(packet) < 1 {
+		return
+	}
+	if packet[0]>>4 == 4 && len(packet) >= 20 {
+		headerSize := int(packet[0]&0x0f) * 4
+		if headerSize < 20 || headerSize > len(packet) {
+			return
+		}
+		packet[1] = packet[1]&^3 | ecn&3
+		packet[10], packet[11] = 0, 0
+		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
+	} else if packet[0]>>4 == 6 && len(packet) >= 40 {
+		packet[1] = packet[1]&0xcf | (ecn&3)<<4
+	}
+}
+
 // testPacketQueueTicketAt constructs host-queue timing evidence without a
 // live packet queue.
 func testPacketQueueTicketAt(epoch, value time.Time) packetQueueTicket {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"testing"
 
@@ -345,9 +346,7 @@ func (n *interopNetwork) copyMipstackToGVisor() {
 			}
 		}
 		if err != nil {
-			if n.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
-				n.reportBridgeError(fmt.Errorf("read mipstack packets: %w", err))
-			}
+			n.reportBridgeError(fmt.Errorf("read mipstack packets: %w", err))
 			return
 		}
 	}
@@ -419,9 +418,7 @@ func (n *interopNetwork) copyGVisorToMipstack() {
 		err := n.deliverToMipstack(packetBytes)
 		view.Release()
 		if err != nil {
-			if n.ctx.Err() == nil {
-				n.reportBridgeError(err)
-			}
+			n.reportBridgeError(err)
 			return
 		}
 	}
@@ -444,18 +441,91 @@ func (n *interopNetwork) deliverToGVisor(packetBytes []byte) error {
 // requires the single-packet Device contract to consume it.
 func (n *interopNetwork) deliverToMipstack(packetBytes []byte) error {
 	count, err := n.mipstack.Write([][]byte{packetBytes}, 0)
-	if count != 1 || err != nil {
-		return fmt.Errorf("write gVisor packet to mipstack: count=%d, error=%v", count, err)
+	if err != nil {
+		return fmt.Errorf("write gVisor packet to mipstack: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("write gVisor packet to mipstack: count=%d, want 1", count)
 	}
 	return nil
 }
 
 // reportBridgeError records the first asynchronous bridge failure without
-// blocking a packet-copy goroutine.
+// blocking a packet-copy goroutine. Cancellation suppresses only closed
+// transports from in-flight delivery racing stack destruction.
 func (n *interopNetwork) reportBridgeError(err error) {
+	if n.ctx.Err() != nil && (errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed)) {
+		return
+	}
 	select {
 	case n.bridgeError <- err:
 	default:
+	}
+}
+
+// TestInteropBridgeErrorCancellation verifies that shutdown suppresses only
+// closed-transport failures and preserves genuine bridge failures.
+func TestInteropBridgeErrorCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	network := &interopNetwork{ctx: ctx, bridgeError: make(chan error, 1)}
+	first, second := errors.New("first bridge failure"), errors.New("second bridge failure")
+	network.reportBridgeError(first)
+	network.reportBridgeError(second)
+	select {
+	case err := <-network.bridgeError:
+		if err != first {
+			t.Fatalf("first bridge failure = %v, want %v", err, first)
+		}
+	default:
+		t.Fatal("live bridge failure was not recorded")
+	}
+	transport, err := mipstack.New(mipstack.Config{LocalAddresses: []netip.Prefix{interopFamilies[0].mipstackPrefix()}, MTU: interopDefaultMTU})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = transport.Close()
+	network.mipstack = transport
+	deliveryError := network.deliverToMipstack(nil)
+	if !errors.Is(deliveryError, os.ErrClosed) {
+		t.Fatalf("closed-stack delivery error = %v, want wrapped os.ErrClosed", deliveryError)
+	}
+	network.reportBridgeError(deliveryError)
+	select {
+	case err := <-network.bridgeError:
+		if err != deliveryError {
+			t.Fatalf("live closed-transport error = %v, want %v", err, deliveryError)
+		}
+	default:
+		t.Fatal("live closed-transport error was suppressed")
+	}
+	network.reportBridgeError(first)
+	cancel()
+	select {
+	case err := <-network.bridgeError:
+		if err != first {
+			t.Fatalf("recorded failure after cancellation = %v, want %v", err, first)
+		}
+	default:
+		t.Fatal("cancellation discarded a recorded bridge failure")
+	}
+	for _, closed := range []error{os.ErrClosed, net.ErrClosed} {
+		network.reportBridgeError(fmt.Errorf("packet delivery: %w", closed))
+		select {
+		case err := <-network.bridgeError:
+			t.Fatalf("shutdown reported a closed transport: %v", err)
+		default:
+		}
+	}
+	network.reportBridgeError(deliveryError)
+	network.reportBridgeError(second)
+	select {
+	case err := <-network.bridgeError:
+		if err != second {
+			t.Fatalf("failure after cancellation = %v, want %v", err, second)
+		}
+	default:
+		t.Fatal("cancellation suppressed a genuine bridge failure")
 	}
 }
 

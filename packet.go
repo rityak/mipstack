@@ -1129,9 +1129,12 @@ type ipPacketOptions struct {
 	flowLabelSet    bool
 }
 
-// withDefaults fills output fields omitted by per-packet control data.
-func (o ipPacketOptions) withDefaults(defaults ipPacketOptions) ipPacketOptions {
-	if !o.hopLimitSet && o.hopLimit == 0 {
+// withDefaults fills output fields omitted by per-packet control data. Linux
+// keeps IP_MULTICAST_TTL independent from the unicast TTL, so a multicast
+// destination keeps the hop limit unset for its independent default; broadcast
+// uses the ordinary socket default.
+func (o ipPacketOptions) withDefaults(defaults ipPacketOptions, multicast bool) ipPacketOptions {
+	if !multicast && !o.hopLimitSet && o.hopLimit == 0 {
 		o.hopLimit, o.hopLimitSet = defaults.hopLimit, defaults.hopLimitSet
 	}
 	if !o.trafficClassSet && o.trafficClass == 0 {
@@ -1914,24 +1917,6 @@ func inspectIPv6Options(header []byte) (bool, byte, int) {
 		offset += length
 	}
 	return true, 0, 0
-}
-
-// setPacketECN updates the two ECN bits and repairs the IPv4 header checksum.
-func setPacketECN(packet []byte, ecn byte) {
-	if len(packet) < 1 {
-		return
-	}
-	if packet[0]>>4 == 4 && len(packet) >= 20 {
-		headerSize := int(packet[0]&0x0f) * 4
-		if headerSize < 20 || headerSize > len(packet) {
-			return
-		}
-		packet[1] = packet[1]&^3 | ecn&3
-		packet[10], packet[11] = 0, 0
-		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
-	} else if packet[0]>>4 == 6 && len(packet) >= 40 {
-		packet[1] = packet[1]&0xcf | (ecn&3)<<4
-	}
 }
 
 // ipHeaderSize validates an address pair and payload length and returns the
