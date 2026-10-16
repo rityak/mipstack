@@ -721,7 +721,7 @@ func TestCongestionLossBatchPreservesSnapshots(t *testing.T) {
 				}
 				observedAt := now.Add(time.Millisecond)
 				if path.timeout {
-					state.prepareRetransmission(0, true, duringACK, true, false, observedAt)
+					state.prepareRetransmission(0, true, duringACK, true, false, 0, observedAt)
 				} else {
 					state.outstanding[4].markLost(true)
 					state.recordProvenLosses(duringACK, true, observedAt)
@@ -776,7 +776,7 @@ func TestCongestionLossBatchPreservesSnapshots(t *testing.T) {
 				}
 				state.controller.delivery.sampledLost = 900
 				if path.timeout {
-					state.prepareRetransmission(0, true, duringACK, true, false, observedAt)
+					state.prepareRetransmission(0, true, duringACK, true, false, 0, observedAt)
 				} else {
 					state.recordProvenLosses(duringACK, true, observedAt)
 				}

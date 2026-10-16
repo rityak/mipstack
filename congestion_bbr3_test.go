@@ -1537,7 +1537,7 @@ func TestTCPBBR3UndoRestoresModel(t *testing.T) {
 					t.Fatal("marking loss notified the controller before recovery entry")
 				}
 			}
-			state.prepareRetransmission(0, timeout, !timeout, true, false, now)
+			state.prepareRetransmission(0, timeout, !timeout, true, false, 0, now)
 			if recorder.missing || recorder.checkpoints != 1 || len(recorder.losses) != 4 {
 				t.Fatalf("loss event ordering = missing %t checkpoints %d losses %v", recorder.missing, recorder.checkpoints, recorder.losses)
 			}

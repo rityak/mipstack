@@ -380,6 +380,14 @@ func (b *bbrCongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 		if event.State.CongestionWindow < b.priorWindow {
 			event.State.CongestionWindow = b.priorWindow
 		}
+		// Linux BBR caps ProbeRTT at four segments. Preserve that bound when
+		// undo restores priorWindow without a following rate-sample update.
+		if b.mode == bbrProbeRTT {
+			minimum := uint32(bbrMinimumCongestionMSS * event.State.MaximumSegmentSize)
+			if event.State.CongestionWindow > minimum {
+				event.State.CongestionWindow = minimum
+			}
+		}
 	}
 }
 

@@ -353,6 +353,20 @@ func (b *bbr3CongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 		if event.State.CongestionWindow < b.priorWindow {
 			event.State.CongestionWindow = b.priorWindow
 		}
+		// BBR draft section 5.6.4.5 bounds ProbeRTT independently of undo.
+		// A late DSACK need not produce a rate sample to reapply these bounds.
+		if b.mode == bbrProbeRTT {
+			mss := event.State.MaximumSegmentSize
+			window := b.boundWindow(uint64(event.State.CongestionWindow), mss)
+			probeTarget := b.modelWindowForBandwidth(b.effectiveBandwidth(), bbr3ProbeRTTWindowGain, mss)
+			if minimum := uint64(bbrMinimumCongestionMSS * mss); probeTarget < minimum {
+				probeTarget = minimum
+			}
+			if window > probeTarget {
+				window = probeTarget
+			}
+			event.State.CongestionWindow = clampCongestionUint32(window)
+		}
 		b.setPacingRate(event.State.CongestionWindow, event.State.SmoothedRTT)
 	}
 }

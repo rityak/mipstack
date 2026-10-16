@@ -5590,7 +5590,7 @@ func TestTCPCWRRecoveryPointTracksACKProgress(t *testing.T) {
 				point := state.ecnRecoveryPoint
 				if recovery != "ordinary" {
 					state.rtoAttempts = 1
-					if index := state.prepareRetransmission(0, true, false, true, false, now.Add(2*time.Millisecond)); index != 0 || state.undo == nil || state.undo.transport == nil || state.undo.transport.phase != CongestionPhaseCWR {
+					if index := state.prepareRetransmission(0, true, false, true, false, 0, now.Add(2*time.Millisecond)); index != 0 || state.undo == nil || state.undo.transport == nil || state.undo.transport.phase != CongestionPhaseCWR {
 						t.Fatal("nested timeout did not retain the active CWR episode")
 					}
 					if recovery == "undo-before-point" {
@@ -5711,7 +5711,7 @@ func TestTCPRecoveryEventsUseLossObservationTime(t *testing.T) {
 				observation = time.Time{}
 			}
 			before := time.Now()
-			if index := state.prepareRetransmission(0, timeout, false, true, false, observation); index != 0 {
+			if index := state.prepareRetransmission(0, timeout, false, true, false, 0, observation); index != 0 {
 				t.Fatalf("selected retransmission = %d, want 0", index)
 			}
 			after := time.Now()
@@ -10702,7 +10702,7 @@ func TestTCPZeroWindowRetransmissionDisablesLossEvidence(t *testing.T) {
 		outstanding: []sentTCPSegment{{sequence: 100, end: 1100,
 			state: sentTCPSegmentTransmitted, congestionPacketState: controller.transmissionState()}},
 	}
-	if index := state.prepareRetransmission(0, true, false, false, false, now); index != 0 {
+	if index := state.prepareRetransmission(0, true, false, false, false, 0, now); index != 0 {
 		t.Fatalf("zero-window retransmission index = %d, want 0", index)
 	}
 	if recorder.lossEvidence {
@@ -10996,7 +10996,7 @@ func TestTCPZeroWindowRetransmissionCancelsPLPMTUProbe(t *testing.T) {
 			state.sendNext = 100 + uint32(payloadSize)
 			state.outstanding = []sentTCPSegment{{sequence: 100, end: state.sendNext, flags: TCPFlagACK, state: sentTCPSegmentTransmitted | sentTCPSegmentMTUProbe}}
 			state.pathMTUState = &tcpEstablishedPathMTUState{discovery: tcpPLPMTU{active: true, searching: true, probeMTU: 2000, probeStart: 100, probeEnd: state.sendNext, searchLow: 1500, searchHigh: 3000}}
-			index := state.prepareRetransmission(0, true, false, false, false, time.Now())
+			index := state.prepareRetransmission(0, true, false, false, false, 0, time.Now())
 			if index != 0 || len(state.outstanding) != 2 {
 				t.Fatalf("retransmission index/segments = %d/%d, want 0/2", index, len(state.outstanding))
 			}
@@ -12975,7 +12975,7 @@ func TestTCPRTOTransmissionLoss(t *testing.T) {
 						state.sackedRanges, state.sackedBytes = 1, mss
 					}
 					state.controller.initialize(CongestionPhaseRecovery, epoch, test.rtt, test.rtt, state.congestionWindow, state.slowStartThreshold, mss, 1)
-					if index := state.prepareRetransmission(0, true, false, true, false, now); index != 0 {
+					if index := state.prepareRetransmission(0, true, false, true, false, 0, now); index != 0 {
 						t.Fatalf("RTO target = %d", index)
 					}
 					segment := &state.outstanding[1]
@@ -12992,7 +12992,7 @@ func TestTCPRTOTransmissionLoss(t *testing.T) {
 					if losses != mss+test.newLosses {
 						t.Fatalf("lost bytes = %d, want %d", losses, mss+test.newLosses)
 					}
-					state.prepareRetransmission(0, true, false, true, false, now)
+					state.prepareRetransmission(0, true, false, true, false, 0, now)
 					if state.controller.state.LostBytes != losses {
 						t.Fatal("repeated timeout reported the same generations twice")
 					}
@@ -13001,7 +13001,7 @@ func TestTCPRTOTransmissionLoss(t *testing.T) {
 					if flight := state.rtoTransmissionFlight(); flight != test.flight+mss {
 						t.Fatalf("published flight = %d, want %d", flight, test.flight+mss)
 					}
-					state.prepareRetransmission(0, true, false, true, false, now.Add(time.Second))
+					state.prepareRetransmission(0, true, false, true, false, 0, now.Add(time.Second))
 					wantLosses := losses + mss
 					if !test.lost && !test.pending && !test.flags.has(sentTCPSegmentSACKed) {
 						wantLosses += mss
@@ -13054,7 +13054,7 @@ func TestTCPRTOAfterSACKReneging(t *testing.T) {
 			state.controller.initialize(CongestionPhaseOpen, epoch, 100*time.Millisecond, 100*time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
 			recorder := &bbr3RenegingRecorder{algorithm: state.controller.algorithm.(*bbr3CongestionControl)}
 			state.controller.algorithm = recorder
-			if index := state.prepareRetransmission(-1, true, false, true, false, now); index != 0 {
+			if index := state.prepareRetransmission(-1, true, false, true, false, 0, now); index != 0 {
 				t.Fatalf("reneging RTO target = %d, want 0", index)
 			}
 			wantFlight, wantLosses := uint32(0), uint64(2*mss)
@@ -13067,7 +13067,7 @@ func TestTCPRTOAfterSACKReneging(t *testing.T) {
 			if flight := state.rtoTransmissionFlight(); flight != wantFlight || state.controller.state.LostBytes != wantLosses || recorder.validLoss.Load() != 0 || recorder.staleLoss.Load() != wantLosses/mss {
 				t.Fatalf("reneging flight/loss/evidence = %d/%d/%d/%d, want %d/%d/0/%d", flight, state.controller.state.LostBytes, recorder.validLoss.Load(), recorder.staleLoss.Load(), wantFlight, wantLosses, wantLosses/mss)
 			}
-			state.prepareRetransmission(0, true, false, false, false, now)
+			state.prepareRetransmission(0, true, false, false, false, 0, now)
 			if state.controller.state.LostBytes != wantLosses {
 				t.Fatal("repeated preparation reported a generation twice")
 			}
@@ -13082,7 +13082,7 @@ func TestTCPRTOAfterSACKReneging(t *testing.T) {
 			}
 			// The recovery flag outlives this timeout. A later ordinary RTO
 			// must still retain a recent replacement without fresh reneging.
-			state.prepareRetransmission(0, true, false, true, false, now.Add(time.Millisecond))
+			state.prepareRetransmission(0, true, false, true, false, 0, now.Add(time.Millisecond))
 			if flight := state.rtoTransmissionFlight(); flight != mss {
 				t.Fatalf("ordinary RTO during reneging recovery flight = %d, want %d", flight, mss)
 			}
@@ -13149,7 +13149,7 @@ func TestTCPRTORetainsRecentReplacementAfterSACK(t *testing.T) {
 		sackedRanges: 3, sackedBytes: 3 * mss,
 	}
 	state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
-	state.prepareRetransmission(0, true, false, true, false, now)
+	state.prepareRetransmission(0, true, false, true, false, 0, now)
 	if state.outstanding[1].state.has(sentTCPSegmentSACKRetried) || state.rtoTransmissionFlight() != 2*mss {
 		t.Fatal("RTO did not retain both recent speculative copies")
 	}
@@ -13176,7 +13176,7 @@ func TestTCPRTOFlightUndoAndControllerChange(t *testing.T) {
 		},
 	}
 	state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
-	state.prepareRetransmission(0, true, false, true, false, now)
+	state.prepareRetransmission(0, true, false, true, false, 0, now)
 	state.outstanding[0].advanceTransmissionGeneration()
 	state.outstanding[0].state |= sentTCPSegmentSACKRetried
 	losses := state.controller.state.LostBytes
@@ -13186,7 +13186,7 @@ func TestTCPRTOFlightUndoAndControllerChange(t *testing.T) {
 	if flight := state.rtoTransmissionFlight(); flight != 3*mss || state.controller.state.LostBytes != losses || state.outstanding[0].state.has(sentTCPSegmentTransmissionLost) {
 		t.Fatalf("undo flight = %d, lost bytes %d/%d", flight, state.controller.state.LostBytes, losses)
 	}
-	state.prepareRetransmission(0, true, false, true, false, now.Add(time.Second))
+	state.prepareRetransmission(0, true, false, true, false, 0, now.Add(time.Second))
 	state.outstanding[0].advanceTransmissionGeneration()
 	if flight := state.rtoTransmissionFlight(); flight != mss {
 		t.Fatalf("RTO replacement flight = %d", flight)
@@ -13295,7 +13295,7 @@ func TestTCPEifelPartialACKDoesNotReportSpuriousLoss(t *testing.T) {
 				segment.congestionPacketState = state.controller.transmissionState()
 			}
 			retransmittedAt := start.Add(1200 * time.Millisecond)
-			if index := state.prepareRetransmission(0, true, false, true, false, retransmittedAt); index != 0 {
+			if index := state.prepareRetransmission(0, true, false, true, false, 0, retransmittedAt); index != 0 {
 				t.Fatalf("RTO selected range %d, want 0", index)
 			}
 			beforeLost := state.controller.state.LostBytes
@@ -13335,14 +13335,6 @@ func TestTCPEifelPartialACKDoesNotReportSpuriousLoss(t *testing.T) {
 }
 
 func TestTCPPRRDeliveryAndSendCount(t *testing.T) {
-	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, state: sentTCPSegmentSACKed},
-		{sequence: 200, end: 300},
-		{sequence: 300, end: 400},
-	}
-	if delivered := tcpNewlyAcknowledgedBytes(outstanding, 350); delivered != 150 {
-		t.Fatalf("new cumulative delivery = %d, want 150", delivered)
-	}
 	if window := prrCongestionWindow(800, 500, 1000, 100, 0, 100, true, false, 100); window != 850 {
 		t.Fatalf("PRR proportional window = %d, want 850", window)
 	}
@@ -13351,6 +13343,12 @@ func TestTCPPRRDeliveryAndSendCount(t *testing.T) {
 	}
 	if window := prrCongestionWindow(300, 500, 1000, 100, 0, 100, true, true, 100); window != 400 {
 		t.Fatalf("PRR packet-conservation window with new loss = %d, want 400", window)
+	}
+	if window := prrCongestionWindow(500, 500, 1000, 100, 0, 100, false, true, 100); window != 600 {
+		t.Fatalf("PRR forced entry window = %d, want 600", window)
+	}
+	if window := prrCongestionWindow(500, 500, 1000, 100, 100, 100, false, true, 100); window != 500 {
+		t.Fatalf("PRR repeated forced entry window = %d, want 500", window)
 	}
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		controller := newTCPCongestionController(algorithm)
@@ -13362,6 +13360,365 @@ func TestTCPPRRDeliveryAndSendCount(t *testing.T) {
 		if window := controller.applyPRRWindow(time.Unix(100, 0), 6000, 4100, 0); window != want {
 			t.Fatalf("%s PRR window = %d, want %d", algorithm, window, want)
 		}
+	}
+}
+
+func TestTCPPRRCumulativeDelivery(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, test := range []struct {
+			name      string
+			ack       uint32
+			sacked    []int
+			withSACK  bool
+			delivered uint64
+		}{
+			{name: "complete ranges", ack: 300, delivered: 200},
+			{name: "partial range", ack: 350, delivered: 250},
+			{name: "earlier SACK", ack: 350, sacked: []int{0}, delivered: 150},
+			{name: "partial earlier SACK", ack: 350, sacked: []int{2}, delivered: 200},
+			{name: "only earlier SACK", ack: 300, sacked: []int{0, 1}},
+			{name: "cumulative and SACK", ack: 350, sacked: []int{0}, withSACK: true, delivered: 250},
+		} {
+			t.Run(algorithm+"/"+test.name, func(t *testing.T) {
+				now := time.Unix(100, 0)
+				epoch := now.Add(-time.Second)
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: epoch}
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(algorithm),
+					peerMSS: 100, peerSACK: true, peerWindow: 65535,
+					sendUnacknowledged: 100, sendNext: 500, fastRecovery: true, recoveryPoint: 500,
+					congestionWindow: 400, slowStartThreshold: 400, prrPriorFlight: 400,
+					rtt: newRTTEstimator(time.Second), outstanding: make([]sentTCPSegment, 4),
+				}
+				for index := range state.outstanding {
+					state.outstanding[index] = sentTCPSegment{
+						sequence: uint32(100 + 100*index), end: uint32(200 + 100*index),
+						state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Millisecond)),
+					}
+				}
+				for _, index := range test.sacked {
+					state.outstanding[index].state |= sentTCPSegmentSACKed
+					state.sackedRanges++
+					state.sackedBytes += 100
+				}
+				state.controller.initialize(CongestionPhaseRecovery, epoch, time.Millisecond, time.Millisecond, 400, 400, 100, 1)
+				state.rebaseOutstanding()
+				segment := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535}
+				if test.withSACK {
+					var options [10]byte
+					options[0], options[1] = TCPHeaderOptionSACK, 10
+					binary.BigEndian.PutUint32(options[2:6], 400)
+					binary.BigEndian.PutUint32(options[6:10], 500)
+					segment.setOptions(options[:])
+				}
+				state.processAcknowledgment(&segment, now, 0)
+				if !state.fastRecovery || state.prrDelivered != test.delivered || state.sendUnacknowledged != test.ack || state.outstanding[0].sequence != test.ack {
+					t.Fatalf("cumulative ACK: recovery:%t delivered:%d SND.UNA:%d first:%d, want true/%d/%d/%d", state.fastRecovery, state.prrDelivered, state.sendUnacknowledged, state.outstanding[0].sequence, test.delivered, test.ack, test.ack)
+				}
+				state.processAcknowledgment(&segment, now.Add(time.Millisecond), 0)
+				if state.prrDelivered != test.delivered {
+					t.Fatalf("repeated ACK credited delivery twice: %d, want %d", state.prrDelivered, test.delivered)
+				}
+			})
+		}
+	}
+}
+
+func TestTCPPRREntryRetransmissionReadiness(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC} {
+		t.Run(algorithm+"/no delivery", func(t *testing.T) {
+			const mss = 1000
+			now := time.Unix(100, 0)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: now.Add(-time.Second)}
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(algorithm),
+				peerSACK: true, peerMSS: mss, peerWindow: 65535,
+				sendUnacknowledged: 100, sendNext: 3100,
+				congestionWindow: 6000, slowStartThreshold: 20000,
+				sackedRanges: 1, sackedBytes: mss, rtt: newRTTEstimator(time.Second),
+				outstanding: []sentTCPSegment{
+					{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost},
+					{sequence: 1100, end: 2100, state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost},
+					{sequence: 2100, end: 3100, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+				},
+			}
+			state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+			if index := state.prepareRetransmission(0, false, false, true, false, 0, now); index != 0 {
+				t.Fatalf("timer recovery target = %d, want 0", index)
+			}
+			if !state.fastRecovery || state.prrPriorFlight != 2*mss || state.prrDelivered != 0 || state.prrOut != 0 || state.congestionWindow != 0 {
+				t.Fatalf("timer entry = active:%t flight:%d delivered:%d sent:%d window:%d", state.fastRecovery, state.prrPriorFlight, state.prrDelivered, state.prrOut, state.congestionWindow)
+			}
+			if !state.recoveryOutputReady() || sackRecoveryCanSend(true, 0, mss, state.congestionWindow) {
+				t.Fatal("timer entry must authorize only its retransmission, not new data")
+			}
+			state.outstanding[0].advanceTransmissionGeneration()
+			state.outstanding[0].state.set(sentTCPSegmentRACKLost, false)
+			state.outstanding[0].state.set(sentTCPSegmentSACKRetried, true)
+			state.prrOut += mss
+			if firstUnretriedLoss(state.outstanding, mss) != 1 || state.recoveryOutputReady() || state.canRetransmitRecovery(sackRecoveryPipe(state.outstanding, mss), mss) {
+				t.Fatal("first publication authorized another loss without delivery credit")
+			}
+		})
+	}
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		t.Run(algorithm, func(t *testing.T) {
+			state := tcpEstablishedState{
+				controller: newTCPCongestionController(algorithm), peerSACK: true,
+				peerMSS: 1000, peerWindow: 65535, fastRecovery: true,
+				outstanding: []sentTCPSegment{{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost | sentTCPSegmentTransmissionLost}},
+			}
+			want := algorithm == CongestionControlReno || algorithm == CongestionControlCUBIC
+			if ready := state.recoveryOutputReady(); ready != want {
+				t.Fatalf("entry output readiness = %t, want %t", ready, want)
+			}
+			if sackRecoveryCanSend(true, 0, 1000, 0) {
+				t.Fatal("ordinary new data acquired the entry-retransmission exemption")
+			}
+			state.prrOut = 1000
+			if state.recoveryOutputReady() || state.canRetransmitRecovery(0, 1000) {
+				t.Fatal("successful entry retransmission did not consume its exemption")
+			}
+		})
+	}
+}
+
+func TestTCPLateDSACKUndoPreservesProbeRTTWindow(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlBBR, CongestionControlBBR3} {
+		for _, test := range []struct {
+			name        string
+			ack         uint32
+			outstanding bool
+		}{
+			{name: "empty flight", ack: 5000},
+			{name: "old ACK", ack: 4000},
+			{name: "active flight", ack: 5000, outstanding: true},
+			{name: "new delivery", ack: 6000, outstanding: true},
+		} {
+			t.Run(algorithm+"/"+test.name, func(t *testing.T) {
+				const mss = 1000
+				now := time.Unix(100, 0)
+				epoch := now.Add(-time.Second)
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: epoch}
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(algorithm),
+					peerMSS: mss, peerSACK: true, peerWindow: 65535,
+					sendUnacknowledged: 5000, sendNext: 5000, bytesAcknowledged: 5000,
+					congestionWindow: 4000, slowStartThreshold: 20000,
+					rtt: newRTTEstimator(time.Second), undo: new(tcpRecoveryUndo),
+				}
+				state.controller.initialize(CongestionPhaseOpen, epoch, 10*time.Millisecond, 20*time.Millisecond, 20000, 20000, mss, 1)
+				state.undo.begin(false, 4000, 20000, 20000, 10000, &state.controller, state.rtt, now.Add(-time.Second))
+				state.undo.recordRetransmission(1000, 2000, 10, false)
+				state.recordRetransmission(1000, 2000)
+				if test.outstanding {
+					state.sendNext = 6000
+					state.outstanding = []sentTCPSegment{{sequence: 5000, end: 6000, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Millisecond))}}
+					state.rebaseOutstanding()
+				}
+				cap := uint32(4000)
+				switch model := state.controller.algorithm.(type) {
+				case *bbrCongestionControl:
+					model.mode, model.priorWindow = bbrProbeRTT, 20000
+					model.minimumRTT, model.bandwidth = 10*time.Millisecond, 1000000
+					model.minimumRTTStamp = now
+				case *bbr3CongestionControl:
+					model.mode, model.priorWindow = bbrProbeRTT, 20000
+					model.minimumRTT, model.bandwidthHigh[1] = 10*time.Millisecond, 1000000
+					model.minimumRTTStamp, model.probeRTTStamp = now, now
+					cap = 5000 // max(4*MSS, 0.5 * 1 MB/s * 10 ms).
+				}
+				var options [10]byte
+				options[0], options[1] = TCPHeaderOptionSACK, 10
+				binary.BigEndian.PutUint32(options[2:6], 1000)
+				binary.BigEndian.PutUint32(options[6:10], 2000)
+				segment := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535}
+				segment.setOptions(options[:])
+				state.processAcknowledgment(&segment, now, 0)
+				if state.undo.spuriousUndos != 1 || state.congestionWindow > cap {
+					t.Fatalf("DSACK undo = count:%d window:%d, cap:%d", state.undo.spuriousUndos, state.congestionWindow, cap)
+				}
+				switch model := state.controller.algorithm.(type) {
+				case *bbrCongestionControl:
+					if model.mode != bbrProbeRTT || model.priorWindow != 20000 {
+						t.Fatalf("undo changed ProbeRTT mode/prior window: %v/%d", model.mode, model.priorWindow)
+					}
+					model.probeDone, model.probeRound = now, true
+					window := model.updateMinimumRTT(state.congestionWindow, &tcpDeliveryRateSample{ackTime: now.Add(time.Second)}, mss)
+					if model.mode == bbrProbeRTT || window < 20000 {
+						t.Fatalf("ProbeRTT exit lost the saved window: %v/%d", model.mode, window)
+					}
+				case *bbr3CongestionControl:
+					if model.mode != bbrProbeRTT || model.priorWindow != 20000 {
+						t.Fatalf("undo changed ProbeRTT mode/prior window: %v/%d", model.mode, model.priorWindow)
+					}
+					model.probeDone, model.probeRound = now, true
+					window := model.updateMinimumRTT(state.congestionWindow, &tcpDeliveryRateSample{ackTime: now.Add(time.Second)}, mss)
+					if model.mode == bbrProbeRTT || window < 20000 {
+						t.Fatalf("ProbeRTT exit lost the saved window: %v/%d", model.mode, window)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestTCPPRRRecoveryEntryCredit(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC} {
+		for _, test := range []struct {
+			name            string
+			ack             uint32
+			priorSACK       bool
+			limitedTransmit bool
+			lostReplacement bool
+			wantDelivery    uint64
+			wantPriorFlight uint32
+		}{
+			{name: "SACK", wantDelivery: 6000, wantPriorFlight: 10000},
+			{name: "cumulative and SACK", ack: 1000, wantDelivery: 7000, wantPriorFlight: 10000},
+			{name: "earlier SACK", priorSACK: true, wantDelivery: 4000, wantPriorFlight: 8000},
+			{name: "Limited Transmit", limitedTransmit: true, wantDelivery: 6000, wantPriorFlight: 10000},
+			{name: "lost replacement", lostReplacement: true, wantDelivery: 6000, wantPriorFlight: 10000},
+		} {
+			t.Run(algorithm+"/"+test.name, func(t *testing.T) {
+				const mss = 1000
+				now := time.Unix(100, 0)
+				epoch := now.Add(-time.Second)
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: epoch}
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(algorithm),
+					peerMSS: mss, peerSACK: true, peerWindow: 65535,
+					sendNext: 10000, congestionWindow: 10000, slowStartThreshold: 20000,
+					rtt: newRTTEstimator(time.Second), outstanding: make([]sentTCPSegment, 10),
+				}
+				for i := range state.outstanding {
+					state.outstanding[i] = sentTCPSegment{
+						sequence: uint32(i * mss), end: uint32((i + 1) * mss),
+						state:     sentTCPSegmentTransmitted,
+						hostQueue: testPacketQueueTicketAt(epoch, now.Add(-500*time.Millisecond)),
+					}
+				}
+				if test.priorSACK {
+					state.outstanding[6].state |= sentTCPSegmentSACKed
+					state.outstanding[7].state |= sentTCPSegmentSACKed
+					state.sackedRanges, state.sackedBytes = 2, 2000
+				}
+				if test.limitedTransmit {
+					state.outstanding[8].state |= sentTCPSegmentLimited
+					state.outstanding[9].state |= sentTCPSegmentLimited
+					state.limitedTransmitActive = true
+				}
+				phase := CongestionPhaseOpen
+				if test.lostReplacement {
+					state.fastRecovery, state.recoveryPoint = true, state.sendNext
+					state.prrPriorFlight, state.prrDelivered, state.prrOut = 12000, 2000, 1000
+					state.outstanding[0].advanceTransmissionGeneration()
+					state.outstanding[0].state |= sentTCPSegmentSACKRetried
+					phase = CongestionPhaseRecovery
+				}
+				state.controller.initialize(phase, epoch, 10*time.Millisecond, 20*time.Millisecond, 10000, 20000, mss, 1)
+				state.rebaseOutstanding()
+				var options [10]byte
+				options[0], options[1] = TCPHeaderOptionSACK, 10
+				binary.BigEndian.PutUint32(options[2:6], 2000)
+				binary.BigEndian.PutUint32(options[6:10], 8000)
+				segment := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535}
+				segment.setOptions(options[:])
+				state.processAcknowledgment(&segment, now, 0)
+				if !state.fastRecovery || state.prrDelivered != test.wantDelivery || state.prrOut != 0 || state.prrPriorFlight != test.wantPriorFlight {
+					t.Fatalf("entry PRR = active:%t delivered:%d sent:%d flight:%d, want true/%d/0/%d", state.fastRecovery, state.prrDelivered, state.prrOut, state.prrPriorFlight, test.wantDelivery, test.wantPriorFlight)
+				}
+				window := state.congestionWindow
+				state.processAcknowledgment(&segment, now.Add(time.Millisecond), 0)
+				if state.prrDelivered != test.wantDelivery || state.prrOut != 0 || state.prrPriorFlight != test.wantPriorFlight || state.congestionWindow != window {
+					t.Fatal("repeated SACK changed the PRR episode or granted more output")
+				}
+				segment = tcpSegment{acknowledgement: state.sendNext, flags: TCPFlagACK, window: 65535}
+				state.processAcknowledgment(&segment, now.Add(2*time.Millisecond), 0)
+				if state.fastRecovery || state.prrPriorFlight != 0 || state.prrDelivered != 0 || state.prrOut != 0 {
+					t.Fatal("the concluding ACK retained or replenished PRR credit")
+				}
+			})
+		}
+	}
+}
+
+func TestTCPPRRFirstRetransmissionPreservesCredit(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	if err := connection.SetCongestionControl(CongestionControlCUBIC); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x5b}, 10*before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	segments := make([][]byte, 0, 10)
+	for len(segments) < 10 {
+		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !ok {
+			t.Fatalf("initial flight contains %d/10 packets", len(segments))
+		}
+		segments = append(segments, consumeTestPacket(&stack.outbound, entry))
+	}
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, ok := stack.outbound.tryReserve()
+		if !ok {
+			break
+		}
+		held = append(held, slot)
+	}
+	for _, wire := range segments[2:8] {
+		if err := link.handleOutboundPacket(wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	var blocked TCPConnInfo
+	for {
+		blocked = connection.Info()
+		if blocked.InboundQueueBytes == 0 && blocked.FastRecovery {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("SACK processing did not enter recovery: %+v", blocked)
+		}
+		runtime.Gosched()
+	}
+	if blocked.Retransmissions != before.Retransmissions {
+		t.Fatal("blocked recovery published a retransmission")
+	}
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	for i := 0; i < 2; i++ {
+		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !ok {
+			t.Fatalf("retransmission %d lost the remaining entry-ACK credit", i+1)
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, ok := parseIPPacket(wire, false)
+		original, _ := parseIPPacket(segments[i], false)
+		if !ok || packet.protocol != ProtocolTCP || !bytes.Equal(packet.payload[4:8], original.payload[4:8]) {
+			t.Fatalf("retransmission %d does not fill the expected hole: %x", i+1, wire)
+		}
+		// Neither retransmission is acknowledged: the second publication must
+		// use the entry ACK's remaining credit, not a new ACK or timer grant.
+	}
+	after := connection.Info()
+	if after.CongestionWindow != blocked.CongestionWindow || after.Retransmissions != before.Retransmissions+2 {
+		t.Fatalf("first sends changed the grant: before %+v, after %+v", blocked, after)
 	}
 }
 
@@ -13514,7 +13871,7 @@ func TestTCPPRRNewLossAfterRTOUndo(t *testing.T) {
 				state.outstanding[index].hostQueue = testPacketQueueTicketAt(epoch, now.Add(-500*time.Millisecond))
 			}
 			state.outstanding[1].state |= sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost | sentTCPSegmentLossReported | sentTCPSegmentTransmissionLost
-			state.prepareRetransmission(0, true, false, true, false, now)
+			state.prepareRetransmission(0, true, false, true, false, 0, now)
 			if !state.outstanding[2].lossAlreadyReported() {
 				t.Fatal("RTO did not report the aged original")
 			}
@@ -15070,7 +15427,7 @@ func BenchmarkTCPRTOAccounting(b *testing.B) {
 						}
 						state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
 						if repeated {
-							state.prepareRetransmission(0, true, false, true, false, now)
+							state.prepareRetransmission(0, true, false, true, false, 0, now)
 							state.outstanding[0].advanceTransmissionGeneration()
 						}
 						initial := state
@@ -15085,7 +15442,7 @@ func BenchmarkTCPRTOAccounting(b *testing.B) {
 							state = initial
 							*model = initialModel
 							copy(state.outstanding, initialSegments)
-							state.prepareRetransmission(0, true, false, true, false, now)
+							state.prepareRetransmission(0, true, false, true, false, 0, now)
 						}
 						b.StopTimer()
 						if !state.rtoRecovery || !state.undo.active {

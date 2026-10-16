@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -310,6 +311,253 @@ func benchmarkTCPControllerConnection(b *testing.B, algorithm string, mtu uint32
 		<-bridge.done
 	})
 	return connection, server, bridge
+}
+
+// BenchmarkTCPFastRecovery transfers and verifies an echoed stream through
+// Stack packet I/O with deterministic first-transmission losses. SACK loses
+// two ranges in a larger stream; RACK leaves one hole below a single SACK.
+// Each operation includes connection setup, transfer, and abortive cleanup.
+// RACK timing includes the reordering timer, whose wakeup latency can dominate
+// the short transfer at very small RTTs.
+func BenchmarkTCPFastRecovery(b *testing.B) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, test := range []struct {
+			name     string
+			segments int
+			drops    map[int]bool
+		}{
+			{name: "SACK", segments: 64, drops: map[int]bool{1: true, 2: true}},
+			{name: "RACK", segments: 2, drops: map[int]bool{1: true}},
+		} {
+			b.Run(algorithm+"/"+test.name, func(b *testing.B) {
+				link, stack := newTestStack(b, netip.MustParseAddr("192.0.2.221"), netip.MustParseAddr("192.0.2.222"))
+				link.mu.Lock()
+				link.echoTCP, link.sackTCP, link.dropTCPOrdinals = true, true, test.drops
+				link.mu.Unlock()
+				payload := bytes.Repeat([]byte{0x5a}, test.segments*1280)
+				received := make([]byte, len(payload))
+				var retransmissions, sackRetransmissions, rackRetransmissions uint64
+				var handshakeRTT time.Duration
+				b.SetBytes(int64(2 * len(payload)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					opened, err := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8080))
+					if err != nil {
+						cancel()
+						b.Fatal(err)
+					}
+					connection := opened.(*TCPConn)
+					if err = connection.SetCongestionControl(algorithm); err != nil {
+						b.Fatal(err)
+					}
+					if err = connection.SetLinger(0); err != nil {
+						b.Fatal(err)
+					}
+					deadline, _ := ctx.Deadline()
+					_ = connection.SetDeadline(deadline)
+					setup := connection.Info()
+					if setup.CongestionControl != algorithm || setup.MaximumSegmentSize != 1280 {
+						b.Fatalf("unexpected initial connection: %+v", setup)
+					}
+					handshakeRTT += setup.MinimumRTT
+					before := stack.Stats()
+					written := make(chan error, 1)
+					go func() {
+						n, writeErr := connection.Write(payload)
+						if writeErr == nil && n != len(payload) {
+							writeErr = io.ErrShortWrite
+						}
+						written <- writeErr
+					}()
+					_, readErr := io.ReadFull(connection, received)
+					writeErr := <-written
+					info, after := connection.Info(), stack.Stats()
+					_ = connection.Close()
+					select {
+					case <-connection.done:
+					case <-ctx.Done():
+						b.Fatal("connection cleanup timed out")
+					}
+					cancel()
+					link.mu.Lock()
+					delete(link.tcp, connection.key.local.Port())
+					link.mu.Unlock()
+					if readErr != nil || writeErr != nil || !bytes.Equal(received, payload) {
+						b.Fatalf("stream transfer: read %v, write %v", readErr, writeErr)
+					}
+					retries := after.TCPRetransmissions - before.TCPRetransmissions
+					sack := after.TCPSACKRetransmissions - before.TCPSACKRetransmissions
+					rack := after.TCPRACKRetransmissions - before.TCPRACKRetransmissions
+					tlp := after.TCPTailLossProbes - before.TCPTailLossProbes
+					if retries != uint64(len(test.drops)) || sack != retries || test.name == "RACK" && rack != retries || tlp != 0 || info.FastRecovery || info.RetransmissionRecovery || info.BytesAcknowledged != uint64(len(payload)) {
+						b.Fatalf("unexpected recovery: retransmissions %d, SACK %d, RACK %d, TLP %d, info %+v", retries, sack, rack, tlp, info)
+					}
+					retransmissions += retries
+					sackRetransmissions += sack
+					rackRetransmissions += rack
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(handshakeRTT.Nanoseconds())/float64(b.N), "handshake-rtt-ns/op")
+				b.ReportMetric(float64(retransmissions)/float64(b.N), "retransmissions/op")
+				b.ReportMetric(float64(sackRetransmissions)/float64(b.N), "sack-retransmissions/op")
+				b.ReportMetric(float64(rackRetransmissions)/float64(b.N), "rack-retransmissions/op")
+				b.ReportMetric(0, "tail-loss-probes/op")
+			})
+		}
+	}
+}
+
+// BenchmarkTCPRACKRecovery repeats one-hole recoveries on an established
+// connection. Every peer response, including the SYN-ACK and SACKs, has a
+// one-millisecond delay. Windows before Go 1.23 uses twenty milliseconds to
+// keep RACK and TLP expirations distinct with its coarser timer resolution.
+// Each two-segment flight drops its first segment once, leaving one hole below
+// a single SACK; recovery cannot rely on DupThresh or a later write.
+// Setup and cleanup are excluded; bytes count both directions of the echo.
+func BenchmarkTCPRACKRecovery(b *testing.B) {
+	responseDelay := time.Millisecond
+	version := runtime.Version()
+	if runtime.GOOS == "windows" && (strings.HasPrefix(version, "go1.20") || strings.HasPrefix(version, "go1.21") || strings.HasPrefix(version, "go1.22")) {
+		responseDelay = 20 * time.Millisecond
+	}
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		b.Run(algorithm, func(b *testing.B) {
+			link, stack := newTestStack(b, netip.MustParseAddr("192.0.2.223"), netip.MustParseAddr("192.0.2.224"))
+			link.mu.Lock()
+			link.echoTCP, link.sackTCP = true, true
+			link.delayTCPResponse = responseDelay
+			link.dropTCPOrdinals = map[int]bool{1: true}
+			link.mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			opened, err := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8080))
+			if err != nil {
+				b.Fatal(err)
+			}
+			connection := opened.(*TCPConn)
+			defer connection.Close()
+			if err = connection.SetCongestionControl(algorithm); err != nil {
+				b.Fatal(err)
+			}
+			if err = connection.SetLinger(0); err != nil {
+				b.Fatal(err)
+			}
+			if err = connection.SetDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+				b.Fatal(err)
+			}
+			setup := connection.Info()
+			if setup.CongestionControl != algorithm || setup.MaximumSegmentSize != 1280 || setup.MinimumRTT < responseDelay {
+				b.Fatalf("unexpected RACK connection: %+v", setup)
+			}
+			payload := bytes.Repeat([]byte{0x6b}, 2*setup.MaximumSegmentSize)
+			received := make([]byte, len(payload))
+			before := stack.Stats()
+			b.SetBytes(int64(2 * len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+					b.Fatalf("RACK write = %d, %v", n, writeErr)
+				}
+				if _, err = io.ReadFull(connection, received); err != nil || !bytes.Equal(received, payload) {
+					b.Fatalf("RACK echo = %v", err)
+				}
+				info := connection.Info()
+				if info.FastRecovery || info.RetransmissionRecovery || info.BytesAcknowledged != uint64(i+1)*uint64(len(payload)) {
+					b.Fatalf("incomplete RACK recovery: %+v", info)
+				}
+				link.mu.Lock()
+				peer := link.tcp[connection.key.local.Port()]
+				peer.dataSegments = 0
+				for sequence := range peer.seenData {
+					delete(peer.seenData, sequence)
+				}
+				link.mu.Unlock()
+			}
+			b.StopTimer()
+			after := stack.Stats()
+			retries := after.TCPRetransmissions - before.TCPRetransmissions
+			rack := after.TCPRACKRetransmissions - before.TCPRACKRetransmissions
+			if retries != uint64(b.N) || rack != retries || after.TCPTailLossProbes != before.TCPTailLossProbes {
+				b.Fatalf("recovery count = retransmissions:%d RACK:%d TLP:%d, want %d RACK retransmissions only", retries, rack, after.TCPTailLossProbes-before.TCPTailLossProbes, b.N)
+			}
+			b.ReportMetric(float64(rack)/float64(b.N), "rack-retransmissions/op")
+			b.ReportMetric(float64(setup.MinimumRTT.Nanoseconds()), "handshake-rtt-ns")
+			b.ReportMetric(float64(responseDelay.Nanoseconds()), "response-delay-ns")
+		})
+	}
+}
+
+// BenchmarkTCPPRREntryAcknowledgment measures the ACK that creates a SACK
+// recovery episode, including its checkpoint and delivery credit.
+func BenchmarkTCPPRREntryAcknowledgment(b *testing.B) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		b.Run(algorithm, func(b *testing.B) {
+			fixture := newTCPRecoveryACKFixture(b, algorithm, 64)
+			fixture.initial.fastRecovery = false
+			fixture.initial.recoveryPoint, fixture.initial.prrPriorFlight = 0, 0
+			fixture.initial.controller.state.Phase = CongestionPhaseOpen
+			fixture.original[1].state = sentTCPSegmentTransmitted
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				fixture.reset()
+				fixture.state.processAcknowledgment(&fixture.segment, fixture.ackTime, 0)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(fixture.state.prrDelivered), "credit-B")
+		})
+	}
+}
+
+// BenchmarkICMPv6ErrorInput measures checksum validation, quotation parsing,
+// endpoint correlation, and extended-error delivery through Stack.Write.
+func BenchmarkICMPv6ErrorInput(b *testing.B) {
+	local, remote := netip.MustParseAddr("2001:db8::31"), netip.MustParseAddr("2001:db8::32")
+	for _, input := range []struct{ messageType, code byte }{{2, 0}, {2, 1}, {100, 255}} {
+		b.Run(fmt.Sprintf("type-%d/code-%d", input.messageType, input.code), func(b *testing.B) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1500})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer stack.Close()
+			if err = stack.Start(); err != nil {
+				b.Fatal(err)
+			}
+			opened, err := stack.DialUDP(context.Background(), "udp6", netip.AddrPort{}, netip.AddrPortFrom(remote, 13000))
+			if err != nil {
+				b.Fatal(err)
+			}
+			connection := opened.(*UDPConn)
+			defer connection.Close()
+			if err = connection.SetReceiveErrors(true); err != nil {
+				b.Fatal(err)
+			}
+			quote := buildTestUDP(local, remote, connection.LocalAddr().(*net.UDPAddr).AddrPort().Port(), 13000, []byte("quote"))
+			body := make([]byte, 4+len(quote))
+			binary.BigEndian.PutUint32(body[:4], 1280)
+			copy(body[4:], quote)
+			wire := mustTestWire((ICMPMessage{Source: remote, Destination: local, Type: input.messageType, Code: input.code, Body: body}).MarshalBinary())
+			packet := buildIPPacket(remote, local, ProtocolICMPv6, wire, 1, true)
+			packets := [][]byte{packet}
+			delivered := 0
+			b.ReportAllocs()
+			b.SetBytes(int64(len(packet)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if n, err := stack.Write(packets, 0); err != nil || n != 1 {
+					b.Fatalf("ICMPv6 input = %d, %v", n, err)
+				}
+				if reported, err := connection.ReadError(); err == nil && reported != nil {
+					delivered++
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(delivered)/float64(b.N), "errors/op")
+		})
+	}
 }
 
 // BenchmarkTCPEstablishedStateAllocation measures the allocator's effective

@@ -180,18 +180,21 @@ selection is required because multicast, broadcast, and anycast destinations
 cannot be reused blindly as reply sources. The zero-copy reply shares `Body`
 with the request, while `MarshalBinary` and `AppendBinary` encode the complete
 message and calculate its address-family checksum.
-`ICMPMessage.IsError` classifies supported family-specific error type/code
-pairs, while `ICMPMessage.ICMPError` validates the available quoted structure
-and returns its addresses, protocol, TCP or UDP ports, path MTU, and parameter
+`ICMPMessage.IsError` classifies family-specific errors accepted on receive,
+including unknown ICMPv6 error types and Packet Too Big with any Code, while
+`ICMPMessage.ICMPError` validates the available quoted structure and returns
+its addresses, protocol, TCP or UDP ports, path MTU, and parameter
 pointer. Quoted packet and payload slices borrow `ICMPMessage.Body`; socket
 delivery takes an independent copy when it must retain them. For IPv6 No Next
 Header, `QuotedPacket` retains ignored trailing bytes while `QuotedPayload` is
 empty, matching `IPPacket.UpperLayer`. `ICMPError.ICMPMessage` performs the
 reverse construction from a validated, possibly truncated quoted packet and
-copies that quote; route selection, rate limiting, recursive-error suppression,
-and quote truncation remain transmission policy rather than codec behavior.
-The exported untyped ICMP type and code constants cover every error subtype the
-stack accepts as well as Echo Request and Reply. This includes the RFC 8883
+copies that quote. Construction requires supported type/code pairs, including
+Code 0 for IPv6 Packet Too Big; route selection, rate limiting, recursive-error
+suppression, and quote truncation remain transmission policy rather than codec
+behavior.
+The exported untyped ICMP type and code constants cover the supported error
+subtypes as well as Echo Request and Reply. This includes the RFC 8883
 IPv6 Parameter Problem processing-limit codes and Destination Unreachable
 "Headers too long", plus RFC 9914 P-Route errors. `ICMPError.Extensions`
 retains the RFC 4884 object sequence without its four-byte Extension Header;

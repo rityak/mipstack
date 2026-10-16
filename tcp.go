@@ -3525,7 +3525,15 @@ func (s *tcpEstablishedState) recoveryOutputReady() bool {
 		return false
 	}
 	size := s.outstanding[index].end - s.outstanding[index].sequence
-	return sackRecoveryCanSend(s.fastRecovery, sackRecoveryPipe(s.outstanding, s.peerMSS), size, s.congestionWindow)
+	return s.canRetransmitRecovery(sackRecoveryPipe(s.outstanding, s.peerMSS), size)
+}
+
+// canRetransmitRecovery retains RFC 6675 section 5's single entry
+// retransmission before SetPipe. Like Linux PRR, successful publication counts
+// its actual bytes in prrOut; model-owned windows keep their controller's limit.
+func (s *tcpEstablishedState) canRetransmitRecovery(pipe, size uint32) bool {
+	return s.fastRecovery && s.prrOut == 0 && !s.controller.customRecovery() ||
+		sackRecoveryCanSend(s.fastRecovery, pipe, size, s.congestionWindow)
 }
 
 // sendACKAt emits an ACK through an actor-owned slot and commits window, SACK,
@@ -8149,15 +8157,6 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	if probeFailed {
 		state.failPLPMTUProbe()
 	}
-	if state.fastRecovery && state.peerSACK && newlyDelivered != 0 {
-		state.prrDelivered += uint64(newlyDelivered)
-		pipe := sackRecoveryPipe(state.outstanding, state.peerMSS)
-		// RFC 9937 section 6.2 grants the extra SMSS only when SND.UNA
-		// advances without further loss. A delivered old loss cannot cancel
-		// a new inference, even if that generation was reported before undo.
-		proposed := prrCongestionWindow(pipe, state.slowStartThreshold, state.prrPriorFlight, state.prrDelivered, state.prrOut, newlyDelivered, ackAdvanced, newlyLost, state.peerMSS)
-		state.congestionWindow = state.controller.applyPRRWindow(receivedAt, state.congestionWindow, proposed, pipe)
-	}
 	if rtoPartialACK && !sackReneging {
 		index := firstUnsackedSegment(state.outstanding)
 		if state.peerSACK {
@@ -8210,10 +8209,20 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	if recoveryIndex >= 0 {
 		// The common entry checkpoints before reporting marked losses and
 		// applying the congestion response, without publishing output.
-		state.prepareRetransmission(recoveryIndex, false, deliveryACK, true, lostRetransmission, receivedAt)
+		state.prepareRetransmission(recoveryIndex, false, deliveryACK, true, lostRetransmission, newlyDelivered, receivedAt)
 		state.haveRACKLoss = hasRACKLoss(state.outstanding)
 	} else if newlyLost {
 		state.recordProvenLosses(deliveryACK, true, receivedAt)
+	}
+	if state.fastRecovery && state.peerSACK && newlyDelivered != 0 {
+		// RFC 9937 section 6.2 accounts for the ACK that starts recovery,
+		// after entry has initialized this episode's counters.
+		state.prrDelivered += uint64(newlyDelivered)
+		pipe := sackRecoveryPipe(state.outstanding, state.peerMSS)
+		// SafeACK requires cumulative progress without further loss; an
+		// acknowledged old loss cannot cancel a new loss inference.
+		proposed := prrCongestionWindow(pipe, state.slowStartThreshold, state.prrPriorFlight, state.prrDelivered, state.prrOut, newlyDelivered, ackAdvanced, newlyLost, state.peerMSS)
+		state.congestionWindow = state.controller.applyPRRWindow(receivedAt, state.congestionWindow, proposed, pipe)
 	}
 	retransmissionUpdate := tcpRetransmissionPreserve
 	if ackAdvanced {
@@ -8728,14 +8737,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if rackRetransmission {
 				c.stack.stats.tcpRACKRetransmissions.Add(1)
 			}
-			firstRecoverySend := state.fastRecovery && state.prrOut == 0
 			if state.fastRecovery {
 				state.prrOut += uint64(oldest.dataSize())
-			}
-			if firstRecoverySend {
-				// Linux PRR admits the forced recovery-entry retransmission
-				// before delivery feedback grants additional output.
-				state.congestionWindow = sackRecoveryPipe(state.outstanding, state.peerMSS)
 			}
 		}
 		if timeout && len(state.outstanding) != 0 {
@@ -9071,9 +9074,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					size := state.outstanding[index].end - state.outstanding[index].sequence
 					pipe := sackRecoveryPipe(state.outstanding, state.peerMSS)
-					// RFC 6675 permits the recovery-entry retransmission before
-					// SetPipe, but later transmissions require cwnd-Pipe space.
-					if !sackRecoveryCanSend(state.fastRecovery, pipe, size, state.congestionWindow) {
+					if !state.canRetransmitRecovery(pipe, size) {
 						break
 					}
 					if state.fastRecovery {
@@ -9731,7 +9732,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					if state.haveRACKLoss {
 						// Timer-derived RACK evidence enters recovery once. The drain
 						// below selects and publishes from that prepared scoreboard.
-						state.prepareRetransmission(firstUnretriedLoss(state.outstanding, state.peerMSS), false, false, true, lostRetransmission, observedAt)
+						state.prepareRetransmission(firstUnretriedLoss(state.outstanding, state.peerMSS), false, false, true, lostRetransmission, 0, observedAt)
 						if err := drainRecovery(tcpOutputReservation{}); err != nil {
 							return err
 						}
@@ -9780,7 +9781,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			// SACK reneging and zero-window retransmissions share RTO preparation,
 			// but neither supplies reliable probe-loss evidence from the saved
 			// transmission snapshot.
-			pendingIndex = state.prepareRetransmission(pendingIndex, true, false, !sackReneging && !zeroWindowRTO, false, time.Time{})
+			pendingIndex = state.prepareRetransmission(pendingIndex, true, false, !sackReneging && !zeroWindowRTO, false, 0, time.Time{})
 			if pendingIndex < 0 {
 				state.armRetransmission()
 				continue
@@ -9901,7 +9902,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 // prepareRetransmission records one loss indication and updates recovery state
 // without publishing the selected range. The caller can therefore retain the
 // resulting protocol authorization while device capacity is unavailable.
-func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duringACK, lossEvidenceValid, lostRetransmission bool, lossObservedAt time.Time) int {
+// newlyDelivered supplies the entry ACK's contribution to RFC 9937 RecoverFS;
+// timer-driven entry passes zero.
+func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duringACK, lossEvidenceValid, lostRetransmission bool, newlyDelivered uint32, lossObservedAt time.Time) int {
 	if len(state.outstanding) == 0 {
 		return -1
 	}
@@ -10059,9 +10062,17 @@ func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duri
 			state.fastRecovery = true
 			state.recoveryPoint = state.sendNext
 			if state.peerSACK {
-				state.prrPriorFlight = flight
+				// RFC 9937 section 6.1 includes this ACK's new delivery and
+				// lost or Limited Transmit data, but excludes earlier SACKs.
+				state.prrPriorFlight = ordinary + newlyDelivered
 				state.prrDelivered = 0
 				state.prrOut = 0
+				if newlyDelivered == 0 {
+					// Without delivery credit, only the entry retransmission
+					// is exempt from the Pipe gate.
+					pipe := sackRecoveryPipe(state.outstanding, state.peerMSS)
+					state.congestionWindow = state.controller.applyPRRWindow(lossObservedAt, state.congestionWindow, pipe, pipe)
+				}
 			}
 		}
 	}
@@ -11545,8 +11556,8 @@ func sackRecoveryPipe(outstanding []sentTCPSegment, mss int) uint32 {
 	return bytes
 }
 
-// sackRecoveryCanSend applies RFC 6675's cwnd-Pipe gate. The one
-// retransmission that enters recovery precedes SetPipe and is exempt.
+// sackRecoveryCanSend applies RFC 6675's cwnd-Pipe gate. The recovery sender
+// handles the single entry retransmission separately from ordinary data.
 func sackRecoveryCanSend(recovery bool, pipe, size, window uint32) bool {
 	return !recovery || uint64(pipe)+uint64(size) <= uint64(window)
 }
@@ -11571,7 +11582,7 @@ func tcpNewlyAcknowledgedBytes(outstanding []sentTCPSegment, acknowledgement uin
 	return delivered
 }
 
-// prrCongestionWindow implements Linux's byte-scaled RFC 9937 send-count
+// prrCongestionWindow implements RFC 9937's byte-based send-count
 // calculation. Returning Pipe+sndcnt lets the existing RFC 6675 sender apply
 // the allowance to retransmissions and new data with one common gate.
 func prrCongestionWindow(pipe, threshold, priorFlight uint32, delivered, sent uint64, newlyDelivered uint32, cumulativeACK, newlyLost bool, mss int) uint32 {
@@ -11597,6 +11608,9 @@ func prrCongestionWindow(pipe, threshold, priorFlight uint32, delivered, sent ui
 		if available := uint64(threshold - pipe); allowance > available {
 			allowance = available
 		}
+	}
+	if sent == 0 && allowance == 0 {
+		allowance = uint64(mss)
 	}
 	if allowance > uint64(tcpMaximumScaledWindow) {
 		allowance = uint64(tcpMaximumScaledWindow)
