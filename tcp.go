@@ -1402,6 +1402,9 @@ const (
 	// Pipe across replacement generations. RFC 8985 clears the current
 	// transmission's loss state on retransmission, not the original copy's.
 	sentTCPSegmentOriginalLost
+	// sentTCPSegmentTransmissionLost excludes the current transmission from
+	// copy-level flight until a replacement is published or loss is undone.
+	sentTCPSegmentTransmissionLost
 )
 
 // has reports whether any requested state bit is present.
@@ -1495,7 +1498,24 @@ func (s *sentTCPSegment) lossAlreadyReported() bool {
 // generation independently eligible for a loss event.
 func (s *sentTCPSegment) advanceTransmissionGeneration() {
 	s.state |= sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted
-	s.state &^= sentTCPSegmentLossReported
+	s.state &^= sentTCPSegmentLossReported | sentTCPSegmentTransmissionLost
+}
+
+// markLost applies loss evidence to the original copy and, when current is
+// true, the current transmission. RFC 6675 sequence evidence alone cannot
+// prove loss of a replacement; RFC 8985 uses its transmission time instead.
+// The result describes a new inference, independently of loss reporting.
+func (s *sentTCPSegment) markLost(current bool) bool {
+	if !s.isTransmitted() || s.state.has(sentTCPSegmentSACKed) {
+		return false
+	}
+	flags := sentTCPSegmentOriginalLost
+	if current {
+		flags |= sentTCPSegmentTransmissionLost
+	}
+	changed := s.state&flags != flags
+	s.state |= flags
+	return changed
 }
 
 // transmittedAt reconstructs the host-queue admission time used by loss
@@ -2295,6 +2315,28 @@ func (s *tcpEstablishedState) congestionFlight() uint32 {
 	return s.ordinaryFlight()
 }
 
+// rtoTransmissionFlight follows Linux tcp_packets_in_flight by excluding
+// SACKed and lost copies while retaining live replacements. Only transmission
+// snapshots use it; send permission, pacing, and the delivery clock retain
+// their own flight estimates.
+func (s *tcpEstablishedState) rtoTransmissionFlight() uint32 {
+	var flight uint32
+	for index := range s.outstanding {
+		segment := &s.outstanding[index]
+		if segment.state.has(sentTCPSegmentSACKed) {
+			continue
+		}
+		size := segment.end - segment.sequence
+		if !segment.state.has(sentTCPSegmentOriginalLost) {
+			flight += size
+		}
+		if segment.isRetransmitted() && !segment.state.has(sentTCPSegmentTransmissionLost) {
+			flight += size
+		}
+	}
+	return flight
+}
+
 // recountSACK refreshes the cached SACKed range and byte totals after the
 // scoreboard has been structurally modified.
 func (s *tcpEstablishedState) recountSACK() {
@@ -2310,20 +2352,35 @@ func (s *tcpEstablishedState) recordRetransmission(start, end uint32) {
 	s.retransmitHistory.record(start, end)
 }
 
-// recordProvenLosses reports newly proven loss through the event family used
-// by the active congestion controller. duringACK retains delivery accounting
-// for the rate sample currently being assembled at observedAt.
-func (s *tcpEstablishedState) recordProvenLosses(duringACK bool, observedAt time.Time) {
-	if !s.controller.usesLossEvents() {
-		s.controller.noteLoss(recordProvenTCPLosses(s.outstanding, s.peerMSS), duringACK)
-		return
+// recordProvenLosses reports marked transmission losses once per generation.
+// Recovery entry saves its checkpoint before calling this method. duringACK
+// retains losses for the current delivery sample; evidenceValid distinguishes
+// ordinary loss from a timeout following SACK reneging.
+func (s *tcpEstablishedState) recordProvenLosses(duringACK, evidenceValid bool, observedAt time.Time) {
+	var losses uint32
+	started := false
+	packetEvents := s.controller.usesLossEvents()
+	for index := range s.outstanding {
+		segment := &s.outstanding[index]
+		bytes := recordTCPSegmentLoss(segment)
+		if bytes == 0 {
+			continue
+		}
+		if !packetEvents {
+			losses = growCongestionWindow(losses, bytes)
+			continue
+		}
+		if !started {
+			started = true
+			s.controller.syncTransportState(s.congestionWindow, s.slowStartThreshold, s.congestionFlight(), s.peerMSS, s.rtt.srtt)
+			s.controller.syncDeliveryState()
+			s.controller.prepareEvent(CongestionEventPacketLost, observedAt)
+		}
+		s.controller.publishPacketLoss(segment, bytes, duringACK, evidenceValid)
 	}
-	if observedAt.IsZero() {
-		observedAt = time.Now()
+	if !packetEvents {
+		s.controller.noteLoss(losses, duringACK)
 	}
-	recordProvenTCPLossesWith(s.outstanding, s.peerMSS, func(segment *sentTCPSegment, bytes uint32) {
-		s.controller.notePacketLoss(segment, bytes, duringACK, true, observedAt, s.congestionWindow, s.slowStartThreshold, s.congestionFlight(), s.peerMSS, s.rtt.srtt)
-	})
 }
 
 // connectionState derives the public TCP state from the actor's close flags.
@@ -3177,7 +3234,7 @@ func (s *tcpEstablishedState) armSACKReneging() {
 func (s *tcpEstablishedState) retransmissionTarget(kind tcpRetransmissionKind) int {
 	// RFC 6298 section 5.4 and RFC 2018 section 5 require an RTO to retry
 	// the left edge even when SACKed. Contradictory SACK marks are cleared
-	// after this generation's host-queue wait, before timeout preparation.
+	// during timeout preparation, after this generation's host-queue wait.
 	index := 0
 	if kind == tcpRetransmissionProbe {
 		index = lastUnsackedSegment(s.outstanding)
@@ -3733,12 +3790,16 @@ func (s *tcpEstablishedState) restoreSpuriousRecovery(receivedAt time.Time, ackn
 		// Published retransmissions remain in flight; subsequent SACK/RACK
 		// feedback can establish fresh loss evidence without replaying the RTO.
 		for index := range s.outstanding {
-			s.outstanding[index].state &^= sentTCPSegmentOriginalLost | sentTCPSegmentRACKLost
+			s.outstanding[index].state &^= sentTCPSegmentOriginalLost | sentTCPSegmentRACKLost | sentTCPSegmentTransmissionLost
 		}
 		s.haveRACKLoss = false
 	}
 	s.undo.spuriousUndos++
 	s.connection.stack.stats.tcpSpuriousRecoveryUndos.Add(1)
+	// Undo changes pacing policy, not the credit of published transmissions.
+	s.controller.cancelPacingWake()
+	s.pacing = false
+	s.pacingDeadline = time.Time{}
 	return true
 }
 
@@ -7627,7 +7688,6 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			state.peerWindowSequence = segment.sequence
 		}
 	}
-	recoveryAtACK := state.fastRecovery
 	hadSACKedAtACK := state.sackedRanges != 0
 	newlyDelivered := uint32(0)
 	acknowledgedForUndo := uint32(0)
@@ -7635,6 +7695,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	sampledRTT := false
 	partialCumulativeACK := false
 	rtoPartialACK := false
+	newRenoPartialACK := false
 	sackReneging := false
 	// Match Linux's ACK-entry snapshot: an ACK that ends SACK-reneging
 	// recovery still cannot produce a valid delivery-rate sample from ranges
@@ -7766,6 +7827,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		if len(state.outstanding) == 0 {
 			state.outstanding, state.outstandingBase, state.outstandingHead = nil, nil, 0
 			state.sackedRanges, state.sackedBytes = 0, 0
+			state.haveRACKLoss = false
 		}
 		if len(state.outstanding) != 0 && tcpSequenceGreater(ack, state.outstanding[0].sequence) {
 			partialCumulativeACK = true
@@ -7848,12 +7910,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				// RFC 6582 NewReno: a partial ACK confirms one loss
 				// but not the recovery point. Deflate by newly ACKed
 				// data, add one SMSS, and retransmit the next hole.
-				state.congestionWindow = state.controller.partialACKWindow(receivedAt, state.congestionWindow, acknowledged, state.congestionFlight(), state.peerMSS)
-				index := firstUnsackedSegment(state.outstanding)
-				if index >= 0 {
-					state.outstanding[index].state.set(sentTCPSegmentSACKRetried, false)
-				}
-				state.enterRecovery(index, receivedAt)
+				newRenoPartialACK = true
 			}
 		} else if !ecnCongestion && !state.controller.usesDeliveryRate() {
 			growth := acknowledged
@@ -7954,11 +8011,6 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	hasSACK := false
 	newSACKInfo := false
 	frtoOriginalDelivered := false
-	trackPRRLoss := recoveryAtACK && state.fastRecovery && state.peerSACK
-	lostBefore := 0
-	if trackPRRLoss {
-		lostBefore = sackLostRangeCount(state.outstanding, state.peerMSS)
-	}
 	if state.peerSACK && len(state.outstanding) != 0 {
 		blocks := parseTCPSACKOptions(segment.optionBytes(), state.sendUnacknowledged, state.sendNext)
 		var latestSACK tcpRACKSample
@@ -7993,30 +8045,10 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			state.rtt.observeAt(rttSample, monotonicStampAt(c.stack.timestampEpoch, receivedAt))
 			sampledRTT = true
 		}
-		latestSACK.rtt = elapsedRTTSampleAt(latestSACK.sentAt, receivedAt)
-		state.rackLatestDelivered = newerRACKSample(state.rackLatestDelivered, validRACKSample(latestSACK, state.rtt.minimum, timestampEcho))
-		reorderingWindow := rackReorderingWindow(state.rtt.minimum, state.rtt.srtt, state.rackReorderingScale)
-		if !state.rackReorderingSeen && (state.fastRecovery || state.rtoRecovery || state.sackedRanges >= tcpDuplicateACKThreshold) {
-			reorderingWindow = 0
+		if !latestSACK.sentAt.IsZero() {
+			latestSACK.rtt = elapsedRTTSampleAt(latestSACK.sentAt, receivedAt)
+			state.rackLatestDelivered = newerRACKSample(state.rackLatestDelivered, validRACKSample(latestSACK, state.rtt.minimum, timestampEcho))
 		}
-		if !sackReneging && (state.rackLatestDelivered.retransmitted || state.sackedRanges != 0) {
-			state.haveRACKLoss = markRACKLoss(state.outstanding, state.rackLatestDelivered, receivedAt, reorderingWindow, c.stack.timestampEpoch)
-		}
-	}
-	newlyLost := trackPRRLoss && sackLostRangeCount(state.outstanding, state.peerMSS) > lostBefore
-	if recoveryAtACK && state.fastRecovery && state.peerSACK && newlyDelivered != 0 {
-		state.prrDelivered += uint64(newlyDelivered)
-		pipe := sackRecoveryPipe(state.outstanding, state.peerMSS)
-		proposed := prrCongestionWindow(pipe, state.slowStartThreshold, state.prrPriorFlight, state.prrDelivered, state.prrOut, newlyDelivered, ackAdvanced, newlyLost, state.peerMSS)
-		state.congestionWindow = state.controller.applyPRRWindow(receivedAt, state.congestionWindow, proposed, pipe)
-	}
-	probeFailed := false
-	if state.pathMTUState != nil && state.pathMTUState.discovery.active && hasSACK && state.sendUnacknowledged == state.pathMTUState.discovery.probeStart && isolatedPLPMTUProbeLoss(state.outstanding, state.pathMTUState.discovery.probeStart, highestSACK, state.peerMSS) {
-		state.failPLPMTUProbe()
-		probeFailed = true
-	}
-	if !sackReneging && (hasSACK || state.haveRACKLoss) {
-		state.recordProvenLosses(deliveryACK, receivedAt)
 	}
 	if state.tailProbeActive && state.tailProbeRetransmit && !ackAdvanced && ack == state.tailProbeEnd && previousWindow == state.peerWindow && !hasSACK && len(segment.payload) == 0 && segment.flags&TCPFlagFIN == 0 {
 		state.tailProbeActive = false
@@ -8028,6 +8060,8 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	if sackReneging {
 		state.armSACKReneging()
 	}
+	// RFC 5682 resolves the previous timeout before new loss callbacks can
+	// replace the controller's undo checkpoint.
 	duplicateEvidence := tcpDuplicateACKEvidence(*segment, state.peerSACK, newSACKInfo, ackAdvanced, state.sendUnacknowledged, previousWindow, state.peerWindow)
 	if state.frtoState == tcpFRTOFallbackPending && (duplicateEvidence || sackReneging) {
 		// New loss or reneging evidence replaces F-RTO's earlier fallback
@@ -8095,6 +8129,35 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			}
 		}
 	}
+	if state.peerSACK && len(state.outstanding) != 0 && !sackReneging {
+		reorderingWindow := rackReorderingWindow(state.rtt.minimum, state.rtt.srtt, state.rackReorderingScale)
+		if !state.rackReorderingSeen && (state.fastRecovery || state.rtoRecovery || state.sackedRanges >= tcpDuplicateACKThreshold) {
+			reorderingWindow = 0
+		}
+		if state.rackLatestDelivered.retransmitted || state.sackedRanges != 0 {
+			state.haveRACKLoss = markRACKLoss(state.outstanding, state.rackLatestDelivered, receivedAt, reorderingWindow, c.stack.timestampEpoch)
+		}
+	}
+	probeFailed := state.pathMTUState != nil && state.pathMTUState.discovery.active && hasSACK && state.sendUnacknowledged == state.pathMTUState.discovery.probeStart && isolatedPLPMTUProbeLoss(state.outstanding, state.pathMTUState.discovery.probeStart, highestSACK, state.peerMSS)
+	newlyLost, lostRetransmission := false, false
+	// RFC 6675 IsLost cannot hold below both SACK thresholds. RACK's
+	// time-based evidence remains independent of these sequence thresholds.
+	if !sackReneging && (state.haveRACKLoss || hasSACK &&
+		(state.sackedRanges >= tcpDuplicateACKThreshold || state.peerMSS > 0 && uint64(state.sackedBytes) > uint64((tcpDuplicateACKThreshold-1)*state.peerMSS))) {
+		newlyLost, lostRetransmission = markProvenTCPLosses(state.outstanding, state.peerMSS, probeFailed)
+	}
+	if probeFailed {
+		state.failPLPMTUProbe()
+	}
+	if state.fastRecovery && state.peerSACK && newlyDelivered != 0 {
+		state.prrDelivered += uint64(newlyDelivered)
+		pipe := sackRecoveryPipe(state.outstanding, state.peerMSS)
+		// RFC 9937 section 6.2 grants the extra SMSS only when SND.UNA
+		// advances without further loss. A delivered old loss cannot cancel
+		// a new inference, even if that generation was reported before undo.
+		proposed := prrCongestionWindow(pipe, state.slowStartThreshold, state.prrPriorFlight, state.prrDelivered, state.prrOut, newlyDelivered, ackAdvanced, newlyLost, state.peerMSS)
+		state.congestionWindow = state.controller.applyPRRWindow(receivedAt, state.congestionWindow, proposed, pipe)
+	}
 	if rtoPartialACK && !sackReneging {
 		index := firstUnsackedSegment(state.outstanding)
 		if state.peerSACK {
@@ -8108,37 +8171,49 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			if !state.peerSACK {
 				segment.state.set(sentTCPSegmentSACKRetried, false)
 			}
-			state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), deliveryACK, true, receivedAt, state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
+			segment.markLost(true)
+			state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment), deliveryACK, true, receivedAt, state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
 			state.tailProbeActive = false
 			state.tailProbeRetransmit = false
 		}
 	}
-	if !sackReneging && !state.rtoRecovery && state.haveRACKLoss {
-		state.enterRecovery(firstUnretriedLoss(state.outstanding, state.peerMSS), receivedAt)
-		state.haveRACKLoss = hasRACKLoss(state.outstanding)
-	}
-	// RFC 6675 DupAcks and Limited Transmit apply before recovery.
-	// Once SACK recovery is active, each ACK carrying new scoreboard
-	// information drives SetPipe/NextSeg below without re-entering it.
-	countDuplicate := duplicateEvidence && (!state.peerSACK || !state.fastRecovery)
-	if !probeFailed && !state.rtoRecovery && len(state.outstanding) != 0 && countDuplicate {
-		state.duplicateACKs++
-		if state.duplicateACKs < tcpDuplicateACKThreshold && !state.fastRecovery {
-			// RFC 3042 Limited Transmit permits one new segment for each
-			// of the first two duplicate ACKs without inflating cwnd. The
-			// established output path derives its cumulative allowance from this
-			// count after ACK processing is complete.
-		} else if state.duplicateACKs == tcpDuplicateACKThreshold {
-			if state.peerSACK {
-				// RFC 6675 enters recovery after DupThresh ACKs carrying
-				// new SACK information even if IsLost remains false.
-				state.enterRecovery(firstUnsackedSegment(state.outstanding), receivedAt)
-			} else {
-				state.enterRecovery(firstUnsackedSegment(state.outstanding), receivedAt)
-			}
-		} else if state.duplicateACKs > tcpDuplicateACKThreshold && !state.peerSACK {
-			state.congestionWindow = state.controller.duplicateACKWindow(receivedAt, state.congestionWindow, state.congestionFlight(), state.peerMSS)
+	recoveryIndex := -1
+	if !sackReneging && !state.rtoRecovery && len(state.outstanding) != 0 {
+		if state.haveRACKLoss {
+			recoveryIndex = firstUnretriedLoss(state.outstanding, state.peerMSS)
 		}
+		if !probeFailed && duplicateEvidence && (!state.peerSACK || !state.fastRecovery) {
+			state.duplicateACKs++
+			if state.duplicateACKs == tcpDuplicateACKThreshold {
+				recoveryIndex = firstUnsackedSegment(state.outstanding)
+			} else if state.duplicateACKs > tcpDuplicateACKThreshold && !state.peerSACK {
+				state.congestionWindow = state.controller.duplicateACKWindow(receivedAt, state.congestionWindow, state.congestionFlight(), state.peerMSS)
+			}
+		}
+		// RFC 6675 section 5, step (2), also enters recovery when IsLost
+		// proves the first hole before DupThresh duplicate ACKs arrive.
+		if !probeFailed && !state.fastRecovery && state.peerSACK && hasSACK &&
+			(state.haveRACKLoss || state.sackedRanges >= tcpDuplicateACKThreshold || state.peerMSS > 0 && uint64(state.sackedBytes) > uint64((tcpDuplicateACKThreshold-1)*state.peerMSS)) {
+			index := firstUnsackedSegment(state.outstanding)
+			if sackSegmentLost(state.outstanding, index, state.peerMSS) {
+				recoveryIndex = index
+			}
+		}
+		if newRenoPartialACK && state.fastRecovery && !state.peerSACK {
+			state.congestionWindow = state.controller.partialACKWindow(receivedAt, state.congestionWindow, acknowledgedForUndo, state.congestionFlight(), state.peerMSS)
+			recoveryIndex = firstUnsackedSegment(state.outstanding)
+			if recoveryIndex >= 0 {
+				state.outstanding[recoveryIndex].state.set(sentTCPSegmentSACKRetried, false)
+			}
+		}
+	}
+	if recoveryIndex >= 0 {
+		// The common entry checkpoints before reporting marked losses and
+		// applying the congestion response, without publishing output.
+		state.prepareRetransmission(recoveryIndex, false, deliveryACK, true, lostRetransmission, receivedAt)
+		state.haveRACKLoss = hasRACKLoss(state.outstanding)
+	} else if newlyLost {
+		state.recordProvenLosses(deliveryACK, true, receivedAt)
 	}
 	retransmissionUpdate := tcpRetransmissionPreserve
 	if ackAdvanced {
@@ -8326,7 +8401,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		// Delivery sampling resets its pipeline timestamps only when packets_out
 		// is zero. SACKed or loss-marked data therefore remains part of the first
 		// argument even when it is no longer congestion flight.
-		rate, updatedWindow := state.controller.onDataSend(payload.size, state.peerMSS, sentAt, hostQueue.queuedAt, windowFlight, state.congestionWindow, congestionFlight, state.rtt.srtt, state.slowStartThreshold)
+		transmissionFlight := congestionFlight
+		if state.rtoRecovery && state.controller.usesTransmissionEvents() {
+			transmissionFlight = state.rtoTransmissionFlight()
+		}
+		rate, updatedWindow := state.controller.onDataSend(payload.size, state.peerMSS, sentAt, hostQueue.queuedAt, windowFlight, state.congestionWindow, congestionFlight, transmissionFlight, state.rtt.srtt, state.slowStartThreshold)
 		state.congestionWindow = updatedWindow
 		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: published.timestamp, state: sentTCPSegmentInitialState(limitedTransmit, published.carriesCWR, probe, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate, transmissionOrder: transmissionOrder}, offset+payload.size < total)
 		state.bytesSent += uint64(payload.size)
@@ -8597,9 +8676,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		outputWindow.release()
 		return nil
 	}
-	publishRetransmission := func(outputWindow tcpOutputWindow, index int, timeout bool) (tcpOutputWindow, bool, error) {
+	publishRetransmission := func(outputWindow tcpOutputWindow, index int, timeout bool, transmissionFlight uint32, flightKnown bool) (tcpOutputWindow, uint32, bool, error) {
 		if index < 0 || index >= len(state.outstanding) {
-			return outputWindow, false, nil
+			return outputWindow, transmissionFlight, false, nil
 		}
 		oldest := &state.outstanding[index]
 		rackRetransmission := oldest.state.has(sentTCPSegmentRACKLost)
@@ -8607,11 +8686,24 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		window, right, reserve := state.nextAdvertisedReceiveWindow()
 		outputWindow, published, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *oldest, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 		if err != nil || blocked {
-			return outputWindow, blocked, err
+			return outputWindow, transmissionFlight, blocked, err
 		}
 		flightAdded := uint32(0)
 		if state.peerSACK && state.fastRecovery && !oldest.state.has(sentTCPSegmentSACKed|sentTCPSegmentSACKRetried) {
 			flightAdded = oldest.end - oldest.sequence
+		}
+		nextFlight := transmissionFlight
+		if state.rtoRecovery && state.controller.usesTransmissionEvents() {
+			if !flightKnown {
+				transmissionFlight = state.rtoTransmissionFlight()
+			}
+			nextFlight = transmissionFlight
+			if !oldest.state.has(sentTCPSegmentSACKed) && (!repeated || oldest.state.has(sentTCPSegmentTransmissionLost)) {
+				// Publication replaces the current copy without changing the
+				// original's loss state. Only a missing or lost replacement
+				// adds sequence bytes to Linux's live-copy flight estimate.
+				nextFlight += oldest.end - oldest.sequence
+			}
 		}
 		hostQueue := published.hostQueue
 		transmissionOrder := state.recordTransmission(hostQueue)
@@ -8652,10 +8744,14 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			}
 			state.armRetransmission()
 		}
-		oldest.delivery = state.controller.onRetransmit(oldest.dataSize(), state.peerMSS, oldest.transmittedAt(c.stack.timestampEpoch), oldest.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), flightAdded, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+		flight := state.congestionFlight()
+		if !state.rtoRecovery {
+			transmissionFlight = flight - flightAdded
+		}
+		oldest.delivery = state.controller.onRetransmit(oldest.dataSize(), state.peerMSS, oldest.transmittedAt(c.stack.timestampEpoch), oldest.hostQueue.queuedAt, state.congestionWindow, flight, transmissionFlight, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		oldest.congestionPacketState = state.controller.transmissionState()
 		oldest.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
-		return outputWindow, false, nil
+		return outputWindow, nextFlight, false, nil
 	}
 	retransmitRTORecovery = func(outputWindow tcpOutputWindow, index int) (tcpOutputWindow, bool, error) {
 		if len(state.outstanding) == 0 || state.peerWindow == 0 {
@@ -8680,11 +8776,16 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
 			c.sendCWR = true
 		}
+		segment.markLost(true)
+		state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment), false, true, time.Now(), state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
+		transmissionFlight := uint32(0)
+		if state.controller.usesTransmissionEvents() {
+			transmissionFlight = state.rtoTransmissionFlight()
+		}
 		segment.state.set(sentTCPSegmentCWR, false)
 		segment.timestamp = published.timestamp
 		segment.hostQueue = hostQueue
 		segment.transmissionOrder = transmissionOrder
-		state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), false, true, time.Now(), state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
 		segment.advanceTransmissionGeneration()
 		segment.state.set(sentTCPSegmentSACKRetried, true)
 		rackLost := segment.state.has(sentTCPSegmentRACKLost)
@@ -8695,7 +8796,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		state.tailProbeActive = false
 		state.tailProbeRetransmit = false
 		c.noteRetransmission()
-		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.ordinaryFlight(), 0, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.ordinaryFlight(), transmissionFlight, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		segment.congestionPacketState = state.controller.transmissionState()
 		segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
 		return outputWindow, false, nil
@@ -8717,7 +8818,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		if retransmissionKind == tcpRetransmissionRTO {
 			var err error
-			outputWindow, _, err = publishRetransmission(outputWindow, pendingIndex, true)
+			outputWindow, _, _, err = publishRetransmission(outputWindow, pendingIndex, true, 0, false)
 			outputWindow.release()
 			return err
 		}
@@ -8758,7 +8859,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			probeSentAt = sentAt
 			segment.advanceTransmissionGeneration()
 			c.noteRetransmission()
-			segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), 0, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+			flight := state.congestionFlight()
+			segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, flight, flight, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 			segment.congestionPacketState = state.controller.transmissionState()
 			state.tailProbeBytes = segment.dataSize()
 			state.tailProbeState = originalCongestionState
@@ -8869,6 +8971,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if state.peerSACK && state.fastRecovery && !segment.state.has(sentTCPSegmentSACKed|sentTCPSegmentSACKRetried) {
 			flightAdded = segment.end - segment.sequence
 		}
+		transmissionFlight := uint32(0)
+		if state.rtoRecovery && state.controller.usesTransmissionEvents() {
+			transmissionFlight = state.rtoTransmissionFlight()
+		}
 		hostQueue := published.hostQueue
 		transmissionOrder := state.recordTransmission(hostQueue)
 		state.recordRetransmission(segment.sequence, segment.end)
@@ -8888,7 +8994,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		segment.state.set(sentTCPSegmentSACKRetried, true)
 		state.haveRACKLoss = hasRACKLoss(state.outstanding)
 		c.noteRetransmission()
-		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), flightAdded, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+		flight := state.congestionFlight()
+		if !state.rtoRecovery {
+			transmissionFlight = flight - flightAdded
+		}
+		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, flight, transmissionFlight, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		segment.congestionPacketState = state.controller.transmissionState()
 		segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
 		if state.frtoState == tcpFRTOTimeoutPending {
@@ -8949,6 +9059,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				if state.fastRecovery {
 					highest = highestSACKedSequence(state.outstanding)
 				}
+				var transmissionFlight uint32
+				flightKnown := false
 				for {
 					index := firstUnretriedLoss(state.outstanding, state.peerMSS)
 					if index < 0 && state.fastRecovery {
@@ -8971,15 +9083,18 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 							break
 						}
 					}
-					outputWindow, blocked, err = publishRetransmission(outputWindow, index, false)
+					outputWindow, transmissionFlight, blocked, err = publishRetransmission(outputWindow, index, false, transmissionFlight, flightKnown)
 					if err != nil || blocked {
 						break
 					}
+					// ACKs and controller changes cannot run within this loop.
+					// Only successful publications establish a reusable estimate.
+					flightKnown = true
 				}
 			} else if !state.peerSACK && state.fastRecovery {
 				index := firstUnsackedSegment(state.outstanding)
 				if index >= 0 && !state.outstanding[index].state.has(sentTCPSegmentSACKRetried) {
-					outputWindow, blocked, err = publishRetransmission(outputWindow, index, false)
+					outputWindow, _, blocked, err = publishRetransmission(outputWindow, index, false, 0, false)
 				}
 			}
 		}
@@ -9603,6 +9718,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				observedAt := time.Now()
 				state.haveRACKLoss = markRACKLoss(state.outstanding, state.rackLatestDelivered, observedAt, reorderingWindow, c.stack.timestampEpoch)
 				if state.haveRACKLoss {
+					_, lostRetransmission := markProvenTCPLosses(state.outstanding, state.peerMSS, false)
 					// RACK can be the first conclusive evidence that only the
 					// PLPMTU probe was lost. Apply the same RFC 4821 isolation
 					// rule as the ACK path before ordinary congestion recovery.
@@ -9612,11 +9728,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 							return err
 						}
 					}
-					state.recordProvenLosses(false, observedAt)
 					if state.haveRACKLoss {
 						// Timer-derived RACK evidence enters recovery once. The drain
 						// below selects and publishes from that prepared scoreboard.
-						state.prepareRetransmission(firstUnretriedLoss(state.outstanding, state.peerMSS), false, false, true, observedAt)
+						state.prepareRetransmission(firstUnretriedLoss(state.outstanding, state.peerMSS), false, false, true, lostRetransmission, observedAt)
 						if err := drainRecovery(tcpOutputReservation{}); err != nil {
 							return err
 						}
@@ -9634,18 +9749,6 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				}
 				continue
 			}
-			if retransmissionKind == tcpRetransmissionRTO && state.outstanding[0].state.has(sentTCPSegmentSACKed) {
-				// RFC 2018 permits receiver reneging. Like Linux tcp_enter_loss,
-				// discard a contradictory scoreboard at any RTO, including a
-				// zero-window retry that did not use the short reneging timer.
-				for index := range state.outstanding {
-					state.outstanding[index].state.set(sentTCPSegmentSACKed, false)
-				}
-				state.sackedRanges, state.sackedBytes = 0, 0
-				state.haveRACKLoss = false
-				state.sackRenegingRecovery = true
-				sackReneging = true
-			}
 			if zeroWindowRTO {
 				if err := state.zeroWindowTimeoutError(time.Now(), c.socketOptions().userTimeout); err != nil {
 					return err
@@ -9662,7 +9765,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				state.blackHoleRTOs++
 				if state.blackHoleRTOs >= tcpBlackHoleTimeouts {
 					if len(state.outstanding) != 0 {
-						segment := state.outstanding[firstUnsackedSegment(state.outstanding)]
+						segment := state.outstanding[pendingIndex]
 						mtu := nextBlackHoleProbeMTU(c.mtu, c.key.remote.Addr().Is6(), segment.dataSize(), c.peerTimestamp)
 						if mtu < c.mtu {
 							c.stack.stats.pathMTUBlackHoleReductions.Add(1)
@@ -9677,7 +9780,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			// SACK reneging and zero-window retransmissions share RTO preparation,
 			// but neither supplies reliable probe-loss evidence from the saved
 			// transmission snapshot.
-			pendingIndex = state.prepareRetransmission(pendingIndex, true, false, !sackReneging && !zeroWindowRTO, time.Time{})
+			pendingIndex = state.prepareRetransmission(pendingIndex, true, false, !sackReneging && !zeroWindowRTO, false, time.Time{})
 			if pendingIndex < 0 {
 				state.armRetransmission()
 				continue
@@ -9798,9 +9901,21 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 // prepareRetransmission records one loss indication and updates recovery state
 // without publishing the selected range. The caller can therefore retain the
 // resulting protocol authorization while device capacity is unavailable.
-func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duringACK, lossEvidenceValid bool, lossObservedAt time.Time) int {
+func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duringACK, lossEvidenceValid, lostRetransmission bool, lossObservedAt time.Time) int {
 	if len(state.outstanding) == 0 {
 		return -1
+	}
+	sackReneging := timeout && state.outstanding[0].state.has(sentTCPSegmentSACKed)
+	if sackReneging {
+		// RFC 2018 permits receiver reneging. Like Linux tcp_timeout_mark_lost,
+		// discard contradictory SACK state before marking this timeout's losses.
+		for segmentIndex := range state.outstanding {
+			state.outstanding[segmentIndex].state.set(sentTCPSegmentSACKed, false)
+		}
+		state.sackedRanges, state.sackedBytes = 0, 0
+		state.haveRACKLoss = false
+		state.sackRenegingRecovery = true
+		lossEvidenceValid = false
 	}
 	if index < 0 || index >= len(state.outstanding) {
 		index = firstUnsackedSegment(state.outstanding)
@@ -9855,8 +9970,9 @@ func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duri
 	}
 	oldest := &state.outstanding[index]
 	rackRetransmission := oldest.state.has(sentTCPSegmentRACKLost)
-	lostRetransmission := rackRetransmission && oldest.isRetransmitted()
 	lostCWR := oldest.state.has(sentTCPSegmentCWR)
+	// RFC 8985 treats loss of a replacement as a new congestion signal.
+	// Classify the whole evidence batch, independently of retransmit order.
 	beginUndo := timeout && !state.rtoRecovery || !timeout && (!state.fastRecovery || lostRetransmission)
 	if beginUndo {
 		flight := state.ordinaryFlight()
@@ -9870,8 +9986,14 @@ func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duri
 		state.undo.begin(timeout, state.sendNext, state.congestionWindow, state.slowStartThreshold, flight, &state.controller, state.rtt, lossObservedAt)
 		state.undo.setTransport(transport)
 	}
-	lossProven := timeout || !state.peerSACK || sackSegmentLost(state.outstanding, index, state.peerMSS)
-	state.controller.notePacketLoss(oldest, recordTCPSegmentLoss(oldest, lossProven), duringACK, lossEvidenceValid, lossObservedAt, state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt)
+	if timeout {
+		state.markTimeoutLosses(index, sackReneging, duringACK, lossEvidenceValid, lossObservedAt)
+	} else {
+		if !state.peerSACK || sackSegmentLost(state.outstanding, index, state.peerMSS) {
+			oldest.markLost(!state.peerSACK || rackRetransmission || !oldest.isRetransmitted())
+		}
+		state.recordProvenLosses(duringACK, lossEvidenceValid, lossObservedAt)
+	}
 	if timeout {
 		state.tailProbeActive = false
 		state.tailProbeRetransmit = false
@@ -9903,13 +10025,6 @@ func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duri
 		state.prrOut = 0
 		state.ecnRecoveryPoint = state.sendNext
 		state.ecnRecoveryActive = true
-		// Modern Linux preserves valid SACK state across an ordinary RTO.
-		// The caller clears contradictory marks after the selected generation
-		// leaves the host queue, before preparing timeout recovery.
-		for index := range state.outstanding {
-			state.outstanding[index].state.set(sentTCPSegmentSACKRetried, false)
-			state.outstanding[index].state.set(sentTCPSegmentRACKLost, false)
-		}
 		state.haveRACKLoss = false
 		state.rtt.backoff()
 	} else {
@@ -9953,10 +10068,64 @@ func (state *tcpEstablishedState) prepareRetransmission(index int, timeout, duri
 	return index
 }
 
-// enterRecovery applies ACK-derived loss recovery without publishing a
-// retransmission.
-func (state *tcpEstablishedState) enterRecovery(index int, receivedAt time.Time) {
-	state.prepareRetransmission(index, false, state.controller.usesDeliveryRate(), true, receivedAt)
+// markTimeoutLosses applies Linux tcp_timeout_mark_lost's age test and consumes
+// each generation's loss history before discarding recovery-only markers.
+// Loss callbacks in SACK recovery require the complete RFC 6675 Pipe scoreboard.
+func (state *tcpEstablishedState) markTimeoutLosses(index int, sackReneging, duringACK, evidenceValid bool, observedAt time.Time) {
+	packetEvents := state.controller.usesLossEvents()
+	deliveryAccounting := state.controller.usesDeliveryRate()
+	deferReport := packetEvents && state.peerSACK && state.fastRecovery
+	var losses uint32
+	started := false
+	// Linux retains recent higher transmissions on an ordinary RTO, but not
+	// after confirmed SACK reneging. Host-owned transmissions wait to depart.
+	// The epoch-relative cutoff may precede the epoch.
+	lossCutoff := observedAt.Sub(state.connection.stack.timestampEpoch) - state.rackLatestDelivered.rtt
+	for segmentIndex := range state.outstanding {
+		segment := &state.outstanding[segmentIndex]
+		if segment.state.has(sentTCPSegmentTransmissionLost | sentTCPSegmentSACKed) {
+			// An accounted loss without recovery markers needs no further update.
+			const reportedLoss = sentTCPSegmentTransmissionLost | sentTCPSegmentLossReported
+			const lossStateMask = reportedLoss | sentTCPSegmentSACKed | sentTCPSegmentSACKRetried | sentTCPSegmentRACKLost
+			if segment.state&lossStateMask == reportedLoss {
+				continue
+			}
+		} else {
+			queue := segment.hostQueue.queue(state.connection.stack)
+			if !segment.hostQueue.pendingIn(queue) && (sackReneging || segmentIndex == index || segment.hostQueue.queuedAt == 0 || time.Duration(segment.hostQueue.queuedAt-1) <= lossCutoff) {
+				segment.markLost(true)
+			}
+		}
+		if deferReport {
+			continue
+		}
+		// Like Linux tcp_mark_skb_lost, account loss in the marking pass,
+		// including loss inferred earlier but not yet reported.
+		bytes := recordTCPSegmentLoss(segment)
+		if bytes != 0 {
+			if packetEvents {
+				if !started {
+					started = true
+					state.controller.syncTransportState(state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
+					state.controller.syncDeliveryState()
+					state.controller.prepareEvent(CongestionEventPacketLost, observedAt)
+				}
+				state.controller.publishPacketLoss(segment, bytes, duringACK, evidenceValid)
+			} else if deliveryAccounting {
+				losses = growCongestionWindow(losses, bytes)
+			}
+		}
+		// Linux preserves valid SACK state across an ordinary RTO.
+		segment.state &^= sentTCPSegmentSACKRetried | sentTCPSegmentRACKLost
+	}
+	if deferReport {
+		state.recordProvenLosses(duringACK, evidenceValid, observedAt)
+		for segmentIndex := range state.outstanding {
+			state.outstanding[segmentIndex].state &^= sentTCPSegmentSACKRetried | sentTCPSegmentRACKLost
+		}
+	} else if !packetEvents {
+		state.controller.noteLoss(losses, duringACK)
+	}
 }
 
 // armPathMTURetransmission preserves PMTU-induced retransmission work until an
@@ -11224,25 +11393,6 @@ func firstUnretriedSACKHole(outstanding []sentTCPSegment, highest uint32) int {
 	return -1
 }
 
-// sackLostRangeCount counts ranges satisfying RFC 6675 IsLost, including
-// RACK declarations, for PRR's newly-lost suppression of slow-start reduction.
-func sackLostRangeCount(outstanding []sentTCPSegment, mss int) int {
-	count := 0
-	var sackedRanges, sackedBytes int
-	for index := len(outstanding) - 1; index >= 0; index-- {
-		segment := outstanding[index]
-		if segment.state.has(sentTCPSegmentSACKed) {
-			sackedRanges++
-			sackedBytes += int(segment.end - segment.sequence)
-			continue
-		}
-		if segment.state.has(sentTCPSegmentRACKLost) || sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss {
-			count++
-		}
-	}
-	return count
-}
-
 // sackSegmentLost implements RFC 6675 IsLost: either DupThresh transmitted
 // ranges or more than (DupThresh-1)*SMSS bytes have been SACKed above it.
 func sackSegmentLost(outstanding []sentTCPSegment, index, mss int) bool {
@@ -11267,34 +11417,22 @@ func sackSegmentLost(outstanding []sentTCPSegment, index, mss int) bool {
 	return false
 }
 
-// recordTCPSegmentLoss marks a proven transmission generation as reported and
-// returns its sequence-space size. A later retransmission starts a new
-// generation that can independently be proven lost.
-func recordTCPSegmentLoss(segment *sentTCPSegment, proven bool) uint32 {
-	if !proven || segment == nil || !segment.isTransmitted() {
+// recordTCPSegmentLoss consumes one marked generation's loss report. Undo may
+// clear the current loss inference without making this history reportable again.
+func recordTCPSegmentLoss(segment *sentTCPSegment) uint32 {
+	if !segment.state.has(sentTCPSegmentTransmissionLost) || segment.state.has(sentTCPSegmentSACKed|sentTCPSegmentLossReported) {
 		return 0
 	}
-	reported := segment.lossAlreadyReported()
-	segment.state |= sentTCPSegmentOriginalLost | sentTCPSegmentLossReported
-	if reported {
-		return 0
-	}
+	segment.state |= sentTCPSegmentLossReported
 	return segment.end - segment.sequence
 }
 
-// recordProvenTCPLosses returns bytes newly declared lost by RACK or RFC
-// 6675 IsLost. A speculative SACK-hole retransmission is not loss evidence,
-// and an already retransmitted range needs new RACK evidence or an RTO before
-// its replacement generation can be reported.
-func recordProvenTCPLosses(outstanding []sentTCPSegment, mss int) uint32 {
-	return recordProvenTCPLossesWith(outstanding, mss, nil)
-}
-
-// recordProvenTCPLossesWith additionally reports every newly lost generation
-// without allocating a temporary slice. report runs synchronously while the
-// connection actor owns outstanding.
-func recordProvenTCPLossesWith(outstanding []sentTCPSegment, mss int, report func(*sentTCPSegment, uint32)) uint32 {
-	var losses uint32
+// markProvenTCPLosses applies RACK and RFC 6675 evidence without reporting it
+// to the controller. The result is RFC 9937's further-loss indication, not the
+// net change of the loss set or the number of newly reportable bytes. The
+// second result identifies new time-based loss of a replacement transmission.
+// isolatedProbe excludes an RFC 4821 probe failure from congestion evidence.
+func markProvenTCPLosses(outstanding []sentTCPSegment, mss int, isolatedProbe bool) (newlyLost, lostRetransmission bool) {
 	var sackedRanges, sackedBytes int
 	for index := len(outstanding) - 1; index >= 0; index-- {
 		segment := &outstanding[index]
@@ -11307,22 +11445,27 @@ func recordProvenTCPLossesWith(outstanding []sentTCPSegment, mss int, report fun
 		// original transmission and cannot prove that its replacement was lost.
 		// RACK compares transmit times and therefore is direct evidence for the
 		// current replacement generation.
-		if !segment.state.has(sentTCPSegmentRACKLost) {
+		rackLost := segment.state.has(sentTCPSegmentRACKLost)
+		if rackLost {
+			// Repeated RACK evidence cannot add loss when both copies are
+			// already marked; publishing a replacement clears its loss flag.
+			const lostCopies = sentTCPSegmentOriginalLost | sentTCPSegmentTransmissionLost
+			if segment.state&lostCopies == lostCopies {
+				continue
+			}
+		} else {
 			if sackedRanges < tcpDuplicateACKThreshold && (mss <= 0 || sackedBytes <= (tcpDuplicateACKThreshold-1)*mss) {
 				continue
 			}
-			if segment.state.has(sentTCPSegmentSACKRetried) {
-				segment.state |= sentTCPSegmentOriginalLost
-				continue
-			}
 		}
-		bytes := recordTCPSegmentLoss(segment, true)
-		losses = growCongestionWindow(losses, bytes)
-		if bytes != 0 && report != nil {
-			report(segment, bytes)
+		replacementLost := rackLost && segment.isRetransmitted() && !segment.state.has(sentTCPSegmentTransmissionLost)
+		changed := segment.markLost(rackLost || !segment.isRetransmitted())
+		if !isolatedProbe || !segment.state.has(sentTCPSegmentMTUProbe) {
+			newlyLost = newlyLost || changed
+			lostRetransmission = lostRetransmission || changed && replacementLost
 		}
 	}
-	return losses
+	return newlyLost, lostRetransmission
 }
 
 // isolatedPLPMTUProbeLoss requires ordinary RFC 6675/RACK loss evidence for
@@ -11428,7 +11571,7 @@ func tcpNewlyAcknowledgedBytes(outstanding []sentTCPSegment, acknowledgement uin
 	return delivered
 }
 
-// prrCongestionWindow implements Linux's byte-scaled RFC 6937 send-count
+// prrCongestionWindow implements Linux's byte-scaled RFC 9937 send-count
 // calculation. Returning Pipe+sndcnt lets the existing RFC 6675 sender apply
 // the allowance to retransmissions and new data with one common gate.
 func prrCongestionWindow(pipe, threshold, priorFlight uint32, delivered, sent uint64, newlyDelivered uint32, cumulativeACK, newlyLost bool, mss int) uint32 {
@@ -11581,7 +11724,7 @@ func markRACKLoss(outstanding []sentTCPSegment, delivered tcpRACKSample, now tim
 	for index := range outstanding {
 		segment := &outstanding[index]
 		if !segment.state.has(sentTCPSegmentSACKed) && rackDeliveredAfter(delivered, *segment, epoch) && !now.Before(segment.transmittedAt(epoch).Add(delivered.rtt+reorderingWindow)) {
-			segment.state |= sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost
+			segment.state |= sentTCPSegmentRACKLost
 			segment.state.set(sentTCPSegmentSACKRetried, false)
 		}
 		lost = lost || segment.state.has(sentTCPSegmentRACKLost) && !segment.state.has(sentTCPSegmentSACKRetried)

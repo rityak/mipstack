@@ -2024,6 +2024,16 @@ func (t packetQueueTicket) generation() uint64 { return t.token >> packetQueueTi
 // stack.outbound.
 func (t packetQueueTicket) loopback() bool { return t.token&packetQueueTicketLoopback != 0 }
 
+// queue returns the queue encoded in the ticket, independently of the current
+// routing configuration. stack must be non-nil.
+func (t packetQueueTicket) queue(stack *Stack) *packetQueue {
+	queue := &stack.outbound
+	if t.loopback() {
+		queue = &stack.loopback.packetQueue
+	}
+	return queue
+}
+
 // initFIFO initializes q as a bounded FIFO queue sharing its stack's monotonic
 // epoch. The caller must exclusively own an inactive q.
 func (q *packetQueue) initFIFO(capacity int, epoch time.Time) {
@@ -2076,16 +2086,9 @@ func (t packetQueueTicket) pendingIn(queue *packetQueue) bool {
 }
 
 // pending selects the ticket's encoded outbound or loopback queue and reports
-// whether that queue still owns its exact slot generation.
+// whether that queue still owns its exact slot generation. stack must be non-nil.
 func (t packetQueueTicket) pending(stack *Stack) bool {
-	if stack == nil {
-		return false
-	}
-	queue := &stack.outbound
-	if t.loopback() {
-		queue = &stack.loopback.packetQueue
-	}
-	return t.pendingIn(queue)
+	return t.pendingIn(t.queue(stack))
 }
 
 // departedTime returns the queue-departure time after this waiter completes.
@@ -2113,10 +2116,7 @@ func (t packetQueueTicket) departureWaiter(stack *Stack, notify chan<- struct{})
 	if stack == nil {
 		return nil
 	}
-	queue := &stack.outbound
-	if t.loopback() {
-		queue = &stack.loopback.packetQueue
-	}
+	queue := t.queue(stack)
 	slot := t.slot()
 	if int(slot) >= len(queue.slots) || !t.pendingIn(queue) {
 		return nil

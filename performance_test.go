@@ -3,15 +3,241 @@ package mipstack
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type benchmarkRTOController struct {
+	algorithm       CongestionController
+	window          uint32
+	recoveryEntries atomic.Uint32
+	timeoutAt       chan time.Time
+}
+
+func (c *benchmarkRTOController) HandleCongestionEvent(event *CongestionEvent) {
+	if event.Type == CongestionEventInitialize {
+		event.State.CongestionWindow = c.window
+	}
+	c.algorithm.HandleCongestionEvent(event)
+	if event.Type == CongestionEventTimeout {
+		// Timeout events mark recovery entry, not each RTO expiration.
+		if c.recoveryEntries.Add(1) == 1 {
+			c.timeoutAt <- event.Time
+		}
+	}
+}
+
+// BenchmarkTCPRTORecovery loses a complete flight before allowing retransmissions
+// through the public packet I/O APIs. Losing the first SYN selects RFC 6298
+// section 5.7's three-second data RTO without an RTT sample, allowing the flight
+// to form with native pacing and race overhead.
+// Each recovery packet is acknowledged. The final ACK carries FIN, and
+// completion includes reading its EOF. Each iteration includes the initial
+// data RTO wait, but excludes the handshake.
+// recovery-MiB/s excludes that initial wait, but includes any further RTO waits
+// in the recovery episode.
+func BenchmarkTCPRTORecovery(b *testing.B) {
+	const mss = 1280
+	local := netip.MustParseAddr("192.0.2.211")
+	remote := netip.MustParseAddr("192.0.2.212")
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, count := range []int{16, 128, 1024, 8192} {
+			b.Run(fmt.Sprintf("%s/segments-%d", algorithm, count), func(b *testing.B) {
+				payload := bytes.Repeat([]byte{0x5a}, count*mss)
+				var recoveryTime time.Duration
+				b.SetBytes(int64(len(payload)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				b.StopTimer()
+				for iteration := 0; iteration < b.N; iteration++ {
+					base, _ := registeredCongestionControlFactory(algorithm)
+					definition := base.definition
+					var observer *benchmarkRTOController
+					definition.New = func(context CongestionControlContext) CongestionController {
+						observer = &benchmarkRTOController{
+							algorithm: base.definition.New(context), window: uint32(len(payload)),
+							timeoutAt: make(chan time.Time, 1),
+						}
+						return observer
+					}
+					factory, err := NewCongestionControlFactory(definition)
+					if err != nil {
+						b.Fatal(err)
+					}
+					stack, err := New(Config{
+						LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
+						TCP: TCPSocketDefaults{CongestionControlFactory: factory, SendBuffer: len(payload), MaximumSendBuffer: len(payload)},
+					})
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err = stack.Start(); err != nil {
+						_ = stack.Close()
+						b.Fatal(err)
+					}
+					peerDone := make(chan error, 1)
+					go func() {
+						peerDone <- func() error {
+							buffer := make([]byte, 65535)
+							original := make([]bool, count)
+							received := make([]bool, count)
+							originalCount, prefix := 0, 0
+							firstRecoveryACK := true
+							synLost := false
+							var first uint32
+							for {
+								sizes := []int{0}
+								if _, readErr := stack.Read([][]byte{buffer}, sizes, 0); readErr != nil {
+									return readErr
+								}
+								packet, ok := parseIPPacket(buffer[:sizes[0]], false)
+								if !ok || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+									return fmt.Errorf("invalid outbound TCP packet")
+								}
+								tcp := packet.payload
+								sequence := binary.BigEndian.Uint32(tcp[4:8])
+								flags := tcp[13]
+								data := tcp[int(tcp[12]>>4)*4:]
+								if flags&TCPFlagSYN != 0 {
+									if !synLost {
+										synLost = true
+										continue
+									}
+									first = sequence + 1
+									options := []byte{2, 4, 5, 0, 4, 2, 1, 3, 3, 8}
+									if writeErr := writeTestPacket(stack, buildTestTCP(remote, local, 8080, binary.BigEndian.Uint16(tcp[:2]), 100, first, TCPFlagSYN|TCPFlagACK, 65535, options, nil)); writeErr != nil {
+										return writeErr
+									}
+									continue
+								}
+								if flags&TCPFlagRST != 0 {
+									return fmt.Errorf("connection reset during RTO recovery")
+								}
+								if len(data) != 0 {
+									offset := int(sequence - first)
+									if offset < 0 || offset >= len(payload) || offset%mss != 0 || len(data) != mss || !bytes.Equal(data, payload[offset:offset+mss]) {
+										return fmt.Errorf("invalid recovery payload at offset %d, length %d", offset, len(data))
+									}
+									index := offset / mss
+									// Drop queued initial packets until the RTO's left-edge
+									// retransmission actually reaches the device reader.
+									if observer.recoveryEntries.Load() == 0 || firstRecoveryACK && index != 0 {
+										if !original[index] {
+											original[index] = true
+											originalCount++
+										}
+										continue
+									}
+									if originalCount != count {
+										return fmt.Errorf("RTO started after only %d/%d original segments departed", originalCount, count)
+									}
+									if firstRecoveryACK {
+										// Give RFC 8985's retransmission RTT a measurable
+										// interval even when the clock has coarse ticks.
+										time.Sleep(time.Millisecond)
+										firstRecoveryACK = false
+									}
+									received[index] = true
+									for prefix < count && received[prefix] {
+										prefix++
+									}
+								}
+								// The first non-SYN ACK advertises the scaled window before
+								// data is queued, so large flights are not receiver-limited.
+								ackFlags := uint8(TCPFlagACK)
+								if prefix == count {
+									ackFlags |= TCPFlagFIN
+								}
+								if writeErr := writeTestPacket(stack, buildTestTCP(remote, local, 8080, binary.BigEndian.Uint16(tcp[:2]), 101, first+uint32(prefix*mss), ackFlags, 65535, nil, nil)); writeErr != nil {
+									return writeErr
+								}
+								if prefix == count {
+									return nil
+								}
+							}
+						}()
+					}()
+					// The guard bounds instrumented large-flight processing, not TCP's RTO.
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					connection, err := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8080))
+					if err != nil {
+						cancel()
+						_ = stack.Close()
+						<-peerDone
+						b.Fatal(err)
+					}
+					deadline, _ := ctx.Deadline()
+					_ = connection.SetDeadline(deadline)
+					for connection.(*TCPConn).Info().PeerWindow < uint32(len(payload)) {
+						select {
+						case <-ctx.Done():
+							_ = stack.Close()
+							<-peerDone
+							cancel()
+							b.Fatal("scaled peer window was not installed")
+						default:
+							runtime.Gosched()
+						}
+					}
+					setup := connection.(*TCPConn).Info()
+					if setup.RTT != 0 || setup.MinimumRTT != 0 || setup.RetransmissionTimeout != 3*time.Second {
+						_ = stack.Close()
+						<-peerDone
+						cancel()
+						b.Fatalf("unexpected initial RTT/RTO: %v/%v, minimum %v", setup.RTT, setup.RetransmissionTimeout, setup.MinimumRTT)
+					}
+					b.StartTimer()
+					written, writeErr := connection.Write(payload)
+					select {
+					case err = <-peerDone:
+						peerDone = nil
+					case <-ctx.Done():
+						err = ctx.Err()
+					}
+					// EOF follows processing of the final ACK. Congestion ACK
+					// callbacks alone need not cover every acknowledged byte.
+					if err == nil {
+						var buffer [1]byte
+						if n, readErr := connection.Read(buffer[:]); n != 0 || readErr != io.EOF {
+							err = fmt.Errorf("recovery completion read = %d, %v; want 0, EOF", n, readErr)
+						}
+					}
+					completed := time.Now()
+					b.StopTimer()
+					info := connection.(*TCPConn).Info()
+					_ = stack.Close()
+					if peerDone != nil {
+						if peerErr := <-peerDone; err == nil {
+							err = peerErr
+						}
+					}
+					cancel()
+					if err != nil || writeErr != nil || written != len(payload) {
+						b.Fatalf("recovery failed: peer %v, write %d/%d: %v, recovery entries %d, info %+v", err, written, len(payload), writeErr, observer.recoveryEntries.Load(), info)
+					}
+					if observer.recoveryEntries.Load() != 1 || info.BytesAcknowledged != uint64(len(payload)) || info.RetransmissionRecovery || info.FastRecovery || info.SpuriousRecoveryUndos != 0 || info.State != TCPStateCloseWait {
+						b.Fatalf("incomplete RTO recovery: recovery entries %d, info %+v", observer.recoveryEntries.Load(), info)
+					}
+					recoveryTime += completed.Sub(<-observer.timeoutAt)
+				}
+				// A complete small recovery can finish within one clock tick.
+				// Do not report an infinite rate when the clock cannot resolve it.
+				if recoveryTime > 0 {
+					b.ReportMetric(float64(recoveryTime.Nanoseconds())/float64(b.N)/1e6, "recovery-ms/op")
+					b.ReportMetric(float64(len(payload))*float64(b.N)/recoveryTime.Seconds()/(1024*1024), "recovery-MiB/s")
+				}
+			})
+		}
+	}
+}
 
 func benchmarkTCPControllerConnection(b *testing.B, algorithm string, mtu uint32, ipv6 bool, offload RXChecksumOffload) (net.Conn, *Stack, *stackBridge) {
 	b.Helper()
