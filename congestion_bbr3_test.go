@@ -3,6 +3,7 @@ package mipstack
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/netip"
 	"sort"
 	"sync"
@@ -24,6 +25,25 @@ type bbr3RenegingRecorder struct {
 	staleLoss    atomic.Uint64
 	lostBytes    atomic.Uint64
 	onPacketSent func()
+}
+
+type bbr3Retransmission struct {
+	flight   uint32
+	snapshot uint32
+	bytes    int
+	phase    CongestionPhase
+}
+
+type bbr3RetransmissionRecorder struct {
+	algorithm *bbr3CongestionControl
+	published chan bbr3Retransmission
+}
+
+func (r *bbr3RetransmissionRecorder) HandleCongestionEvent(event *CongestionEvent) {
+	r.algorithm.HandleCongestionEvent(event)
+	if event.Type == CongestionEventPacketRetransmitted {
+		r.published <- bbr3Retransmission{flight: event.State.BytesInFlight, snapshot: bbr3DecodePacketState(event.PacketState).inflight, bytes: event.PacketBytes, phase: event.State.Phase}
+	}
 }
 
 func (r *bbr3RenegingRecorder) HandleCongestionEvent(event *CongestionEvent) {
@@ -805,6 +825,223 @@ func TestBBR3ProbeRTTUsesIndependentFiveSecondWindow(t *testing.T) {
 	window = bbr.updateMinimumRTT(4000, sample, mss)
 	if window != 20_000 || bbr.mode != bbrProbeBandwidth || bbr.probePhase != bbr3ProbeCruise {
 		t.Fatalf("ProbeRTT exit = window %d mode %v phase %s", window, bbr.mode, bbr.probePhase.String())
+	}
+}
+
+func TestBBR3ProbeRTTExitClearsLowerBounds(t *testing.T) {
+	for _, idle := range []bool{false, true} {
+		for _, fullBandwidth := range []bool{false, true} {
+			t.Run(fmt.Sprintf("idle-%t/full-bandwidth-%t", idle, fullBandwidth), func(t *testing.T) {
+				now := time.Unix(100, 0)
+				bbr := newBBR3CongestionControl()
+				bbr.mode, bbr.fullBandwidthReached, bbr.applicationLimited = bbrProbeRTT, fullBandwidth, true
+				bbr.probeDone = now.Add(-time.Millisecond)
+				bbr.priorWindow = 20_000
+				bbr.bandwidthHigh[1], bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh = 1_000_000, 500_000, 8000, 30_000
+				window := uint32(4000)
+				if idle {
+					window = bbr.onDeliverySend(now, 0, window)
+				} else {
+					bbr.probeRound, bbr.roundStart = true, true
+					bbr.probeRTTStamp, bbr.minimumRTTStamp = now, now
+					window = bbr.updateMinimumRTT(window, bbr3RateSample(now, 1000, 1000, 4000, time.Millisecond), 1000)
+				}
+				wantMode := bbrStartup
+				if fullBandwidth {
+					wantMode = bbrProbeBandwidth
+				}
+				if bbr.mode != wantMode || window != 20_000 || bbr.bandwidthLow != 0 || bbr.inflightLow != 0 || bbr.inflightHigh != 30_000 || bbr.maximumBandwidth() != 1_000_000 || bbr.effectiveBandwidth() != 1_000_000 {
+					t.Fatalf("ProbeRTT exit = mode %v window %d bandwidth %g bounds %g/%d/%d", bbr.mode, window, bbr.effectiveBandwidth(), bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh)
+				}
+				if fullBandwidth && (bbr.probePhase != bbr3ProbeCruise || bbr.boundWindow(uint64(window), 1000) != uint64(window)) {
+					t.Fatalf("ProbeBW restart = phase %v bounded window %d", bbr.probePhase, bbr.boundWindow(uint64(window), 1000))
+				}
+			})
+		}
+	}
+}
+
+func TestTCPBBR3PublishedRetransmissionFlight(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		count    int
+		pathMTU  bool
+		repeated bool
+	}{
+		{name: "RACK", count: 2},
+		{name: "SACK threshold", count: 5},
+		{name: "PMTU first replacement", count: 5, pathMTU: true},
+		{name: "PMTU repeated replacement", count: 5, pathMTU: true, repeated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			link, stack, connection := newManuallyPumpedTCPConnection(t)
+			recorder := &bbr3RetransmissionRecorder{algorithm: newBBR3CongestionControl(), published: make(chan bbr3Retransmission, 64)}
+			base, _ := registeredCongestionControlFactory(CongestionControlBBR3)
+			definition := base.definition
+			definition.Name = "test-BBR3-flight"
+			definition.New = func(CongestionControlContext) CongestionController { return recorder }
+			factory, err := NewCongestionControlFactory(definition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = connection.SetCongestionControlFactory(factory); err != nil {
+				t.Fatal(err)
+			}
+			mss := connection.Info().MaximumSegmentSize
+			if _, err = connection.Write(bytes.Repeat([]byte{'x'}, test.count*mss)); err != nil {
+				t.Fatal(err)
+			}
+			var segments []TCPSegment
+			var firstWire []byte
+			for len(segments) < test.count {
+				entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+				if !available {
+					t.Fatal("original transmission did not depart")
+				}
+				wire := consumeTestPacket(&stack.outbound, entry)
+				packet, parseErr := ParseIPPacket(wire)
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				segment, parseErr := packet.TCPSegment()
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				if len(segment.Payload) != 0 {
+					if len(segments) == 0 {
+						firstWire = wire
+					}
+					segments = append(segments, segment)
+				}
+			}
+			held := make([]uint16, 0, cap(stack.outbound.free))
+			defer func() {
+				for _, slot := range held {
+					stack.outbound.releaseReserved(slot)
+				}
+			}()
+			holdOutput := func() {
+				t.Helper()
+				for {
+					slot, reserved := stack.outbound.tryReserve()
+					if !reserved {
+						break
+					}
+					held = append(held, slot)
+				}
+				if len(held) != cap(stack.outbound.free) {
+					t.Fatalf("reserved output slots = %d, want %d", len(held), cap(stack.outbound.free))
+				}
+			}
+			if test.pathMTU && !test.repeated {
+				holdOutput()
+			}
+			sacked := make(map[uint32][]byte)
+			for _, segment := range segments[1:] {
+				sacked[segment.SequenceNumber] = segment.Payload
+			}
+			link.mu.Lock()
+			serverNext := link.tcp[connection.key.local.Port()].serverNext
+			link.mu.Unlock()
+			if err = link.deliverTCP(8080, connection.key.local.Port(), serverNext, segments[0].SequenceNumber, TCPFlagACK, 65535, testSACKOptions(sacked), nil); err != nil {
+				t.Fatal(err)
+			}
+			wantFlight, wantPostFlight, wantBytes := uint32(0), uint32(mss), mss
+			if test.pathMTU {
+				waitFor(t, time.Second, func() bool { return connection.Info().FastRecovery })
+				if test.repeated {
+					select {
+					case event := <-recorder.published:
+						if event.phase != CongestionPhaseRecovery || event.flight != 0 || event.snapshot != uint32(mss) || event.bytes != mss {
+							t.Fatalf("first publication = %+v, MSS %d", event, mss)
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatal("no initial retransmission event")
+					}
+					wire := readOutboundPacket(t, stack)
+					packet, parseErr := ParseIPPacket(wire)
+					if parseErr != nil {
+						t.Fatal(parseErr)
+					}
+					segment, parseErr := packet.TCPSegment()
+					if parseErr != nil || segment.SequenceNumber != segments[0].SequenceNumber || !bytes.Equal(segment.Payload, segments[0].Payload) {
+						t.Fatalf("first replacement = %+v, %v", segment, parseErr)
+					}
+					holdOutput()
+					wantFlight = uint32(mss)
+				}
+				const reducedMTU = 1000
+				if err = writeTestPacket(stack, buildTestPacketTooBig(link.remote, link.local, firstWire, reducedMTU)); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, time.Second, func() bool { return connection.Info().PathMTU == reducedMTU })
+				wantBytes = connection.Info().MaximumSegmentSize
+				if !test.repeated {
+					wantPostFlight = uint32(wantBytes)
+				}
+				if info := connection.Info(); !info.FastRecovery || info.RetransmissionRecovery || info.BytesInFlight != wantFlight {
+					t.Fatalf("unpublished PMTU flight = %+v, want %d", info, wantFlight)
+				}
+				last := len(held) - 1
+				stack.outbound.releaseReserved(held[last])
+				held = held[:last]
+			}
+			select {
+			case event := <-recorder.published:
+				if event.phase != CongestionPhaseRecovery || event.flight != wantFlight || event.snapshot != wantFlight+uint32(wantBytes) || event.bytes != wantBytes {
+					t.Fatalf("published transmission = %+v, want flight %d bytes %d", event, wantFlight, wantBytes)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("no retransmission event")
+			}
+			info := connection.Info()
+			if info.BytesInFlight != wantPostFlight || !info.FastRecovery || info.RetransmissionRecovery {
+				t.Fatalf("post-publication flight = %+v", info)
+			}
+			entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+			if !available {
+				t.Fatal("published retransmission did not depart")
+			}
+			packet, err := ParseIPPacket(consumeTestPacket(&stack.outbound, entry))
+			if err != nil {
+				t.Fatal(err)
+			}
+			segment, err := packet.TCPSegment()
+			if err != nil || segment.SequenceNumber != segments[0].SequenceNumber || !bytes.Equal(segment.Payload, segments[0].Payload[:wantBytes]) {
+				t.Fatalf("retransmitted range = %+v, %v", segment, err)
+			}
+		})
+	}
+}
+
+func TestBBR3SpeculativeSACKRetransmissionFlight(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	state := tcpEstablishedState{
+		peerSACK: true, fastRecovery: true, peerMSS: mss,
+		outstanding: []sentTCPSegment{
+			{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted},
+			{sequence: 1100, end: 2100, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+		},
+		controller: newTCPCongestionController(CongestionControlBBR3),
+	}
+	state.controller.initialize(CongestionPhaseRecovery, now, time.Millisecond, time.Millisecond, 10*mss, 10*mss, mss, 1)
+	if index := firstUnretriedSACKHole(state.outstanding, 2100); index != 0 || sackSegmentLost(state.outstanding, index, mss) {
+		t.Fatal("SACK hole was not eligible for RFC 6675 NextSeg rule 3")
+	}
+	before := state.congestionFlight()
+	state.outstanding[0].advanceTransmissionGeneration()
+	state.outstanding[0].state.set(sentTCPSegmentSACKRetried, true)
+	after := state.congestionFlight()
+	if before != mss || after != 2*mss {
+		t.Fatalf("speculative replacement discarded its unproven original: flight %d -> %d", before, after)
+	}
+	state.controller.onRetransmit(mss, mss, now, 1, 10*mss, after, after-before, 2*mss, time.Millisecond, 10*mss)
+	if eventFlight := state.controller.state.BytesInFlight; eventFlight != before {
+		t.Fatalf("speculative event flight = %d, want %d", eventFlight, before)
+	}
+	if snapshot := bbr3DecodePacketState(state.controller.transmissionState()).inflight; snapshot != after {
+		t.Fatalf("speculative transmission snapshot = %d, want %d", snapshot, after)
 	}
 }
 

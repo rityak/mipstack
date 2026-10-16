@@ -1398,6 +1398,10 @@ const (
 	// sentTCPSegmentLossReported prevents reporting the current transmission
 	// generation's loss to the congestion controller more than once.
 	sentTCPSegmentLossReported
+	// sentTCPSegmentOriginalLost excludes the original copy from RFC 6675
+	// Pipe across replacement generations. RFC 8985 clears the current
+	// transmission's loss state on retransmission, not the original copy's.
+	sentTCPSegmentOriginalLost
 )
 
 // has reports whether any requested state bit is present.
@@ -3724,6 +3728,15 @@ func (s *tcpEstablishedState) restoreSpuriousRecovery(receivedAt time.Time, ackn
 		*s.eifelRTO = response
 	}
 	s.restoreRecoveryTransportState(acknowledged)
+	if s.undo.timeout {
+		// Linux tcp_try_undo_loss unmarks inferred losses after a spurious RTO.
+		// Published retransmissions remain in flight; subsequent SACK/RACK
+		// feedback can establish fresh loss evidence without replaying the RTO.
+		for index := range s.outstanding {
+			s.outstanding[index].state &^= sentTCPSegmentOriginalLost | sentTCPSegmentRACKLost
+		}
+		s.haveRACKLoss = false
+	}
 	s.undo.spuriousUndos++
 	s.connection.stack.stats.tcpSpuriousRecoveryUndos.Add(1)
 	return true
@@ -7928,7 +7941,11 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		state.frtoState = tcpFRTOInactive
 		state.frtoProbeBudget = 0
 	} else if spuriousRecovery {
-		state.restoreSpuriousRecovery(receivedAt, acknowledgedForUndo)
+		if state.restoreSpuriousRecovery(receivedAt, acknowledgedForUndo) {
+			// RFC 4015 ends the spurious timeout response. Linux likewise
+			// stops RTO loss processing after undo, even for a partial ACK.
+			rtoPartialACK = false
+		}
 	}
 	if state.eifelRTO != nil && state.eifelRTO.observe(ack, rttSample, &state.rtt) {
 		state.eifelRTO = nil
@@ -8592,6 +8609,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if err != nil || blocked {
 			return outputWindow, blocked, err
 		}
+		flightAdded := uint32(0)
+		if state.peerSACK && state.fastRecovery && !oldest.state.has(sentTCPSegmentSACKed|sentTCPSegmentSACKRetried) {
+			flightAdded = oldest.end - oldest.sequence
+		}
 		hostQueue := published.hostQueue
 		transmissionOrder := state.recordTransmission(hostQueue)
 		state.recordRetransmission(oldest.sequence, oldest.end)
@@ -8631,7 +8652,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			}
 			state.armRetransmission()
 		}
-		oldest.delivery = state.controller.onRetransmit(oldest.dataSize(), state.peerMSS, oldest.transmittedAt(c.stack.timestampEpoch), oldest.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+		oldest.delivery = state.controller.onRetransmit(oldest.dataSize(), state.peerMSS, oldest.transmittedAt(c.stack.timestampEpoch), oldest.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), flightAdded, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		oldest.congestionPacketState = state.controller.transmissionState()
 		oldest.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
 		return outputWindow, false, nil
@@ -8674,7 +8695,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		state.tailProbeActive = false
 		state.tailProbeRetransmit = false
 		c.noteRetransmission()
-		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.ordinaryFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.ordinaryFlight(), 0, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		segment.congestionPacketState = state.controller.transmissionState()
 		segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
 		return outputWindow, false, nil
@@ -8737,7 +8758,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			probeSentAt = sentAt
 			segment.advanceTransmissionGeneration()
 			c.noteRetransmission()
-			segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+			segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), 0, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 			segment.congestionPacketState = state.controller.transmissionState()
 			state.tailProbeBytes = segment.dataSize()
 			state.tailProbeState = originalCongestionState
@@ -8844,6 +8865,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if err != nil || blocked {
 			return outputWindow, blocked, err
 		}
+		flightAdded := uint32(0)
+		if state.peerSACK && state.fastRecovery && !segment.state.has(sentTCPSegmentSACKed|sentTCPSegmentSACKRetried) {
+			flightAdded = segment.end - segment.sequence
+		}
 		hostQueue := published.hostQueue
 		transmissionOrder := state.recordTransmission(hostQueue)
 		state.recordRetransmission(segment.sequence, segment.end)
@@ -8863,7 +8888,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		segment.state.set(sentTCPSegmentSACKRetried, true)
 		state.haveRACKLoss = hasRACKLoss(state.outstanding)
 		c.noteRetransmission()
-		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), flightAdded, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		segment.congestionPacketState = state.controller.transmissionState()
 		segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
 		if state.frtoState == tcpFRTOTimeoutPending {
@@ -10753,9 +10778,13 @@ func tcpSACKBlockLimit(mtu int, address netip.Addr, timestamp bool, reservePaylo
 }
 
 // tcpSACKOptions reports retained out-of-order ranges and an optional RFC 2883
-// duplicate range. DSACK occupies the first block; otherwise the range
-// containing the segment that triggered the ACK is first as required by RFC
-// 2018.
+// duplicate range. DSACK occupies the first block; otherwise the retained range
+// containing recent, when present, is first.
+//
+// Under memory pressure, discarded bytes of the triggering segment are not
+// reported, unlike RFC 2018 section 8's newest-segment exception. Linux
+// tcp_data_queue_ofo also omits rejected input; partial pruning here can report
+// only its retained prefix. This avoids separate SACK state for discarded data.
 func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int, dsack TCPSACKBlock, haveDSACK bool, workspace *[34]byte) []byte {
 	if maximumBlocks < 1 {
 		return nil
@@ -11242,10 +11271,14 @@ func sackSegmentLost(outstanding []sentTCPSegment, index, mss int) bool {
 // returns its sequence-space size. A later retransmission starts a new
 // generation that can independently be proven lost.
 func recordTCPSegmentLoss(segment *sentTCPSegment, proven bool) uint32 {
-	if !proven || segment == nil || !segment.isTransmitted() || segment.lossAlreadyReported() {
+	if !proven || segment == nil || !segment.isTransmitted() {
 		return 0
 	}
-	segment.state |= sentTCPSegmentLossReported
+	reported := segment.lossAlreadyReported()
+	segment.state |= sentTCPSegmentOriginalLost | sentTCPSegmentLossReported
+	if reported {
+		return 0
+	}
 	return segment.end - segment.sequence
 }
 
@@ -11274,13 +11307,19 @@ func recordProvenTCPLossesWith(outstanding []sentTCPSegment, mss int, report fun
 		// original transmission and cannot prove that its replacement was lost.
 		// RACK compares transmit times and therefore is direct evidence for the
 		// current replacement generation.
-		lost := segment.state.has(sentTCPSegmentRACKLost) || !segment.state.has(sentTCPSegmentSACKRetried) && (sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss)
-		if lost {
-			bytes := recordTCPSegmentLoss(segment, true)
-			losses = growCongestionWindow(losses, bytes)
-			if bytes != 0 && report != nil {
-				report(segment, bytes)
+		if !segment.state.has(sentTCPSegmentRACKLost) {
+			if sackedRanges < tcpDuplicateACKThreshold && (mss <= 0 || sackedBytes <= (tcpDuplicateACKThreshold-1)*mss) {
+				continue
 			}
+			if segment.state.has(sentTCPSegmentSACKRetried) {
+				segment.state |= sentTCPSegmentOriginalLost
+				continue
+			}
+		}
+		bytes := recordTCPSegmentLoss(segment, true)
+		losses = growCongestionWindow(losses, bytes)
+		if bytes != 0 && report != nil {
+			report(segment, bytes)
 		}
 	}
 	return losses
@@ -11337,9 +11376,10 @@ func tcpACKRTTAmbiguous(outstanding []sentTCPSegment, acknowledgement uint32) bo
 }
 
 // sackRecoveryPipe implements RFC 6675 SetPipe. An unSACKed range not yet
-// considered lost counts its original transmission, while every retransmitted
-// range counts its replacement as well. A speculative retransmission can
-// therefore count twice, exactly as required by SetPipe.
+// considered lost counts its original transmission, while a live replacement
+// contributes separately. RFC 8985 section 9.2 requires accounting for RACK
+// loss when combining the two algorithms. The original loss decision survives
+// retransmission; a speculative retransmission still counts both copies.
 func sackRecoveryPipe(outstanding []sentTCPSegment, mss int) uint32 {
 	var bytes uint32
 	var sackedRanges, sackedBytes int
@@ -11351,7 +11391,7 @@ func sackRecoveryPipe(outstanding []sentTCPSegment, mss int) uint32 {
 			continue
 		}
 		size := segment.end - segment.sequence
-		lost := segment.state.has(sentTCPSegmentRACKLost) || sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss
+		lost := segment.state.has(sentTCPSegmentOriginalLost|sentTCPSegmentRACKLost) || sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss
 		if !lost {
 			bytes = growCongestionWindow(bytes, size)
 		}
@@ -11541,7 +11581,7 @@ func markRACKLoss(outstanding []sentTCPSegment, delivered tcpRACKSample, now tim
 	for index := range outstanding {
 		segment := &outstanding[index]
 		if !segment.state.has(sentTCPSegmentSACKed) && rackDeliveredAfter(delivered, *segment, epoch) && !now.Before(segment.transmittedAt(epoch).Add(delivered.rtt+reorderingWindow)) {
-			segment.state.set(sentTCPSegmentRACKLost, true)
+			segment.state |= sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost
 			segment.state.set(sentTCPSegmentSACKRetried, false)
 		}
 		lost = lost || segment.state.has(sentTCPSegmentRACKLost) && !segment.state.has(sentTCPSegmentSACKRetried)
@@ -11787,10 +11827,7 @@ func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, rece
 		c.outOfOrderUnread.Store(0)
 		return accepted != 0 || closed, closed
 	}
-	if !c.storeTCPOutOfOrder(*receiveNext, receiveWindow, receiveExtra, sequence, payload, owner, fin, outOfOrder, outOfOrderBytes) && tcpSequenceGreater(sequence, *receiveNext) {
-		return false, false
-	}
-	return c.promoteTCPReceived(receiveExtra, receiveNext, outOfOrder, outOfOrderBytes)
+	return c.receiveTCPOutOfOrder(receiveNext, receiveWindow, receiveExtra, sequence, payload, owner, fin, outOfOrder, outOfOrderBytes)
 }
 
 // promoteTCPReceived exposes queued bytes that became deliverable after either
@@ -11799,45 +11836,58 @@ func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, rece
 // queued ranges are promoted.
 func (c *TCPConn) promoteTCPReceived(receiveExtra uint16, receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
 	delivered, remoteClosed := false, false
-	for len(*outOfOrder) != 0 && !remoteClosed {
-		piece := (*outOfOrder)[0]
+	pieces, bytes, next := *outOfOrder, *outOfOrderBytes, *receiveNext
+	head := 0
+	for head < len(pieces) && !remoteClosed {
+		piece := pieces[head]
 		owner := piece.payload
-		if tcpSequenceGreater(piece.sequence, *receiveNext) {
+		if tcpSequenceGreater(piece.sequence, next) {
 			break
 		}
-		*outOfOrder = (*outOfOrder)[1:]
-		*outOfOrderBytes -= len(piece.payload)
+		bytes -= len(piece.payload)
 		pieceFINSequence := piece.sequence + uint32(len(piece.payload))
-		if tcpSequenceLess(piece.sequence, *receiveNext) {
-			skip := *receiveNext - piece.sequence
+		if tcpSequenceLess(piece.sequence, next) {
+			skip := next - piece.sequence
 			if skip < uint32(len(piece.payload)) {
 				piece.payload = piece.payload[skip:]
-				piece.sequence = *receiveNext
+				piece.sequence = next
 			} else {
 				piece.payload = nil
-				piece.sequence = *receiveNext
-				piece.fin = piece.fin && pieceFINSequence == *receiveNext
+				piece.sequence = next
+				piece.fin = piece.fin && pieceFINSequence == next
 			}
 		}
-		accepted := c.appendReadBuffer(piece.payload, owner, *outOfOrderBytes, receiveExtra)
-		*receiveNext += uint32(accepted)
+		// Moving retained bytes does not increase queued payload bytes.
+		// RFC 9293 section 3.10.7.4 gives contiguous text priority;
+		// later OFO ranges must not block it after SetReadBuffer shrinks the bound.
+		accepted := c.appendReadBuffer(piece.payload, owner, 0, receiveExtra)
+		next += uint32(accepted)
 		delivered = delivered || accepted != 0
 		if accepted != len(piece.payload) {
 			remaining := retainTCPPayload(piece.payload[accepted:], owner)
-			*outOfOrder = append([]tcpReceivedPiece{{sequence: *receiveNext, payload: remaining, fin: piece.fin}}, *outOfOrder...)
-			*outOfOrderBytes += len(remaining)
+			pieces[head] = tcpReceivedPiece{sequence: next, payload: remaining, fin: piece.fin}
+			bytes += len(remaining)
 			break
 		}
+		pieces[head] = tcpReceivedPiece{}
+		head++
 		if piece.fin {
-			*receiveNext++
+			next++
 			remoteClosed = true
 		}
 	}
+	pieces = pieces[head:]
 	if remoteClosed {
-		*outOfOrder = nil
-		*outOfOrderBytes = 0
+		for index := range pieces {
+			pieces[index] = tcpReceivedPiece{}
+		}
+		bytes = 0
 	}
-	c.outOfOrderUnread.Store(int64(*outOfOrderBytes))
+	if remoteClosed || len(pieces) == 0 {
+		pieces = nil
+	}
+	*outOfOrder, *outOfOrderBytes, *receiveNext = pieces, bytes, next
+	c.outOfOrderUnread.Store(int64(bytes))
 	return delivered || remoteClosed, remoteClosed
 }
 
@@ -11847,18 +11897,31 @@ type tcpDataFragment struct {
 	payload []byte
 }
 
-// storeTCPOutOfOrder retains only uncovered bytes within the receive window.
-// receiveExtra is the one-quantum remainder already promised on the wire and
-// does not permit a second window extension.
-func (c *TCPConn) storeTCPOutOfOrder(receiveNext, receiveWindow uint32, receiveExtra uint16, sequence uint32, payload, owner []byte, fin bool, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) bool {
-	distance := sequence - receiveNext
-	available := c.receiveAvailable(*outOfOrderBytes)
-	available += int(receiveExtra)
-	if available < 0 {
-		available = 0
+// receiveTCPOutOfOrder retains low-sequence bytes within the receive budget,
+// delivers a contiguous prefix, and bounds the remaining out-of-order pieces.
+// receiveExtra is the one-quantum remainder already promised on the wire,
+// not a new extension.
+func (c *TCPConn) receiveTCPOutOfOrder(receiveNext *uint32, receiveWindow uint32, receiveExtra uint16, sequence uint32, payload, owner []byte, fin bool, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
+	next := *receiveNext
+	distance := sequence - next
+	limit := c.receiveAvailable(0) + int(receiveExtra)
+	if limit < 0 {
+		limit = 0
 	}
 	if distance >= receiveWindow && !(distance == 0 && len(payload) == 0 && fin) {
-		return false
+		if distance == 0 {
+			return c.promoteTCPReceived(receiveExtra, receiveNext, outOfOrder, outOfOrderBytes)
+		}
+		return false, false
+	}
+	if len(*outOfOrder) >= tcpMaximumOutOfOrder && *outOfOrderBytes <= limit && tcpSequenceGreater((*outOfOrder)[0].sequence, next) {
+		last := (*outOfOrder)[len(*outOfOrder)-1]
+		tailEnd := last.sequence + uint32(len(last.payload))
+		// A new highest range cannot fill the first gap or survive metadata
+		// pruning. A FIN exactly at the retained tail can still attach to it.
+		if tcpSequenceGreater(sequence, tailEnd) || sequence == tailEnd && len(payload) != 0 {
+			return false, false
+		}
 	}
 	originalPayloadSize := len(payload)
 	if maximumPayload := int(receiveWindow - distance); len(payload) > maximumPayload {
@@ -11894,7 +11957,7 @@ func (c *TCPConn) storeTCPOutOfOrder(receiveNext, receiveWindow uint32, receiveE
 		start, end := distance, distance+uint32(len(payload))
 		cursor := start
 		for _, existing := range *outOfOrder {
-			existingStart := existing.sequence - receiveNext
+			existingStart := existing.sequence - next
 			existingEnd := existingStart + uint32(len(existing.payload))
 			if existingEnd <= cursor {
 				continue
@@ -11923,45 +11986,73 @@ func (c *TCPConn) storeTCPOutOfOrder(receiveNext, receiveWindow uint32, receiveE
 			fragments = append(fragments, tcpDataFragment{offset: cursor, payload: payload[cursor-start:]})
 		}
 	}
-	addedBytes := 0
-	for _, fragment := range fragments {
-		addedBytes += len(fragment.payload)
-	}
 	upperCount := len(*outOfOrder) + len(fragments)
 	if fin {
 		upperCount++
 	}
-	reuseScoreboard := addedBytes <= available && upperCount <= tcpMaximumOutOfOrder && cap(*outOfOrder) >= upperCount
 	var candidate []tcpReceivedPiece
-	if reuseScoreboard {
+	if cap(*outOfOrder) >= upperCount {
 		candidate = (*outOfOrder)[:len(*outOfOrder)]
+	} else if upperCount > tcpMaximumOutOfOrder {
+		candidate = make([]tcpReceivedPiece, len(*outOfOrder), upperCount)
+		copy(candidate, *outOfOrder)
 	} else {
 		candidate = append([]tcpReceivedPiece(nil), (*outOfOrder)...)
 	}
 	for _, fragment := range fragments {
 		retained := retainTCPPayload(fragment.payload, owner)
-		candidate = append(candidate, tcpReceivedPiece{sequence: receiveNext + fragment.offset, payload: retained})
+		candidate = append(candidate, tcpReceivedPiece{sequence: next + fragment.offset, payload: retained})
 	}
 	if fin {
 		candidate = append(candidate, tcpReceivedPiece{sequence: incomingFINSequence, fin: true})
 	}
-	candidate = normalizeTCPReceivedPieces(receiveNext, candidate)
+	candidate = normalizeTCPReceivedPieces(next, candidate)
 	bytes := 0
 	for _, piece := range candidate {
 		bytes += len(piece.payload)
 	}
-	if bytes > *outOfOrderBytes+available || len(candidate) > tcpMaximumOutOfOrder {
-		if !reuseScoreboard {
-			return false
+	// Like Linux tcp_prune_ofo_queue, prefer low sequence space under memory
+	// pressure so retained high ranges cannot prevent gap filling. RFC 2018
+	// section 8 permits reneging; tcpSACKOptions reports only surviving bytes.
+	for bytes > limit {
+		index := len(candidate) - 1
+		piece := &candidate[index]
+		size := len(piece.payload)
+		if excess := bytes - limit; size > excess {
+			owner := piece.payload
+			piece.payload = retainTCPPayload(owner[:size-excess], owner)
+			piece.fin = false
+			bytes = limit
+			break
 		}
+		bytes -= size
+		*piece = tcpReceivedPiece{}
+		candidate = candidate[:index]
 	}
 	*outOfOrder, *outOfOrderBytes = candidate, bytes
-	c.outOfOrderUnread.Store(int64(bytes))
-	return len(fragments) != 0 || fin
+	// RFC 9293 section 3.10.7.4 advances RCV.NXT through contiguous text.
+	// Deliverable pieces do not consume the remaining OFO metadata budget.
+	delivered, closed := c.promoteTCPReceived(receiveExtra, receiveNext, outOfOrder, outOfOrderBytes)
+	if len(*outOfOrder) > tcpMaximumOutOfOrder {
+		for index := tcpMaximumOutOfOrder; index < len(*outOfOrder); index++ {
+			*outOfOrderBytes -= len((*outOfOrder)[index].payload)
+			(*outOfOrder)[index] = tcpReceivedPiece{}
+		}
+		*outOfOrder = (*outOfOrder)[:tcpMaximumOutOfOrder]
+		c.outOfOrderUnread.Store(int64(*outOfOrderBytes))
+	}
+	// A large gap-filling segment can temporarily split every retained range.
+	// Do not keep that expanded workspace behind the bounded surviving queue.
+	if cap(candidate) > tcpMaximumOutOfOrder && len(*outOfOrder) != 0 {
+		retained := make([]tcpReceivedPiece, len(*outOfOrder))
+		copy(retained, *outOfOrder)
+		*outOfOrder = retained
+	}
+	return delivered, closed
 }
 
-// normalizeTCPReceivedPieces sorts, merges, and truncates ranges at the first
-// accepted FIN.
+// normalizeTCPReceivedPieces sorts, removes overlaps, and truncates ranges at
+// the first accepted FIN.
 func normalizeTCPReceivedPieces(receiveNext uint32, pieces []tcpReceivedPiece) []tcpReceivedPiece {
 	sort.SliceStable(pieces, func(left, right int) bool {
 		leftOffset, rightOffset := pieces[left].sequence-receiveNext, pieces[right].sequence-receiveNext

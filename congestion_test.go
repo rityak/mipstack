@@ -108,7 +108,7 @@ func TestCongestionControllerComposesPacingWithoutDeliverySampling(t *testing.T)
 		t.Fatalf("custom pacing delay = %v, want 7ms", delay)
 	}
 	_, _ = controller.onDataSend(1000, 1000, time.Unix(100, 0), 1, 0, 10_000, 0, time.Millisecond, 20_000)
-	_ = controller.onRetransmit(1000, 1000, time.Unix(100, 0), 1, 10_000, 0, 1000, time.Millisecond, 20_000)
+	_ = controller.onRetransmit(1000, 1000, time.Unix(100, 0), 1, 10_000, 0, 0, 1000, time.Millisecond, 20_000)
 	if implementation.dataEvents != 1 || implementation.pacedSends != 1 || implementation.retransmits != 1 {
 		t.Fatalf("pacing callbacks = event %d send %d retransmit %d, want 1/1/1", implementation.dataEvents, implementation.pacedSends, implementation.retransmits)
 	}

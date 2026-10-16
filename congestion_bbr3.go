@@ -902,8 +902,6 @@ func (b *bbr3CongestionControl) updateMinimumRTT(window uint32, sample *tcpDeliv
 		if window < b.priorWindow {
 			window = b.priorWindow
 		}
-		b.bandwidthLow = 0
-		b.inflightLow = 0
 		b.exitProbeRTT(sample.ackTime)
 	}
 	return window
@@ -911,6 +909,10 @@ func (b *bbr3CongestionControl) updateMinimumRTT(window uint32, sample *tcpDeliv
 
 // exitProbeRTT restores Startup or ProbeBW after the measurement interval.
 func (b *bbr3CongestionControl) exitProbeRTT(now time.Time) {
+	// Linux BBRv3 bbr_exit_probe_rtt resets lower bounds before resuming
+	// Startup or ProbeBW, including an exit on idle restart.
+	b.bandwidthLow = 0
+	b.inflightLow = 0
 	if b.fullBandwidthReached {
 		b.mode = bbrProbeBandwidth
 		b.enterProbePhase(bbr3ProbeDown, now)

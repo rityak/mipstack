@@ -686,7 +686,7 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 		t.Fatalf("first loss = state %d bytes %d total %d", recorder.lostState, recorder.lostBytes, recorder.totalLost)
 	}
 	segment.congestionPacketState = 0
-	segment.delivery = controller.onRetransmit(1000, 1000, now.Add(time.Millisecond), 3, 20_000, 1000, 1000, 20*time.Millisecond, 40_000)
+	segment.delivery = controller.onRetransmit(1000, 1000, now.Add(time.Millisecond), 3, 20_000, 1000, 0, 1000, 20*time.Millisecond, 40_000)
 	segment.congestionPacketState = controller.transmissionState()
 	if segment.congestionPacketState != 2 {
 		t.Fatalf("retransmission packet state = %d, want 2", segment.congestionPacketState)
@@ -703,6 +703,36 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 	controller.onTailLossProbeRecovered(now.Add(3*time.Millisecond), 1000, segment.congestionPacketState, 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
 	if !recorder.tailRecovered {
 		t.Fatal("tail-loss-probe recovery event was not delivered")
+	}
+}
+
+func TestCongestionRetransmissionUsesPrePublicationFlight(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		flightAdded uint32
+		bytes       int
+	}{
+		{name: "first replacement", flightAdded: 1000, bytes: 1000},
+		{name: "repeated replacement", bytes: 1000},
+		{name: "FIN", flightAdded: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			implementation := &congestionAPIRecorder{}
+			controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+				Name: "test-transmission-flight", Features: CongestionControlFeatureTransmissionEvents,
+				New: func(CongestionControlContext) CongestionController { return implementation },
+			})
+			now := time.Unix(100, 0)
+			controller.initialize(CongestionPhaseRecovery, now, 10*time.Millisecond, 10*time.Millisecond, 1000, 1000, 1000, 1)
+			controller.pacingSegments = tcpPacingInitialBurst - 1
+			controller.onRetransmit(test.bytes, 1000, now, 1, 1000, 20_000, test.flightAdded, 20_000, 10*time.Millisecond, 1000)
+			if controller.state.BytesInFlight != 20_000-test.flightAdded {
+				t.Fatalf("transmission flight = %d, want %d", controller.state.BytesInFlight, 20_000-test.flightAdded)
+			}
+			if test.bytes != 0 && controller.pacingRate != windowPacingRate(1000, 20_000, 10*time.Millisecond, 1000) {
+				t.Fatalf("pacer used pre-publication flight: rate %g", controller.pacingRate)
+			}
+		})
 	}
 }
 
@@ -733,7 +763,7 @@ func TestCongestionLossEvidenceAfterSACKReneging(t *testing.T) {
 				t.Fatalf("old generation = evidence:%t state:%d lost:%d", recorder.lossEvidence, recorder.lostState, recorder.totalLost)
 			}
 			segment.advanceTransmissionGeneration()
-			segment.delivery = controller.onRetransmit(mss, mss, now.Add(2*time.Millisecond), monotonicStamp(2*time.Millisecond)+1, 20_000, mss, mss, time.Millisecond, 40_000)
+			segment.delivery = controller.onRetransmit(mss, mss, now.Add(2*time.Millisecond), monotonicStamp(2*time.Millisecond)+1, 20_000, mss, 0, mss, time.Millisecond, 40_000)
 			segment.congestionPacketState = controller.transmissionState()
 			controller.notePacketLoss(&segment, recordTCPSegmentLoss(&segment, true), duringACK, true, now.Add(3*time.Millisecond), 20_000, 40_000, mss, mss, time.Millisecond)
 			if !recorder.lossEvidence || recorder.lostState != 2 || recorder.totalLost != 2*mss {
@@ -1060,7 +1090,7 @@ func TestCongestionControllerSkipsOptionalEventFamilies(t *testing.T) {
 	start := time.Unix(100, 0)
 	controller.initialize(CongestionPhaseOpen, start, 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
 	_, _ = controller.onDataSend(1000, 1000, start, 2, 0, 20_000, 0, 20*time.Millisecond, 10_000)
-	_ = controller.onRetransmit(1000, 1000, start, 3, 20_000, 1000, 1000, 20*time.Millisecond, 10_000)
+	_ = controller.onRetransmit(1000, 1000, start, 3, 20_000, 1000, 0, 1000, 20*time.Millisecond, 10_000)
 	controller.checkpointRecovery(start, 20_000, 10_000, 10_000, 1000)
 	if flight := controller.recoveryFlight(start, 10_000, 8000); flight != 8000 {
 		t.Fatalf("default recovery flight = %d, want 8000", flight)

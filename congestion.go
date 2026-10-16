@@ -583,8 +583,10 @@ func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stam
 
 // onRetransmit advances only the pacing clock and delivery snapshot. Loss
 // recovery must not treat a retransmission as new application data or a new
-// congestion-avoidance epoch.
-func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, stamp monotonicStamp, window, flight, packetsOut uint32, smoothedRTT time.Duration, slowStartThreshold uint32) tcpDeliverySnapshot {
+// congestion-avoidance epoch. flightAdded is the sequence space newly added to
+// flight by this publication; the packet event observes flight before that
+// addition while the common pacer observes the published flight.
+func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, stamp monotonicStamp, window, flight, flightAdded, packetsOut uint32, smoothedRTT time.Duration, slowStartThreshold uint32) tcpDeliverySnapshot {
 	snapshot := tcpDeliverySnapshot{}
 	c.packetState = 0
 	if c.usesDeliveryRate() {
@@ -592,7 +594,10 @@ func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, st
 	}
 	if c.usesTransmissionEvents() {
 		c.state.CongestionWindow = window
-		c.state.BytesInFlight = flight
+		// Linux tcp_rate_skb_sent captures flight before adding retrans_out.
+		// Controllers add PacketBytes when forming the new transmission's
+		// snapshot, just as they do for an original transmission.
+		c.state.BytesInFlight = flight - flightAdded
 		event := c.prepareEvent(CongestionEventPacketRetransmitted, now)
 		event.PacketBytes = bytes
 		event.OutstandingBytes = packetsOut
