@@ -1928,8 +1928,9 @@ func (h *tcpRetransmissionHistory) match(block TCPSACKBlock) (bool, bool) {
 }
 
 // tcpRACKSample identifies the newest transmission known to have been
-// delivered. order supplements RFC 8985's sequence tie-break when a coarse
-// clock gives a later retransmission the same timestamp as its original flight.
+// delivered and tracks the latest valid delivery RTT independently. order
+// supplements RFC 8985's sequence tie-break when a coarse clock gives a later
+// retransmission the same timestamp as its original flight.
 type tcpRACKSample struct {
 	sentAt        time.Time
 	end           uint32
@@ -2710,14 +2711,6 @@ func (s *tcpEstablishedState) ageRACKReordering() {
 	s.rackReorderPersist--
 	if s.rackReorderPersist == 0 {
 		s.rackReorderingScale = 1
-	}
-}
-
-// observeRACKReordering records forward-ACK evidence that retransmission
-// reordering has occurred.
-func (s *tcpEstablishedState) observeRACKReordering(end uint32, retransmitted bool) {
-	if rackAdvanceForwardACK(&s.rackForwardACK, &s.rackForwardACKSet, end, retransmitted) {
-		s.rackReorderingSeen = true
 	}
 }
 
@@ -7700,6 +7693,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	newlyDelivered := uint32(0)
 	acknowledgedForUndo := uint32(0)
 	rttSample := time.Duration(0)
+	rackRTT := time.Duration(0)
 	sampledRTT := false
 	partialCumulativeACK := false
 	rtoPartialACK := false
@@ -7719,7 +7713,6 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		} else {
 			*state.deliverySample = tcpDeliveryRateSample{}
 		}
-		state.deliverySample.ackTime = receivedAt
 	}
 	// An active CWR point is at or ahead of SND.UNA. recoveryPhaseAt clears
 	// an already acknowledged phase when undo restores an older episode, so
@@ -7814,14 +7807,20 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				state.sackedRanges--
 				state.sackedBytes -= oldest.end - oldest.sequence
 			} else {
-				state.observeRACKReordering(oldest.end, oldest.isRetransmitted())
+				if rackAdvanceForwardACK(&state.rackForwardACK, &state.rackForwardACKSet, oldest.end, oldest.isRetransmitted()) {
+					state.rackReorderingSeen = true
+				}
+				rackRTT = state.observeRACKDelivery(state.outstanding[:1], ack, segment, receivedAt, timestampEcho, rackRTT)
 			}
-			transmittedAt := oldest.transmittedAt(c.stack.timestampEpoch)
-			candidate := tcpRACKSample{sentAt: transmittedAt, end: oldest.end, order: oldest.transmissionOrder, rtt: elapsedRTTSampleAt(transmittedAt, receivedAt), timestamp: oldest.timestamp, retransmitted: oldest.isRetransmitted()}
-			state.rackLatestDelivered = newerRACKSample(state.rackLatestDelivered, validRACKSample(candidate, state.rtt.minimum, timestampEcho))
 			if !sampledRTT && !ambiguousRTT && !oldest.isRetransmitted() {
-				rttSample = elapsedRTTSampleAt(transmittedAt, receivedAt)
-				state.rtt.observeAt(rttSample, monotonicStampAt(c.stack.timestampEpoch, receivedAt))
+				observedAt := monotonicStampAt(c.stack.timestampEpoch, receivedAt)
+				if oldest.hostQueue.queuedAt != 0 {
+					rttSample = time.Duration(observedAt - oldest.hostQueue.queuedAt)
+					if rttSample < time.Microsecond {
+						rttSample = time.Microsecond
+					}
+				}
+				state.rtt.observeAt(rttSample, observedAt)
 				sampledRTT = true
 			}
 			if oldest.flags&TCPFlagFIN != 0 {
@@ -7850,11 +7849,11 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			if state.outstanding[0].state.has(sentTCPSegmentSACKed) {
 				state.sackedBytes -= ack - state.outstanding[0].sequence
 			} else {
-				state.observeRACKReordering(ack, state.outstanding[0].isRetransmitted())
+				if rackAdvanceForwardACK(&state.rackForwardACK, &state.rackForwardACKSet, ack, state.outstanding[0].isRetransmitted()) {
+					state.rackReorderingSeen = true
+				}
+				rackRTT = state.observeRACKDelivery(state.outstanding[:1], ack, segment, receivedAt, timestampEcho, rackRTT)
 			}
-			transmittedAt := state.outstanding[0].transmittedAt(c.stack.timestampEpoch)
-			candidate := tcpRACKSample{sentAt: transmittedAt, end: ack, order: state.outstanding[0].transmissionOrder, rtt: elapsedRTTSampleAt(transmittedAt, receivedAt), timestamp: state.outstanding[0].timestamp, retransmitted: state.outstanding[0].isRetransmitted()}
-			state.rackLatestDelivered = newerRACKSample(state.rackLatestDelivered, validRACKSample(candidate, state.rtt.minimum, timestampEcho))
 			trimAcknowledgedTCPSegment(&state.outstanding[0], ack)
 		}
 		// A cumulative ACK that stops at data previously reported as SACKed
@@ -8021,41 +8020,39 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	frtoOriginalDelivered := false
 	if state.peerSACK && len(state.outstanding) != 0 {
 		blocks := parseTCPSACKOptions(segment.optionBytes(), state.sendUnacknowledged, state.sendNext)
-		var latestSACK tcpRACKSample
-		var newlySACKed []sentTCPSegment
-		var earliestSACK time.Time
 		if len(blocks) != 0 {
+			var newlySACKed []sentTCPSegment
+			var earliestSACK time.Time
 			state.compactOutstanding()
-			state.outstanding, highestSACK, hasSACK, newSACKInfo, latestSACK, newlySACKed = applyTCPSACK(state.outstanding, blocks, c.stack.timestampEpoch)
+			state.outstanding, highestSACK, hasSACK, newSACKInfo, newlySACKed = applyTCPSACK(state.outstanding, blocks)
 			state.rebaseOutstanding()
-		}
-		if hasSACK {
 			state.recountSACK()
-		}
-		for _, candidate := range newlySACKed {
-			newlyDelivered = growCongestionWindow(newlyDelivered, candidate.end-candidate.sequence)
-			if deliveryACK {
-				state.deliverySample.observe(candidate)
-			}
-			if !candidate.isRetransmitted() {
-				if state.frtoState != tcpFRTOInactive && tcpSequenceLess(candidate.sequence, state.rtoRecoveryPoint) {
-					frtoOriginalDelivered = true
+			for _, candidate := range newlySACKed {
+				newlyDelivered = growCongestionWindow(newlyDelivered, candidate.end-candidate.sequence)
+				if deliveryACK {
+					state.deliverySample.observe(candidate)
 				}
-				sentAt := candidate.transmittedAt(c.stack.timestampEpoch)
-				if earliestSACK.IsZero() || sentAt.Before(earliestSACK) {
-					earliestSACK = sentAt
+				if !candidate.isRetransmitted() {
+					if state.frtoState != tcpFRTOInactive && tcpSequenceLess(candidate.sequence, state.rtoRecoveryPoint) {
+						frtoOriginalDelivered = true
+					}
+					sentAt := candidate.transmittedAt(c.stack.timestampEpoch)
+					if earliestSACK.IsZero() || sentAt.Before(earliestSACK) {
+						earliestSACK = sentAt
+					}
+				}
+				if rackAdvanceForwardACK(&state.rackForwardACK, &state.rackForwardACKSet, candidate.end, candidate.isRetransmitted()) {
+					state.rackReorderingSeen = true
 				}
 			}
-			state.observeRACKReordering(candidate.end, candidate.isRetransmitted())
-		}
-		if !sampledRTT && !earliestSACK.IsZero() {
-			rttSample = elapsedRTTSampleAt(earliestSACK, receivedAt)
-			state.rtt.observeAt(rttSample, monotonicStampAt(c.stack.timestampEpoch, receivedAt))
-			sampledRTT = true
-		}
-		if !latestSACK.sentAt.IsZero() {
-			latestSACK.rtt = elapsedRTTSampleAt(latestSACK.sentAt, receivedAt)
-			state.rackLatestDelivered = newerRACKSample(state.rackLatestDelivered, validRACKSample(latestSACK, state.rtt.minimum, timestampEcho))
+			if !sampledRTT && !earliestSACK.IsZero() {
+				rttSample = elapsedRTTSampleAt(earliestSACK, receivedAt)
+				state.rtt.observeAt(rttSample, monotonicStampAt(c.stack.timestampEpoch, receivedAt))
+				sampledRTT = true
+			}
+			if len(newlySACKed) != 0 {
+				state.observeRACKDelivery(newlySACKed, state.sendNext, segment, receivedAt, timestampEcho, rackRTT)
+			}
 		}
 	}
 	if state.tailProbeActive && state.tailProbeRetransmit && !ackAdvanced && ack == state.tailProbeEnd && previousWindow == state.peerWindow && !hasSACK && len(segment.payload) == 0 && segment.flags&TCPFlagFIN == 0 {
@@ -11170,6 +11167,9 @@ func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32)
 // parseTCPSACKOptions validates and merges ordinary SACK ranges within the
 // current send window. The distinguished DSACK block is handled separately.
 func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []TCPSACKBlock {
+	if len(options) == 0 {
+		return nil
+	}
 	window := sendNext - acknowledged
 	var blocks []TCPSACKBlock
 	for offset := 0; offset < len(options); {
@@ -11219,13 +11219,10 @@ func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []TCPSAC
 }
 
 // applyTCPSACK splits transmissions at SACK boundaries, marks exact covered
-// ranges, and returns the newest delivery information used by RACK. epoch must
-// be the owning stack's timestamp epoch so compact host-queue stamps reconstruct
-// to the transmission times compared by RACK.
-func applyTCPSACK(outstanding []sentTCPSegment, blocks []TCPSACKBlock, epoch time.Time) ([]sentTCPSegment, uint32, bool, bool, tcpRACKSample, []sentTCPSegment) {
+// ranges, and returns newly delivered ranges with their transmission metadata.
+func applyTCPSACK(outstanding []sentTCPSegment, blocks []TCPSACKBlock) ([]sentTCPSegment, uint32, bool, bool, []sentTCPSegment) {
 	var highest uint32
 	var newInformation bool
-	var latest tcpRACKSample
 	var newlySACKed []sentTCPSegment
 	for blockIndex, block := range blocks {
 		if blockIndex == 0 || tcpSequenceGreater(block.RightEdge, highest) {
@@ -11244,7 +11241,6 @@ func applyTCPSACK(outstanding []sentTCPSegment, blocks []TCPSACKBlock, epoch tim
 					// its SACKed state separately tells BBR3 not to use this
 					// generation as probe-loss evidence.
 					newlySACKed = append(newlySACKed, candidate)
-					latest = newerRACKSample(latest, tcpRACKSample{sentAt: segment.transmittedAt(epoch), end: segment.end, order: segment.transmissionOrder, timestamp: segment.timestamp, retransmitted: segment.isRetransmitted()})
 					// A range contributes delivery-rate metadata only on its first
 					// SACK or cumulative ACK, matching tcp_rate_skb_delivered.
 					segment.delivery.deliveredStamp = 0
@@ -11253,7 +11249,7 @@ func applyTCPSACK(outstanding []sentTCPSegment, blocks []TCPSACKBlock, epoch tim
 			}
 		}
 	}
-	return outstanding, highest, len(blocks) != 0, newInformation, latest, newlySACKed
+	return outstanding, highest, len(blocks) != 0, newInformation, newlySACKed
 }
 
 // splitTCPSegmentAt makes the SACK scoreboard byte-accurate when a peer's
@@ -11652,44 +11648,77 @@ func tcpClockTieTransmissionAfter(order, end, previousOrder, previousEnd uint32)
 	return tcpSequenceGreater(end, previousEnd)
 }
 
-// newerRACKSample returns the later transmission under RFC 8985's transmit
-// time ordering. Exact publication order disambiguates a coarse-clock tie,
-// including a later low-sequence retransmission.
-func newerRACKSample(current, candidate tcpRACKSample) tcpRACKSample {
-	if candidate.sentAt.IsZero() {
-		return current
+// observeRACKDelivery updates RFC 8985 section 6.2's delivery RTT and latest
+// transmission from newly delivered ranges. end caps a partial cumulative ACK;
+// SACK callers use SND.NXT after updating min_RTT. Queue and arrival stamps
+// share the stack epoch; only the selected transmission needs a time.Time value.
+// ackRTT accumulates valid delivery RTTs across this ACK's cumulative and SACK
+// ranges, independently of the newest transmission retained from prior ACKs.
+func (state *tcpEstablishedState) observeRACKDelivery(delivered []sentTCPSegment, end uint32, ack *tcpSegment, eventAt time.Time, timestampEcho uint32, ackRTT time.Duration) time.Duration {
+	// RACK needs the ACK's actual arrival, not the actor's monotonic event
+	// clock: a queued ACK cannot prove delivery of a later retransmission.
+	epoch := state.connection.stack.timestampEpoch
+	receivedAt := ack.receivedAt
+	if receivedAt == 0 {
+		receivedAt = monotonicStampAt(epoch, eventAt)
 	}
-	if candidate.sentAt.After(current.sentAt) || candidate.sentAt.Equal(current.sentAt) && tcpClockTieTransmissionAfter(candidate.order, candidate.end, current.order, current.end) {
-		return candidate
-	}
-	return current
-}
-
-// validRACKSample applies RFC 8985's fallback ambiguity check for a
-// retransmitted segment. Without proof from a timestamp echo, an RTT below
-// min_RTT can belong to the original transmission and must not advance RACK.
-func validRACKSample(sample tcpRACKSample, minimumRTT time.Duration, timestampEcho uint32) tcpRACKSample {
-	if sample.retransmitted {
-		// RFC 8985 rejects a delivery sample when TSecr identifies an older
-		// copy than the latest retransmission. The min-RTT check remains
-		// necessary when timestamps are absent or coarser than the path RTT.
-		if sample.timestamp != 0 && timestampEcho != 0 && tcpSequenceLess(timestampEcho, sample.timestamp) {
-			return tcpRACKSample{}
+	current := &state.rackLatestDelivered
+	latestAt := monotonicStampAt(epoch, current.sentAt)
+	updated := false
+	for index := range delivered {
+		segment := &delivered[index]
+		sentAt := segment.hostQueue.queuedAt
+		if sentAt == 0 {
+			continue
 		}
-		if minimumRTT > 0 && sample.rtt < minimumRTT {
-			return tcpRACKSample{}
+		rtt := time.Duration(receivedAt - sentAt)
+		if rtt < 0 {
+			continue
 		}
+		if rtt < time.Microsecond {
+			rtt = time.Microsecond
+		}
+		if segment.isRetransmitted() {
+			// RFC 8985 rejects an older TSecr. Linux also retains the min_RTT
+			// check to avoid crediting an earlier copy as the retransmission.
+			if segment.timestamp != 0 && timestampEcho != 0 && tcpSequenceLess(timestampEcho, segment.timestamp) || state.rtt.minimum > 0 && rtt < state.rtt.minimum {
+				continue
+			}
+		}
+		// RFC 8985 section 6.2 visits this ACK's deliveries in transmit-time
+		// order. Their minimum RTT selects the same final sample without
+		// sorting; a later ACK can still refresh RTT from an older transmission.
+		if ackRTT == 0 || rtt < ackRTT {
+			ackRTT = rtt
+			current.rtt = rtt
+		}
+		candidateEnd := segment.end
+		if tcpSequenceLess(end, candidateEnd) {
+			candidateEnd = end
+		}
+		if sentAt < latestAt || sentAt == latestAt && !tcpClockTieTransmissionAfter(segment.transmissionOrder, candidateEnd, current.order, current.end) {
+			continue
+		}
+		latestAt = sentAt
+		current.end = candidateEnd
+		current.order = segment.transmissionOrder
+		current.timestamp = segment.timestamp
+		current.retransmitted = segment.isRetransmitted()
+		updated = true
 	}
-	return sample
+	if updated {
+		current.sentAt = latestAt.time(epoch)
+	}
+	return ackRTT
 }
 
 // rackDeliveredAfter reports whether delivered was transmitted after segment.
 // A later ACK alone is insufficient: RACK compares transmit order so reordered
-// acknowledgements cannot declare a newer transmission lost. epoch is the
-// owning stack's timestamp epoch for the segment's compact queue stamp.
-func rackDeliveredAfter(delivered tcpRACKSample, segment sentTCPSegment, epoch time.Time) bool {
-	transmittedAt := segment.transmittedAt(epoch)
-	return delivered.sentAt.After(transmittedAt) || delivered.sentAt.Equal(transmittedAt) && tcpClockTieTransmissionAfter(delivered.order, delivered.end, segment.transmissionOrder, segment.end)
+// acknowledgements cannot declare a newer transmission lost. Both stamps use
+// the owning stack's timestamp epoch.
+func rackDeliveredAfter(deliveredAt monotonicStamp, end, order uint32, segment sentTCPSegment) bool {
+	transmittedAt := segment.hostQueue.queuedAt
+	return deliveredAt > transmittedAt || deliveredAt == transmittedAt && tcpClockTieTransmissionAfter(order, end, segment.transmissionOrder, segment.end)
 }
 
 // rackAdvanceForwardACK updates RFC 8985's highest newly delivered sequence
@@ -11703,21 +11732,23 @@ func rackAdvanceForwardACK(forward *uint32, set *bool, end uint32, retransmitted
 }
 
 // rackLossDelay returns RFC 8985's maximum remaining reordering wait across
-// eligible transmissions. Linux measures each threshold as the latest
-// delivered transmission's RTT plus reo_wnd minus the candidate's current age.
-// epoch is the owning stack's timestamp epoch for candidate transmission times.
+// eligible transmissions. Linux measures each threshold as the latest valid
+// delivery RTT plus reo_wnd minus the candidate's current age.
+// epoch is the owning stack's timestamp epoch shared by the queue stamps.
 func rackLossDelay(outstanding []sentTCPSegment, delivered tcpRACKSample, now time.Time, reorderingWindow time.Duration, epoch time.Time) (time.Duration, bool) {
 	var maximum time.Duration
 	found := false
+	deliveredAt := monotonicStampAt(epoch, delivered.sentAt)
+	cutoff := now.Sub(epoch) - delivered.rtt - reorderingWindow
 	for _, segment := range outstanding {
 		// A range already declared lost waits for cwnd-Pipe space or the
 		// ordinary RTO. Re-arming its expired reordering deadline would spin
 		// the actor while recovery is congestion-window limited.
-		if segment.state.has(sentTCPSegmentSACKed) || segment.state.has(sentTCPSegmentRACKLost) || !rackDeliveredAfter(delivered, segment, epoch) {
+		if segment.state.has(sentTCPSegmentSACKed) || segment.state.has(sentTCPSegmentRACKLost) || !rackDeliveredAfter(deliveredAt, delivered.end, delivered.order, segment) {
 			continue
 		}
-		remaining := segment.transmittedAt(epoch).Add(delivered.rtt + reorderingWindow).Sub(now)
-		if remaining < 0 {
+		remaining := time.Duration(segment.hostQueue.queuedAt-1) - cutoff
+		if segment.hostQueue.queuedAt == 0 || remaining < 0 {
 			remaining = 0
 		}
 		if !found || remaining > maximum {
@@ -11730,14 +11761,16 @@ func rackLossDelay(outstanding []sentTCPSegment, delivered tcpRACKSample, now ti
 // markRACKLoss records eligible transmissions whose reordering wait expired.
 // A retransmission can itself be lost; clearing its SACK-recovery retry marker
 // makes that range eligible for another recovery transmission instead of
-// deferring it to RTO. epoch is the owning stack's timestamp epoch used to
-// reconstruct candidate transmission times.
+// deferring it to RTO. epoch is the owning stack's timestamp epoch shared by
+// the queue stamps. The cutoff may precede that epoch.
 // The result reports whether any timed loss remains eligible.
 func markRACKLoss(outstanding []sentTCPSegment, delivered tcpRACKSample, now time.Time, reorderingWindow time.Duration, epoch time.Time) bool {
 	lost := false
+	deliveredAt := monotonicStampAt(epoch, delivered.sentAt)
+	cutoff := now.Sub(epoch) - delivered.rtt - reorderingWindow
 	for index := range outstanding {
 		segment := &outstanding[index]
-		if !segment.state.has(sentTCPSegmentSACKed) && rackDeliveredAfter(delivered, *segment, epoch) && !now.Before(segment.transmittedAt(epoch).Add(delivered.rtt+reorderingWindow)) {
+		if !segment.state.has(sentTCPSegmentSACKed) && rackDeliveredAfter(deliveredAt, delivered.end, delivered.order, *segment) && (segment.hostQueue.queuedAt == 0 || time.Duration(segment.hostQueue.queuedAt-1) <= cutoff) {
 			segment.state |= sentTCPSegmentRACKLost
 			segment.state.set(sentTCPSegmentSACKRetried, false)
 		}

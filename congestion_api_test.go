@@ -879,7 +879,7 @@ func TestCongestionLossEvidenceAfterSACKReneging(t *testing.T) {
 			snapshot, _ := controller.onDataSend(mss, mss, now, 1, 0, 20_000, 0, 0, time.Millisecond, 40_000)
 			segment := sentTCPSegment{sequence: 100, end: 100 + mss, state: sentTCPSegmentTransmitted,
 				delivery: snapshot, congestionPacketState: controller.transmissionState()}
-			outstanding, _, _, _, _, _ := applyTCPSACK([]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 100 + mss}}, now)
+			outstanding, _, _, _, _ := applyTCPSACK([]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 100 + mss}})
 			segment = outstanding[0]
 			if segment.delivery.deliveredStamp != 0 {
 				t.Fatal("SACK did not consume the delivery snapshot")

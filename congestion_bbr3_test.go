@@ -640,8 +640,8 @@ func TestTCPSACKPreservesCongestionTransmissionState(t *testing.T) {
 		state:                 sentTCPSegmentInitialState(false, false, false, false),
 		congestionPacketState: 0x1234,
 	}
-	outstanding, _, _, newInformation, _, newlySACKed := applyTCPSACK(
-		[]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}}, time.Time{},
+	outstanding, _, _, newInformation, newlySACKed := applyTCPSACK(
+		[]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}},
 	)
 	if !newInformation || len(outstanding) != 1 {
 		t.Fatalf("SACK application = information %t ranges %d", newInformation, len(outstanding))
@@ -1369,6 +1369,125 @@ func TestBBR3RecoveryUndoOnlyWidensBounds(t *testing.T) {
 			bbr.undoRecovery(time.Unix(100, 0))
 			if bbr.bandwidthLow != float64(test.want) || bbr.inflightLow != test.want || bbr.inflightHigh != test.want {
 				t.Fatalf("undo bounds = %v/%d/%d, want %d", bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh, test.want)
+			}
+		})
+	}
+}
+
+func TestBBR3RecoveryUndoBoundsWindow(t *testing.T) {
+	for _, test := range []struct {
+		name                              string
+		mode                              bbrMode
+		phase                             bbr3ProbePhase
+		exit                              bbr3UndoState
+		savedHigh, liveHigh, wantHigh     uint32
+		savedLow, liveLow, wantLow        uint32
+		priorWindow, proposed, wantWindow uint32
+		wantMode                          bbrMode
+		wantPhase                         bbr3ProbePhase
+	}{
+		{name: "Cruise restored bound", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 20000, proposed: 4000, wantWindow: 17032, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise wider live bound", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 24000, wantHigh: 24000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise saved unlimited", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			liveHigh: 12000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise live unlimited", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise short-term bound", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, savedLow: 10000, liveLow: 6000, wantLow: 10000,
+			priorWindow: 20000, proposed: 4000, wantWindow: 10000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise minimum cap", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 2000, liveHigh: 1000, wantHigh: 2000, savedLow: 1000, liveLow: 500, wantLow: 1000,
+			priorWindow: 20000, proposed: 4000, wantWindow: 4000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise one MSS headroom", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 6000, liveHigh: 5000, wantHigh: 6000, priorWindow: 6000, proposed: 4000, wantWindow: 5000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise smaller restored window", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 4000, proposed: 6000, wantWindow: 6000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Down", mode: bbrProbeBandwidth, phase: bbr3ProbeDown,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 24000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeDown},
+		{name: "Up", mode: bbrProbeBandwidth, phase: bbr3ProbeUp,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 24000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeUp},
+		{name: "Refill after probe undo", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise, exit: bbr3UndoProbeUp,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, savedLow: 10000, liveLow: 6000,
+			priorWindow: 24000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeRefill},
+		{name: "Startup after loss undo", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise, exit: bbr3UndoStartup,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 24000, proposed: 4000, wantWindow: 24000, wantMode: bbrStartup, wantPhase: bbr3ProbeCruise},
+		{name: "Startup short-term bound", mode: bbrStartup,
+			savedHigh: 6000, liveHigh: 5000, wantHigh: 6000, savedLow: 10000, liveLow: 6000, wantLow: 10000,
+			priorWindow: 20000, proposed: 4000, wantWindow: 10000, wantMode: bbrStartup},
+		{name: "Drain", mode: bbrDrain,
+			savedHigh: 6000, liveHigh: 5000, wantHigh: 6000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrDrain},
+		{name: "ProbeRTT target", mode: bbrProbeRTT, phase: bbr3ProbeCruise, exit: bbr3UndoProbeUp,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 20000, proposed: 4000, wantWindow: 5000, wantMode: bbrProbeRTT, wantPhase: bbr3ProbeCruise},
+		{name: "ProbeRTT model bound", mode: bbrProbeRTT, phase: bbr3ProbeCruise,
+			savedHigh: 2000, liveHigh: 1000, wantHigh: 2000, priorWindow: 20000, proposed: 4000, wantWindow: 4000, wantMode: bbrProbeRTT, wantPhase: bbr3ProbeCruise},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			bbr := newBBR3CongestionControl()
+			bbr.inflightHigh, bbr.inflightLow = test.savedHigh, test.savedLow
+			bbr.minimumRTT, bbr.bandwidthHigh[1] = 10*time.Millisecond, 1000000
+			bbr.fullBandwidthReached = true
+			state := CongestionState{CongestionWindow: test.priorWindow, MaximumSegmentSize: 1000, SmoothedRTT: 20 * time.Millisecond}
+			event := CongestionEvent{Type: CongestionEventRecovery, State: &state, Time: now, Recovery: CongestionRecovery{Stage: CongestionRecoveryCheckpoint}}
+			bbr.HandleCongestionEvent(&event)
+			bbr.mode, bbr.probePhase, bbr.undoState = test.mode, test.phase, test.exit
+			bbr.inflightHigh, bbr.inflightLow = test.liveHigh, test.liveLow
+			state.CongestionWindow = test.proposed
+			event.Recovery.Stage = CongestionRecoveryUndo
+			bbr.HandleCongestionEvent(&event)
+			if state.CongestionWindow != test.wantWindow || bbr.priorWindow != test.priorWindow {
+				t.Fatalf("undo window = %d, saved %d; want %d, saved %d", state.CongestionWindow, bbr.priorWindow, test.wantWindow, test.priorWindow)
+			}
+			if bbr.mode != test.wantMode || bbr.probePhase != test.wantPhase || bbr.inflightHigh != test.wantHigh || bbr.inflightLow != test.wantLow {
+				t.Fatalf("undo model = %s/%s high %d low %d; want %s/%s high %d low %d", bbr.mode, bbr.probePhase, bbr.inflightHigh, bbr.inflightLow, test.wantMode, test.wantPhase, test.wantHigh, test.wantLow)
+			}
+			if bbr.undoBounds || bbr.undoState != bbr3UndoNone {
+				t.Fatal("undo retained a consumed checkpoint")
+			}
+		})
+	}
+}
+
+// BenchmarkBBR3RecoveryUndo measures checkpointing and undoing one valid loss
+// episode, including restoring the phase and model bounds each time.
+func BenchmarkBBR3RecoveryUndo(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		mode bbrMode
+		high uint32
+		exit bbr3UndoState
+	}{
+		{name: "Cruise", mode: bbrProbeBandwidth, high: 20000},
+		{name: "unlimited", mode: bbrProbeBandwidth},
+		{name: "Refill", mode: bbrProbeBandwidth, high: 20000, exit: bbr3UndoProbeUp},
+		{name: "ProbeRTT", mode: bbrProbeRTT, high: 20000},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			model := newBBR3CongestionControl()
+			model.minimumRTT, model.bandwidthHigh[1] = 10*time.Millisecond, 1000000
+			model.fullBandwidthReached = true
+			state := CongestionState{MaximumSegmentSize: 1000, SmoothedRTT: 20 * time.Millisecond}
+			event := CongestionEvent{Type: CongestionEventRecovery, State: &state, Time: time.Unix(100, 0)}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				model.mode, model.probePhase, model.inflightHigh = bbrProbeBandwidth, bbr3ProbeDown, test.high
+				state.CongestionWindow = 20000
+				event.Recovery.Stage = CongestionRecoveryCheckpoint
+				model.HandleCongestionEvent(&event)
+				model.mode, model.probePhase, model.undoState = test.mode, bbr3ProbeCruise, test.exit
+				if test.high != 0 {
+					model.inflightHigh = 12000
+				}
+				state.CongestionWindow = 4000
+				event.Recovery.Stage = CongestionRecoveryUndo
+				model.HandleCongestionEvent(&event)
+			}
+			b.StopTimer()
+			if model.undoBounds || model.undoState != bbr3UndoNone || model.priorWindow != 20000 || state.CongestionWindow == 0 {
+				b.Fatal("benchmark did not complete a valid recovery undo")
 			}
 		})
 	}
