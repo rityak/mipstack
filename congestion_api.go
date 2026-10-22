@@ -353,7 +353,9 @@ type CongestionState struct {
 	CongestionWindow uint32
 	// SlowStartThreshold is ssthresh in bytes.
 	SlowStartThreshold uint32
-	// BytesInFlight is the transport's current congestion flight in bytes.
+	// BytesInFlight is the transport's congestion flight estimate in bytes.
+	// PacketSent and PacketRetransmitted events precede any new flight
+	// contribution from the reported transmission.
 	BytesInFlight uint32
 	// MaximumSegmentSize is the current sender MSS in bytes.
 	MaximumSegmentSize int

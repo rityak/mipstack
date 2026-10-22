@@ -135,11 +135,11 @@ func TestCUBICEpochExcludesApplicationIdleTime(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlCUBIC)
 	start := time.Unix(100, 0)
 	window := uint32(10 * mss)
-	_, _ = controller.onDataSend(mss, mss, start, 0, 0, window, 0, 20*time.Millisecond, ^uint32(0))
+	_, _ = controller.onDataSend(mss, mss, start, 0, 0, window, 0, 0, 20*time.Millisecond, ^uint32(0))
 	window = controller.onACK(window, mss, mss, start.Add(time.Millisecond), 20*time.Millisecond, 20*time.Millisecond, window, false)
 	epoch := cubicState(t, &controller).epochStart
 	resume := start.Add(time.Hour)
-	_, _ = controller.onDataSend(mss, mss, resume, 0, 0, window, 0, 20*time.Millisecond, ^uint32(0))
+	_, _ = controller.onDataSend(mss, mss, resume, 0, 0, window, 0, 0, 20*time.Millisecond, ^uint32(0))
 	if got := cubicState(t, &controller).epochStart; !got.Equal(resume) {
 		t.Fatalf("CUBIC epoch after idle = %v (previous %v), want resume time %v", got, epoch, resume)
 	}
@@ -164,6 +164,31 @@ func TestCUBICIdleRestartClampsApplicationLimitedEpoch(t *testing.T) {
 		if window != 10_000 || cubic.credit <= 0 || !cubic.epochStart.Equal(resume) {
 			t.Fatalf("queued ACK = cwnd %d credit %f epoch %v, want 10000, positive curve credit and %v", window, cubic.credit, cubic.epochStart, resume)
 		}
+	}
+}
+
+func TestCUBICSendStartUsesTransmissionFlight(t *testing.T) {
+	start := time.Unix(100, 0)
+	resume := start.Add(time.Second)
+	for _, test := range []struct {
+		name       string
+		packetsOut uint32
+		flight     uint32
+		epoch      time.Time
+	}{
+		{name: "live copies", packetsOut: 1000, flight: 1000, epoch: start},
+		{name: "lost copies", packetsOut: 1000, epoch: resume},
+		{name: "idle", epoch: resume},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			controller := newTCPCongestionController(CongestionControlCUBIC)
+			cubic := cubicState(t, &controller)
+			cubic.epochStart, cubic.lastSend = start, start
+			_, _ = controller.onDataSend(1000, 1000, resume, 0, test.packetsOut, 10_000, test.packetsOut, test.flight, 20*time.Millisecond, 10_000)
+			if !cubic.epochStart.Equal(test.epoch) || !cubic.lastSend.Equal(resume) {
+				t.Fatalf("send start = epoch %v last send %v, want %v and %v", cubic.epochStart, cubic.lastSend, test.epoch, resume)
+			}
+		})
 	}
 }
 
@@ -220,7 +245,7 @@ func TestCUBICEpochExcludesNonIdleApplicationLimit(t *testing.T) {
 		t.Fatalf("application-limited CUBIC window = %d, want %d", got, window)
 	}
 	resume := start.Add(time.Hour)
-	_, _ = controller.onDataSend(mss, mss, resume, 0, mss, window, mss, 20*time.Millisecond, ^uint32(0))
+	_, _ = controller.onDataSend(mss, mss, resume, 0, mss, window, mss, mss, 20*time.Millisecond, ^uint32(0))
 	if shift := cubicState(t, &controller).epochStart.Sub(epoch); shift != resume.Sub(limitedAt) {
 		t.Fatalf("application-limited epoch shift = %v, want %v", shift, resume.Sub(limitedAt))
 	}

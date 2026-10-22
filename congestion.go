@@ -473,13 +473,27 @@ func (c *tcpCongestionController) notePacketLoss(segment *sentTCPSegment, bytes 
 	if bytes == 0 {
 		return
 	}
-	c.noteLoss(bytes, duringACK)
 	if !c.usesLossEvents() {
+		c.noteLoss(bytes, duringACK)
 		return
 	}
 	c.syncTransportState(window, slowStartThreshold, flight, mss, smoothedRTT)
-	event := c.prepareEvent(CongestionEventPacketLost, now)
+	c.syncDeliveryState()
+	c.prepareEvent(CongestionEventPacketLost, now)
+	c.publishPacketLoss(segment, bytes, duringACK, lossEvidenceValid)
+}
+
+// publishPacketLoss accounts one nonempty generation in a prepared loss-event
+// batch. The caller synchronizes common state and prepares CongestionEventPacketLost
+// before the batch. Loss callbacks are observational; only LostBytes changes
+// between generations.
+func (c *tcpCongestionController) publishPacketLoss(segment *sentTCPSegment, bytes uint32, duringACK, lossEvidenceValid bool) {
+	c.delivery.recordLoss(bytes, duringACK)
+	c.state.LostBytes = c.delivery.totalLost
+	event := &c.event
+	event.State = &c.state
 	event.PacketBytes = int(bytes)
+	event.PacketState = 0
 	event.PacketLossEvidenceValid = lossEvidenceValid
 	if segment != nil {
 		event.PacketState = segment.congestionPacketState
@@ -557,7 +571,7 @@ func (c *tcpCongestionController) cancelPacingWake() {
 // onDataSend advances the selected controller after a first transmission.
 // Delivery-rate implementations also return the per-range snapshot retained
 // by TCP until cumulative ACK or SACK processing selects it.
-func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stamp monotonicStamp, packetsOut, window, flight uint32, smoothedRTT time.Duration, slowStartThreshold uint32) (tcpDeliverySnapshot, uint32) {
+func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stamp monotonicStamp, packetsOut, window, flight, transmissionFlight uint32, smoothedRTT time.Duration, slowStartThreshold uint32) (tcpDeliverySnapshot, uint32) {
 	snapshot := tcpDeliverySnapshot{}
 	c.packetState = 0
 	if c.usesDeliveryRate() {
@@ -565,7 +579,7 @@ func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stam
 	}
 	if c.usesTransmissionEvents() {
 		c.state.CongestionWindow = window
-		c.state.BytesInFlight = flight
+		c.state.BytesInFlight = transmissionFlight
 		event := c.prepareEvent(CongestionEventPacketSent, now)
 		event.PacketBytes = bytes
 		event.OutstandingBytes = packetsOut
@@ -583,8 +597,9 @@ func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stam
 
 // onRetransmit advances only the pacing clock and delivery snapshot. Loss
 // recovery must not treat a retransmission as new application data or a new
-// congestion-avoidance epoch.
-func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, stamp monotonicStamp, window, flight, packetsOut uint32, smoothedRTT time.Duration, slowStartThreshold uint32) tcpDeliverySnapshot {
+// congestion-avoidance epoch. transmissionFlight excludes the new copy and
+// previously lost copies; flight retains the common pacer's flight estimate.
+func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, stamp monotonicStamp, window, flight, transmissionFlight, packetsOut uint32, smoothedRTT time.Duration, slowStartThreshold uint32) tcpDeliverySnapshot {
 	snapshot := tcpDeliverySnapshot{}
 	c.packetState = 0
 	if c.usesDeliveryRate() {
@@ -592,7 +607,10 @@ func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, st
 	}
 	if c.usesTransmissionEvents() {
 		c.state.CongestionWindow = window
-		c.state.BytesInFlight = flight
+		// Linux tcp_rate_skb_sent captures flight before adding retrans_out.
+		// Controllers add PacketBytes when forming the new transmission's
+		// snapshot, just as they do for an original transmission.
+		c.state.BytesInFlight = transmissionFlight
 		event := c.prepareEvent(CongestionEventPacketRetransmitted, now)
 		event.PacketBytes = bytes
 		event.OutstandingBytes = packetsOut

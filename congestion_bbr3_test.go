@@ -3,6 +3,8 @@ package mipstack
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"sort"
 	"sync"
@@ -24,6 +26,66 @@ type bbr3RenegingRecorder struct {
 	staleLoss    atomic.Uint64
 	lostBytes    atomic.Uint64
 	onPacketSent func()
+}
+
+type bbr3Retransmission struct {
+	flight   uint32
+	snapshot uint32
+	bytes    int
+	phase    CongestionPhase
+}
+
+type bbr3RetransmissionRecorder struct {
+	algorithm *bbr3CongestionControl
+	published chan bbr3Retransmission
+}
+
+func (r *bbr3RetransmissionRecorder) HandleCongestionEvent(event *CongestionEvent) {
+	r.algorithm.HandleCongestionEvent(event)
+	if event.Type == CongestionEventPacketRetransmitted {
+		r.published <- bbr3Retransmission{flight: event.State.BytesInFlight, snapshot: bbr3DecodePacketState(event.PacketState).inflight, bytes: event.PacketBytes, phase: event.State.Phase}
+	}
+}
+
+type bbr3RTOAcknowledgment struct {
+	before, after, snapshot, acknowledged uint32
+	losses                                uint64
+	valid                                 bool
+}
+
+type bbr3RTORecorder struct {
+	algorithm *bbr3CongestionControl
+	published chan bbr3Retransmission
+	sent      chan bbr3Retransmission
+	acked     chan bbr3RTOAcknowledgment
+}
+
+func (r *bbr3RTORecorder) HandleCongestionEvent(event *CongestionEvent) {
+	before := r.algorithm.inflightHigh
+	r.algorithm.HandleCongestionEvent(event)
+	switch event.Type {
+	case CongestionEventInitialize:
+		// Seed a mature model so a safe ACK can widen an existing upper bound.
+		r.algorithm.mode, r.algorithm.probePhase = bbrProbeBandwidth, bbr3ProbeCruise
+		r.algorithm.fullBandwidthReached = true
+		r.algorithm.inflightHigh = uint32(4 * event.State.MaximumSegmentSize)
+		r.algorithm.bandwidthHigh[1] = 1_000_000
+		r.algorithm.probeStarted = event.Time
+	case CongestionEventPacketRetransmitted:
+		r.published <- bbr3Retransmission{flight: event.State.BytesInFlight, snapshot: bbr3DecodePacketState(event.PacketState).inflight, bytes: event.PacketBytes, phase: event.State.Phase}
+	case CongestionEventPacketSent:
+		if r.sent != nil {
+			r.sent <- bbr3Retransmission{flight: event.State.BytesInFlight, snapshot: bbr3DecodePacketState(event.PacketState).inflight, bytes: event.PacketBytes, phase: event.State.Phase}
+		}
+	case CongestionEventACK:
+		if sample := event.RateSample; sample != nil {
+			r.acked <- bbr3RTOAcknowledgment{
+				before: before, after: r.algorithm.inflightHigh,
+				snapshot:     bbr3DecodePacketState(sample.PacketState()).inflight,
+				acknowledged: sample.AcknowledgedBytes(), losses: sample.LostBytes(), valid: sample.Valid(),
+			}
+		}
+	}
 }
 
 func (r *bbr3RenegingRecorder) HandleCongestionEvent(event *CongestionEvent) {
@@ -578,8 +640,8 @@ func TestTCPSACKPreservesCongestionTransmissionState(t *testing.T) {
 		state:                 sentTCPSegmentInitialState(false, false, false, false),
 		congestionPacketState: 0x1234,
 	}
-	outstanding, _, _, newInformation, _, newlySACKed := applyTCPSACK(
-		[]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}}, time.Time{},
+	outstanding, _, _, newInformation, newlySACKed := applyTCPSACK(
+		[]sentTCPSegment{segment}, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}},
 	)
 	if !newInformation || len(outstanding) != 1 {
 		t.Fatalf("SACK application = information %t ranges %d", newInformation, len(outstanding))
@@ -775,9 +837,79 @@ func TestBBR3StartupLossExitRequiresRecoveryRound(t *testing.T) {
 	}
 	bbr.lossEventsInRound = bbr3FullLossEvents
 	sample.fastRecovery = true
+	bbr.handleRecoveryEvent(&CongestionEvent{
+		State:    &CongestionState{CongestionWindow: 24_000},
+		Recovery: CongestionRecovery{Stage: CongestionRecoveryCheckpoint},
+	})
 	bbr.checkStartupLoss(sample, packet, mss)
-	if !bbr.fullBandwidthReached || bbr.inflightHigh == 0 {
+	if !bbr.fullBandwidthReached || bbr.inflightHigh == 0 || bbr.undoState != bbr3UndoStartup {
 		t.Fatal("lossy Startup recovery round did not bound inflight")
+	}
+	bbr.checkDrain(sample, mss)
+	bbr.undoRecovery(sample.ackTime)
+	if bbr.fullBandwidthReached || bbr.mode != bbrStartup {
+		t.Fatal("undo did not restart loss-terminated Startup")
+	}
+}
+
+func TestBBR3StartupLossDuringProbeRTT(t *testing.T) {
+	for _, undo := range []bool{false, true} {
+		name := "retain loss"
+		if undo {
+			name = "undo loss"
+		}
+		t.Run(name, func(t *testing.T) {
+			const mss = 1000
+			now := time.Unix(100, 0)
+			bbr := newBBR3CongestionControl()
+			bbr.bandwidthHigh[1] = 1_000_000
+			bbr.minimumRTT = 5 * time.Millisecond
+			bbr.minimumRTTStamp = now.Add(-6 * time.Second)
+			bbr.probeRTTMinimum, bbr.probeRTTStamp = bbr.minimumRTT, bbr.minimumRTTStamp
+			sample := bbr3RateSample(now, 1000, 1000, 20_000, bbr.minimumRTT)
+			window := bbr.updateMinimumRTT(24_000, sample, mss)
+			if bbr.mode != bbrProbeRTT || bbr.fullBandwidthReached {
+				t.Fatal("ProbeRTT did not suspend unfinished Startup")
+			}
+			bbr.handleRecoveryEvent(&CongestionEvent{
+				Time:     now,
+				State:    &CongestionState{CongestionWindow: window, MaximumSegmentSize: mss},
+				Recovery: CongestionRecovery{Stage: CongestionRecoveryCheckpoint},
+			})
+			bbr.latestInflight, bbr.lost = 20_000, 1000
+			bbr.lossRoundStart, bbr.lossEventsInRound = true, bbr3FullLossEvents
+			sample.losses, sample.fastRecovery = 1000, true
+			bbr.checkStartupLoss(sample, bbr3PacketSnapshot{inflight: 20_000}, mss)
+			if !bbr.fullBandwidthReached {
+				t.Fatal("loss evidence did not end Startup during ProbeRTT")
+			}
+			if undo {
+				bbr.handleRecoveryEvent(&CongestionEvent{
+					Time:     now.Add(time.Millisecond),
+					State:    &CongestionState{CongestionWindow: window, MaximumSegmentSize: mss},
+					Recovery: CongestionRecovery{Stage: CongestionRecoveryUndo},
+				})
+			}
+			if bbr.mode != bbrProbeRTT || bbr.fullBandwidthReached == undo {
+				t.Fatal("recovery changed ProbeRTT or retained spurious Startup completion")
+			}
+			sample.inFlight = 0
+			sample.ackTime = now.Add(2 * time.Millisecond)
+			window = bbr.updateMinimumRTT(window, sample, mss)
+			if bbr.probeDone.IsZero() {
+				t.Fatal("ProbeRTT did not start its measurement interval")
+			}
+			sample.ackTime = now.Add(time.Second)
+			bbr.roundStart = true
+			bbr.updateMinimumRTT(window, sample, mss)
+			wantMode := bbrProbeBandwidth
+			if undo {
+				wantMode = bbrStartup
+			}
+			if bbr.mode != wantMode {
+				t.Fatalf("ProbeRTT exit resumed %s, want %s", bbr.mode, wantMode)
+			}
+		})
 	}
 }
 
@@ -808,18 +940,879 @@ func TestBBR3ProbeRTTUsesIndependentFiveSecondWindow(t *testing.T) {
 	}
 }
 
+func TestBBR3ProbeRTTExitClearsLowerBounds(t *testing.T) {
+	for _, idle := range []bool{false, true} {
+		for _, fullBandwidth := range []bool{false, true} {
+			t.Run(fmt.Sprintf("idle-%t/full-bandwidth-%t", idle, fullBandwidth), func(t *testing.T) {
+				now := time.Unix(100, 0)
+				bbr := newBBR3CongestionControl()
+				bbr.mode, bbr.fullBandwidthReached, bbr.applicationLimited = bbrProbeRTT, fullBandwidth, true
+				bbr.probeDone = now.Add(-time.Millisecond)
+				bbr.priorWindow = 20_000
+				bbr.bandwidthHigh[1], bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh = 1_000_000, 500_000, 8000, 30_000
+				window := uint32(4000)
+				if idle {
+					window = bbr.onDeliverySend(now, 0, window)
+				} else {
+					bbr.probeRound, bbr.roundStart = true, true
+					bbr.probeRTTStamp, bbr.minimumRTTStamp = now, now
+					window = bbr.updateMinimumRTT(window, bbr3RateSample(now, 1000, 1000, 4000, time.Millisecond), 1000)
+				}
+				wantMode := bbrStartup
+				if fullBandwidth {
+					wantMode = bbrProbeBandwidth
+				}
+				if bbr.mode != wantMode || window != 20_000 || bbr.bandwidthLow != 0 || bbr.inflightLow != 0 || bbr.inflightHigh != 30_000 || bbr.maximumBandwidth() != 1_000_000 || bbr.effectiveBandwidth() != 1_000_000 {
+					t.Fatalf("ProbeRTT exit = mode %v window %d bandwidth %g bounds %g/%d/%d", bbr.mode, window, bbr.effectiveBandwidth(), bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh)
+				}
+				if fullBandwidth && (bbr.probePhase != bbr3ProbeCruise || bbr.boundWindow(uint64(window), 1000) != uint64(window)) {
+					t.Fatalf("ProbeBW restart = phase %v bounded window %d", bbr.probePhase, bbr.boundWindow(uint64(window), 1000))
+				}
+			})
+		}
+	}
+}
+
+func TestTCPBBR3PublishedRetransmissionFlight(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		count    int
+		pathMTU  bool
+		repeated bool
+	}{
+		{name: "RACK", count: 2},
+		{name: "SACK threshold", count: 5},
+		{name: "PMTU first replacement", count: 5, pathMTU: true},
+		{name: "PMTU repeated replacement", count: 5, pathMTU: true, repeated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			link, stack, connection := newManuallyPumpedTCPConnection(t)
+			recorder := &bbr3RetransmissionRecorder{algorithm: newBBR3CongestionControl(), published: make(chan bbr3Retransmission, 64)}
+			base, _ := registeredCongestionControlFactory(CongestionControlBBR3)
+			definition := base.definition
+			definition.Name = "test-BBR3-flight"
+			definition.New = func(CongestionControlContext) CongestionController { return recorder }
+			factory, err := NewCongestionControlFactory(definition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = connection.SetCongestionControlFactory(factory); err != nil {
+				t.Fatal(err)
+			}
+			mss := connection.Info().MaximumSegmentSize
+			if _, err = connection.Write(bytes.Repeat([]byte{'x'}, test.count*mss)); err != nil {
+				t.Fatal(err)
+			}
+			var segments []TCPSegment
+			var firstWire []byte
+			for len(segments) < test.count {
+				entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+				if !available {
+					t.Fatal("original transmission did not depart")
+				}
+				wire := consumeTestPacket(&stack.outbound, entry)
+				packet, parseErr := ParseIPPacket(wire)
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				segment, parseErr := packet.TCPSegment()
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				if len(segment.Payload) != 0 {
+					if len(segments) == 0 {
+						firstWire = wire
+					}
+					segments = append(segments, segment)
+				}
+			}
+			held := make([]uint16, 0, cap(stack.outbound.free))
+			defer func() {
+				for _, slot := range held {
+					stack.outbound.releaseReserved(slot)
+				}
+			}()
+			holdOutput := func() {
+				t.Helper()
+				for {
+					slot, reserved := stack.outbound.tryReserve()
+					if !reserved {
+						break
+					}
+					held = append(held, slot)
+				}
+				if len(held) != cap(stack.outbound.free) {
+					t.Fatalf("reserved output slots = %d, want %d", len(held), cap(stack.outbound.free))
+				}
+			}
+			if test.pathMTU && !test.repeated {
+				holdOutput()
+			}
+			sacked := make(map[uint32][]byte)
+			for _, segment := range segments[1:] {
+				sacked[segment.SequenceNumber] = segment.Payload
+			}
+			link.mu.Lock()
+			serverNext := link.tcp[connection.key.local.Port()].serverNext
+			link.mu.Unlock()
+			if err = link.deliverTCP(8080, connection.key.local.Port(), serverNext, segments[0].SequenceNumber, TCPFlagACK, 65535, testSACKOptions(sacked), nil); err != nil {
+				t.Fatal(err)
+			}
+			wantFlight, wantPostFlight, wantBytes := uint32(0), uint32(mss), mss
+			if test.pathMTU {
+				waitFor(t, time.Second, func() bool { return connection.Info().FastRecovery })
+				if test.repeated {
+					select {
+					case event := <-recorder.published:
+						if event.phase != CongestionPhaseRecovery || event.flight != 0 || event.snapshot != uint32(mss) || event.bytes != mss {
+							t.Fatalf("first publication = %+v, MSS %d", event, mss)
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatal("no initial retransmission event")
+					}
+					wire := readOutboundPacket(t, stack)
+					packet, parseErr := ParseIPPacket(wire)
+					if parseErr != nil {
+						t.Fatal(parseErr)
+					}
+					segment, parseErr := packet.TCPSegment()
+					if parseErr != nil || segment.SequenceNumber != segments[0].SequenceNumber || !bytes.Equal(segment.Payload, segments[0].Payload) {
+						t.Fatalf("first replacement = %+v, %v", segment, parseErr)
+					}
+					holdOutput()
+					wantFlight = uint32(mss)
+				}
+				const reducedMTU = 1000
+				if err = writeTestPacket(stack, buildTestPacketTooBig(link.remote, link.local, firstWire, reducedMTU)); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, time.Second, func() bool { return connection.Info().PathMTU == reducedMTU })
+				wantBytes = connection.Info().MaximumSegmentSize
+				if !test.repeated {
+					wantPostFlight = uint32(wantBytes)
+				}
+				if info := connection.Info(); !info.FastRecovery || info.RetransmissionRecovery || info.BytesInFlight != wantFlight {
+					t.Fatalf("unpublished PMTU flight = %+v, want %d", info, wantFlight)
+				}
+				last := len(held) - 1
+				stack.outbound.releaseReserved(held[last])
+				held = held[:last]
+			}
+			select {
+			case event := <-recorder.published:
+				if event.phase != CongestionPhaseRecovery || event.flight != wantFlight || event.snapshot != wantFlight+uint32(wantBytes) || event.bytes != wantBytes {
+					t.Fatalf("published transmission = %+v, want flight %d bytes %d", event, wantFlight, wantBytes)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("no retransmission event")
+			}
+			info := connection.Info()
+			if info.BytesInFlight != wantPostFlight || !info.FastRecovery || info.RetransmissionRecovery {
+				t.Fatalf("post-publication flight = %+v", info)
+			}
+			entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+			if !available {
+				t.Fatal("published retransmission did not depart")
+			}
+			packet, err := ParseIPPacket(consumeTestPacket(&stack.outbound, entry))
+			if err != nil {
+				t.Fatal(err)
+			}
+			segment, err := packet.TCPSegment()
+			if err != nil || segment.SequenceNumber != segments[0].SequenceNumber || !bytes.Equal(segment.Payload, segments[0].Payload[:wantBytes]) {
+				t.Fatalf("retransmitted range = %+v, %v", segment, err)
+			}
+		})
+	}
+}
+
+func TestTCPBBR3RTOFlightDoesNotInflateUpperBound(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	recorder := &bbr3RTORecorder{
+		algorithm: newBBR3CongestionControl(),
+		published: make(chan bbr3Retransmission, 32),
+		acked:     make(chan bbr3RTOAcknowledgment, 32),
+	}
+	base, _ := registeredCongestionControlFactory(CongestionControlBBR3)
+	definition := base.definition
+	definition.Name = "test-BBR3-RTO-flight"
+	definition.New = func(CongestionControlContext) CongestionController { return recorder }
+	factory, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	info := connection.Info()
+	mss := info.MaximumSegmentSize
+	if _, err = connection.Write(bytes.Repeat([]byte{'x'}, 4*mss)); err != nil {
+		t.Fatal(err)
+	}
+	var originals []TCPSegment
+	for len(originals) < 4 {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !available {
+			t.Fatal("original transmission did not depart")
+		}
+		packet, parseErr := ParseIPPacket(consumeTestPacket(&stack.outbound, entry))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		segment, parseErr := packet.TCPSegment()
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if len(segment.Payload) != 0 {
+			originals = append(originals, segment)
+		}
+	}
+	deadline := time.NewTimer(3*info.RetransmissionTimeout + time.Second)
+	defer deadline.Stop()
+	var publication bbr3Retransmission
+	for publication.phase != CongestionPhaseLoss {
+		select {
+		case publication = <-recorder.published:
+			if publication.phase != CongestionPhaseLoss {
+				// Let the TLP leave the host queue without delivering it.
+				// The later RTO can then declare every old copy lost.
+				entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+				if !available {
+					t.Fatal("tail-loss probe did not depart")
+				}
+				consumeTestPacket(&stack.outbound, entry)
+			}
+		case <-deadline.C:
+			t.Fatal("ordinary RTO did not publish")
+		}
+	}
+	if publication.flight != 0 || publication.snapshot != uint32(mss) || publication.bytes != mss {
+		t.Fatalf("RTO publication = %+v, want only the new %d-byte copy", publication, mss)
+	}
+	for {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !available {
+			t.Fatal("RTO replacement did not depart")
+		}
+		packet, parseErr := ParseIPPacket(consumeTestPacket(&stack.outbound, entry))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		segment, parseErr := packet.TCPSegment()
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if segment.SequenceNumber == originals[0].SequenceNumber && len(segment.Payload) != 0 {
+			break
+		}
+	}
+	link.mu.Lock()
+	serverNext := link.tcp[connection.key.local.Port()].serverNext
+	link.mu.Unlock()
+	last := originals[len(originals)-1]
+	ack := last.SequenceNumber + uint32(len(last.Payload))
+	if err = link.deliverTCP(8080, connection.key.local.Port(), serverNext, ack, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case observation := <-recorder.acked:
+		if observation.before != uint32(4*mss) || observation.after != observation.before || observation.snapshot != publication.snapshot || observation.acknowledged != uint32(4*mss) || observation.losses != 0 || !observation.valid {
+			t.Fatalf("RTO ACK = %+v, publication %+v", observation, publication)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ACK did not reach the BBR3 controller")
+	}
+	if info := connection.Info(); info.SpuriousRecoveryUndos != 0 {
+		t.Fatalf("bound was restored by spurious-recovery undo: %+v", info)
+	}
+}
+
+func TestTCPBBR3FRTOProbeFlight(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.111"), netip.MustParseAddr("192.0.2.112"))
+	link.mu.Lock()
+	link.echoTCP, link.disableTCPSACK = true, true
+	link.mu.Unlock()
+	dialed, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8080))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := dialed.(*TCPConn)
+	defer connection.Close()
+	recorder := &bbr3RTORecorder{
+		algorithm: newBBR3CongestionControl(),
+		published: make(chan bbr3Retransmission, 32),
+		sent:      make(chan bbr3Retransmission, 64),
+		acked:     make(chan bbr3RTOAcknowledgment, 32),
+	}
+	base, _ := registeredCongestionControlFactory(CongestionControlBBR3)
+	definition := base.definition
+	definition.Name = "test-BBR3-F-RTO-flight"
+	definition.New = func(CongestionControlContext) CongestionController { return recorder }
+	factory, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	info := connection.Info()
+	mss := info.MaximumSegmentSize
+	link.mu.Lock()
+	link.echoTCP = false
+	link.outbound = make(chan []byte, 256)
+	link.mu.Unlock()
+	if _, err = connection.Write(bytes.Repeat([]byte{'x'}, 32*mss)); err != nil {
+		t.Fatal(err)
+	}
+	var sequence uint32
+	haveSequence := false
+	deadline := time.NewTimer(3*info.RetransmissionTimeout + time.Second)
+	defer deadline.Stop()
+	for {
+		var wire []byte
+		select {
+		case wire = <-link.outbound:
+		case <-deadline.C:
+			t.Fatal("initial flight did not reach RTO")
+		}
+		packet, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		segment, parseErr := packet.TCPSegment()
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if len(segment.Payload) == 0 {
+			continue
+		}
+		if !haveSequence {
+			sequence, haveSequence = segment.SequenceNumber, true
+		} else if segment.SequenceNumber == sequence && connection.Info().RetransmissionRecovery {
+			break
+		}
+	}
+	link.mu.Lock()
+	serverNext := link.tcp[connection.key.local.Port()].serverNext
+	link.mu.Unlock()
+	if err = link.deliverTCP(8080, connection.key.local.Port(), serverNext, sequence+uint32(mss), TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for probes := 0; probes < 2; {
+		select {
+		case event := <-recorder.sent:
+			if event.phase != CongestionPhaseLoss {
+				continue
+			}
+			if event.flight != uint32(probes*mss) || event.snapshot != uint32((probes+1)*mss) || event.bytes != mss {
+				t.Fatalf("F-RTO probe %d = %+v", probes, event)
+			}
+			probes++
+		case <-timer.C:
+			t.Fatalf("F-RTO did not publish two new-data probes: probes %d info %+v", probes, connection.Info())
+		}
+	}
+}
+
+func TestBBR3SpeculativeSACKRetransmissionFlight(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	state := tcpEstablishedState{
+		peerSACK: true, fastRecovery: true, peerMSS: mss,
+		outstanding: []sentTCPSegment{
+			{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted},
+			{sequence: 1100, end: 2100, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+		},
+		controller: newTCPCongestionController(CongestionControlBBR3),
+	}
+	state.controller.initialize(CongestionPhaseRecovery, now, time.Millisecond, time.Millisecond, 10*mss, 10*mss, mss, 1)
+	if index := firstUnretriedSACKHole(state.outstanding, 2100); index != 0 || sackSegmentLost(state.outstanding, index, mss) {
+		t.Fatal("SACK hole was not eligible for RFC 6675 NextSeg rule 3")
+	}
+	before := state.congestionFlight()
+	state.outstanding[0].advanceTransmissionGeneration()
+	state.outstanding[0].state.set(sentTCPSegmentSACKRetried, true)
+	after := state.congestionFlight()
+	if before != mss || after != 2*mss {
+		t.Fatalf("speculative replacement discarded its unproven original: flight %d -> %d", before, after)
+	}
+	state.controller.onRetransmit(mss, mss, now, 1, 10*mss, after, before, 2*mss, time.Millisecond, 10*mss)
+	if eventFlight := state.controller.state.BytesInFlight; eventFlight != before {
+		t.Fatalf("speculative event flight = %d, want %d", eventFlight, before)
+	}
+	if snapshot := bbr3DecodePacketState(state.controller.transmissionState()).inflight; snapshot != after {
+		t.Fatalf("speculative transmission snapshot = %d, want %d", snapshot, after)
+	}
+}
+
 func TestBBR3RecoveryUndoOnlyWidensBounds(t *testing.T) {
-	bbr := newBBR3CongestionControl()
-	bbr.bandwidthLow = 800_000
-	bbr.inflightLow = 16_000
-	bbr.inflightHigh = 20_000
-	bbr.saveWindow(24_000)
-	bbr.bandwidthLow = 500_000
-	bbr.inflightLow = 10_000
-	bbr.inflightHigh = 12_000
-	bbr.undoRecovery()
-	if bbr.bandwidthLow != 800_000 || bbr.inflightLow != 16_000 || bbr.inflightHigh != 20_000 {
-		t.Fatalf("undo bounds = %v/%d/%d", bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh)
+	for _, test := range []struct {
+		name        string
+		saved, live uint32
+		want        uint32
+	}{
+		{name: "tightened", saved: 20_000, live: 12_000, want: 20_000},
+		{name: "already wider", saved: 20_000, live: 24_000, want: 24_000},
+		{name: "previously unlimited", live: 12_000},
+		{name: "currently unlimited", saved: 20_000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bbr := newBBR3CongestionControl()
+			bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh = float64(test.saved), test.saved, test.saved
+			bbr.handleRecoveryEvent(&CongestionEvent{
+				State:    &CongestionState{CongestionWindow: 24_000},
+				Recovery: CongestionRecovery{Stage: CongestionRecoveryCheckpoint},
+			})
+			bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh = float64(test.live), test.live, test.live
+			bbr.undoRecovery(time.Unix(100, 0))
+			if bbr.bandwidthLow != float64(test.want) || bbr.inflightLow != test.want || bbr.inflightHigh != test.want {
+				t.Fatalf("undo bounds = %v/%d/%d, want %d", bbr.bandwidthLow, bbr.inflightLow, bbr.inflightHigh, test.want)
+			}
+		})
+	}
+}
+
+func TestBBR3RecoveryUndoBoundsWindow(t *testing.T) {
+	for _, test := range []struct {
+		name                              string
+		mode                              bbrMode
+		phase                             bbr3ProbePhase
+		exit                              bbr3UndoState
+		savedHigh, liveHigh, wantHigh     uint32
+		savedLow, liveLow, wantLow        uint32
+		priorWindow, proposed, wantWindow uint32
+		wantMode                          bbrMode
+		wantPhase                         bbr3ProbePhase
+	}{
+		{name: "Cruise restored bound", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 20000, proposed: 4000, wantWindow: 17032, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise wider live bound", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 24000, wantHigh: 24000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise saved unlimited", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			liveHigh: 12000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise live unlimited", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise short-term bound", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, savedLow: 10000, liveLow: 6000, wantLow: 10000,
+			priorWindow: 20000, proposed: 4000, wantWindow: 10000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise minimum cap", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 2000, liveHigh: 1000, wantHigh: 2000, savedLow: 1000, liveLow: 500, wantLow: 1000,
+			priorWindow: 20000, proposed: 4000, wantWindow: 4000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise one MSS headroom", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 6000, liveHigh: 5000, wantHigh: 6000, priorWindow: 6000, proposed: 4000, wantWindow: 5000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Cruise smaller restored window", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 4000, proposed: 6000, wantWindow: 6000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeCruise},
+		{name: "Down", mode: bbrProbeBandwidth, phase: bbr3ProbeDown,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 24000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeDown},
+		{name: "Up", mode: bbrProbeBandwidth, phase: bbr3ProbeUp,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 24000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeUp},
+		{name: "Refill after probe undo", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise, exit: bbr3UndoProbeUp,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, savedLow: 10000, liveLow: 6000,
+			priorWindow: 24000, proposed: 4000, wantWindow: 20000, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeRefill},
+		{name: "Startup after loss undo", mode: bbrProbeBandwidth, phase: bbr3ProbeCruise, exit: bbr3UndoStartup,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 24000, proposed: 4000, wantWindow: 24000, wantMode: bbrStartup, wantPhase: bbr3ProbeCruise},
+		{name: "Startup short-term bound", mode: bbrStartup,
+			savedHigh: 6000, liveHigh: 5000, wantHigh: 6000, savedLow: 10000, liveLow: 6000, wantLow: 10000,
+			priorWindow: 20000, proposed: 4000, wantWindow: 10000, wantMode: bbrStartup},
+		{name: "Drain", mode: bbrDrain,
+			savedHigh: 6000, liveHigh: 5000, wantHigh: 6000, priorWindow: 20000, proposed: 4000, wantWindow: 20000, wantMode: bbrDrain},
+		{name: "ProbeRTT target", mode: bbrProbeRTT, phase: bbr3ProbeCruise, exit: bbr3UndoProbeUp,
+			savedHigh: 20000, liveHigh: 12000, wantHigh: 20000, priorWindow: 20000, proposed: 4000, wantWindow: 5000, wantMode: bbrProbeRTT, wantPhase: bbr3ProbeCruise},
+		{name: "ProbeRTT model bound", mode: bbrProbeRTT, phase: bbr3ProbeCruise,
+			savedHigh: 2000, liveHigh: 1000, wantHigh: 2000, priorWindow: 20000, proposed: 4000, wantWindow: 4000, wantMode: bbrProbeRTT, wantPhase: bbr3ProbeCruise},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			bbr := newBBR3CongestionControl()
+			bbr.inflightHigh, bbr.inflightLow = test.savedHigh, test.savedLow
+			bbr.minimumRTT, bbr.bandwidthHigh[1] = 10*time.Millisecond, 1000000
+			bbr.fullBandwidthReached = true
+			state := CongestionState{CongestionWindow: test.priorWindow, MaximumSegmentSize: 1000, SmoothedRTT: 20 * time.Millisecond}
+			event := CongestionEvent{Type: CongestionEventRecovery, State: &state, Time: now, Recovery: CongestionRecovery{Stage: CongestionRecoveryCheckpoint}}
+			bbr.HandleCongestionEvent(&event)
+			bbr.mode, bbr.probePhase, bbr.undoState = test.mode, test.phase, test.exit
+			bbr.inflightHigh, bbr.inflightLow = test.liveHigh, test.liveLow
+			state.CongestionWindow = test.proposed
+			event.Recovery.Stage = CongestionRecoveryUndo
+			bbr.HandleCongestionEvent(&event)
+			if state.CongestionWindow != test.wantWindow || bbr.priorWindow != test.priorWindow {
+				t.Fatalf("undo window = %d, saved %d; want %d, saved %d", state.CongestionWindow, bbr.priorWindow, test.wantWindow, test.priorWindow)
+			}
+			if bbr.mode != test.wantMode || bbr.probePhase != test.wantPhase || bbr.inflightHigh != test.wantHigh || bbr.inflightLow != test.wantLow {
+				t.Fatalf("undo model = %s/%s high %d low %d; want %s/%s high %d low %d", bbr.mode, bbr.probePhase, bbr.inflightHigh, bbr.inflightLow, test.wantMode, test.wantPhase, test.wantHigh, test.wantLow)
+			}
+			if bbr.undoBounds || bbr.undoState != bbr3UndoNone {
+				t.Fatal("undo retained a consumed checkpoint")
+			}
+		})
+	}
+}
+
+// BenchmarkBBR3RecoveryUndo measures checkpointing and undoing one valid loss
+// episode, including restoring the phase and model bounds each time.
+func BenchmarkBBR3RecoveryUndo(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		mode bbrMode
+		high uint32
+		exit bbr3UndoState
+	}{
+		{name: "Cruise", mode: bbrProbeBandwidth, high: 20000},
+		{name: "unlimited", mode: bbrProbeBandwidth},
+		{name: "Refill", mode: bbrProbeBandwidth, high: 20000, exit: bbr3UndoProbeUp},
+		{name: "ProbeRTT", mode: bbrProbeRTT, high: 20000},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			model := newBBR3CongestionControl()
+			model.minimumRTT, model.bandwidthHigh[1] = 10*time.Millisecond, 1000000
+			model.fullBandwidthReached = true
+			state := CongestionState{MaximumSegmentSize: 1000, SmoothedRTT: 20 * time.Millisecond}
+			event := CongestionEvent{Type: CongestionEventRecovery, State: &state, Time: time.Unix(100, 0)}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				model.mode, model.probePhase, model.inflightHigh = bbrProbeBandwidth, bbr3ProbeDown, test.high
+				state.CongestionWindow = 20000
+				event.Recovery.Stage = CongestionRecoveryCheckpoint
+				model.HandleCongestionEvent(&event)
+				model.mode, model.probePhase, model.undoState = test.mode, bbr3ProbeCruise, test.exit
+				if test.high != 0 {
+					model.inflightHigh = 12000
+				}
+				state.CongestionWindow = 4000
+				event.Recovery.Stage = CongestionRecoveryUndo
+				model.HandleCongestionEvent(&event)
+			}
+			b.StopTimer()
+			if model.undoBounds || model.undoState != bbr3UndoNone || model.priorWindow != 20000 || state.CongestionWindow == 0 {
+				b.Fatal("benchmark did not complete a valid recovery undo")
+			}
+		})
+	}
+}
+
+// bbr3UndoRecorder observes the public event boundary without retaining events.
+type bbr3UndoRecorder struct {
+	algorithm   *bbr3CongestionControl
+	checkpoints int
+	losses      []uint64
+	flights     []uint32
+	missing     bool
+	probeExitAt uint64
+}
+
+func (r *bbr3UndoRecorder) HandleCongestionEvent(event *CongestionEvent) {
+	if event.Type == CongestionEventRecovery && event.Recovery.Stage == CongestionRecoveryCheckpoint {
+		r.checkpoints++
+	}
+	if event.Type == CongestionEventPacketLost {
+		r.missing = r.missing || r.checkpoints == 0
+		r.losses = append(r.losses, event.State.LostBytes)
+		r.flights = append(r.flights, event.State.BytesInFlight)
+	}
+	probing := r.algorithm.probeSamples
+	r.algorithm.HandleCongestionEvent(event)
+	if event.Type == CongestionEventPacketLost && probing && !r.algorithm.probeSamples {
+		r.probeExitAt = event.State.LostBytes
+	}
+}
+
+func TestTCPBBR3RecoveryEntryBeforeLossCallbacks(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		recovery    bool
+		replacement int
+	}{
+		{name: "IsLost before DupThresh", replacement: -1},
+		{name: "replacement after first hole", recovery: true, replacement: 1},
+		{name: "replacement at first hole", recovery: true, replacement: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const mss = 1000
+			now := time.Unix(100, 0)
+			epoch := now.Add(-time.Second)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: epoch}
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(CongestionControlBBR3),
+				peerMSS: mss, peerSACK: true, peerWindow: 40_000,
+				sendUnacknowledged: 100, sendNext: 6100,
+				congestionWindow: 20_000, slowStartThreshold: 30_000,
+				fastRecovery: test.recovery, recoveryPoint: 6100, prrPriorFlight: 6000,
+				rackReorderingSeen: true, rtt: newRTTEstimator(time.Second),
+				outstanding: make([]sentTCPSegment, 6),
+			}
+			state.controller.initialize(CongestionPhaseOpen, epoch, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+			defer state.controller.release(now, state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), mss, state.rtt.srtt, state.rtt.minimum)
+			algorithm := state.controller.algorithm.(*bbr3CongestionControl)
+			algorithm.inflightHigh = 20_000
+			recorder := &bbr3UndoRecorder{algorithm: algorithm}
+			state.controller.algorithm = recorder
+			for index := range state.outstanding {
+				state.outstanding[index] = sentTCPSegment{
+					sequence: uint32(100 + index*mss), end: uint32(100 + (index+1)*mss),
+					state:     sentTCPSegmentTransmitted,
+					hostQueue: testPacketQueueTicketAt(epoch, now.Add(-100*time.Millisecond)),
+					delivery:  tcpDeliverySnapshot{deliveredStamp: 1},
+				}
+			}
+			if test.replacement >= 0 {
+				for index := 0; index < 2; index++ {
+					state.outstanding[index].hostQueue = testPacketQueueTicketAt(epoch, now.Add(-200*time.Millisecond))
+				}
+				state.outstanding[test.replacement].advanceTransmissionGeneration()
+				state.outstanding[test.replacement].state |= sentTCPSegmentSACKRetried | sentTCPSegmentOriginalLost
+				state.controller.setCongestionPhase(CongestionPhaseRecovery, now)
+			}
+			state.rebaseOutstanding()
+			var options [10]byte
+			options[0], options[1] = TCPHeaderOptionSACK, 10
+			binary.BigEndian.PutUint32(options[2:6], 2100)
+			binary.BigEndian.PutUint32(options[6:10], 6100)
+			segment := tcpSegment{acknowledgement: 100, flags: TCPFlagACK, window: 40_000}
+			segment.setOptions(options[:])
+			state.processAcknowledgment(&segment, now, 0)
+			if !state.fastRecovery || state.undo == nil || !state.undo.active || recorder.checkpoints != 1 || recorder.missing || len(recorder.losses) != 2 || algorithm.undoInflightHigh != 20_000 {
+				t.Fatalf("recovery entry: active %t undo %+v checkpoints %d missing %t losses %v saved bound %d", state.fastRecovery, state.undo, recorder.checkpoints, recorder.missing, recorder.losses, algorithm.undoInflightHigh)
+			}
+			if !test.recovery && (state.duplicateACKs >= tcpDuplicateACKThreshold || state.haveRACKLoss) {
+				t.Fatal("fixture did not enter through IsLost before DupThresh")
+			}
+			if test.recovery && (state.undo.transport == nil || !state.undo.transport.fastRecovery) {
+				t.Fatal("new replacement loss did not checkpoint the previous recovery")
+			}
+			state.processAcknowledgment(&segment, now, 0)
+			if recorder.checkpoints != 1 || len(recorder.losses) != 2 {
+				t.Fatal("unchanged loss evidence restarted recovery or reported a generation twice")
+			}
+		})
+	}
+}
+
+func TestTCPBBR3UndoRestoresModel(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		timeout bool
+		viaACK  bool
+		frto    bool
+		lossAt  int
+	}{
+		{name: "RACK"},
+		{name: "RTO", timeout: true},
+		{name: "RTO middle probe loss", timeout: true, lossAt: 1},
+		{name: "RTO last probe loss", timeout: true, lossAt: 3},
+		{name: "RACK DSACK", viaACK: true},
+		{name: "RTO DSACK", timeout: true, viaACK: true},
+		{name: "RTO F-RTO", timeout: true, viaACK: true, frto: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			timeout := test.timeout
+			const mss = 1000
+			now := time.Unix(100, 0)
+			epoch := now.Add(-2 * time.Second)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: epoch}
+			state := tcpEstablishedState{
+				connection: connection,
+				controller: newTCPCongestionController(CongestionControlBBR3),
+				peerMSS:    mss, peerSACK: true, peerWindow: 40_000,
+				sendUnacknowledged: 100, sendNext: 4100,
+				congestionWindow: 20_000, slowStartThreshold: 30_000,
+				rtt:         newRTTEstimator(time.Second),
+				outstanding: make([]sentTCPSegment, 4),
+			}
+			state.controller.initialize(CongestionPhaseOpen, epoch, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+			algorithm := state.controller.algorithm.(*bbr3CongestionControl)
+			algorithm.mode, algorithm.probePhase = bbrProbeBandwidth, bbr3ProbeUp
+			algorithm.ackPhase, algorithm.probeSamples = bbr3ACKsProbeFeedback, true
+			algorithm.fullBandwidthReached = true
+			algorithm.minimumRTT = 5 * time.Millisecond
+			algorithm.bandwidthHigh[1] = 1_000_000
+			initialHigh := uint32(20_000)
+			if test.lossAt != 0 {
+				initialHigh = 200_000
+			}
+			algorithm.bandwidthLow, algorithm.inflightLow, algorithm.inflightHigh = 800_000, 16_000, initialHigh
+			packetState := CongestionState{BytesInFlight: uint32(10_000 + test.lossAt*50_000)}
+			for i := range state.outstanding {
+				state.outstanding[i] = sentTCPSegment{
+					sequence: uint32(100 + i*mss), end: uint32(100 + (i+1)*mss),
+					state:                 sentTCPSegmentTransmitted,
+					hostQueue:             testPacketQueueTicketAt(epoch, now.Add(-time.Second)),
+					delivery:              tcpDeliverySnapshot{deliveredStamp: 1},
+					congestionPacketState: bbr3EncodePacketState(&packetState, mss),
+				}
+			}
+			recorder := &bbr3UndoRecorder{algorithm: algorithm}
+			state.controller.algorithm = recorder
+			if !timeout {
+				for i := range state.outstanding {
+					state.outstanding[i].state |= sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost
+				}
+				markProvenTCPLosses(state.outstanding, mss, false)
+				if state.controller.state.LostBytes != 0 || state.undo != nil {
+					t.Fatal("marking loss notified the controller before recovery entry")
+				}
+			}
+			state.prepareRetransmission(0, timeout, !timeout, true, false, 0, now)
+			if recorder.missing || recorder.checkpoints != 1 || len(recorder.losses) != 4 {
+				t.Fatalf("loss event ordering = missing %t checkpoints %d losses %v", recorder.missing, recorder.checkpoints, recorder.losses)
+			}
+			for i, lost := range recorder.losses {
+				if lost != uint64((i+1)*mss) || recorder.flights[i] != recorder.flights[0] {
+					t.Fatalf("per-packet loss/flight = %v/%v", recorder.losses, recorder.flights)
+				}
+			}
+			if algorithm.inflightHigh >= initialHigh || algorithm.probePhase != bbr3ProbeDown || algorithm.undoInflightHigh != initialHigh || recorder.probeExitAt != uint64((test.lossAt+1)*mss) {
+				t.Fatalf("loss model: live %d saved %d phase %s, probe exit at loss %d, want %d", algorithm.inflightHigh, algorithm.undoInflightHigh, algorithm.probePhase, recorder.probeExitAt, (test.lossAt+1)*mss)
+			}
+			// ProbeRTT and repeated recovery-window saves must not replace bounds.
+			algorithm.saveWindow(state.congestionWindow)
+			algorithm.nextSend = now.Add(3 * time.Millisecond)
+			algorithm.pacingWakeDeadline = algorithm.nextSend
+			algorithm.pacingBurstRemaining = mss
+			state.pacing, state.pacingDeadline = true, algorithm.nextSend
+			if test.viaACK {
+				state.undo.recordRetransmission(100, 1100, 10, false)
+				state.recordRetransmission(100, 1100)
+				state.outstanding[0].advanceTransmissionGeneration()
+				state.rebaseOutstanding()
+				// Isolate DSACK from F-RTO and first acknowledge the replacement.
+				// A DSACK beginning at the old SND.UNA with an empty scoreboard
+				// instead denotes reverse-path congestion under RFC 3708 A.1.
+				if !test.frto {
+					state.frtoState = tcpFRTOInactive
+					first := tcpSegment{acknowledgement: 1100, flags: TCPFlagACK, window: 40_000}
+					state.processAcknowledgment(&first, now.Add(time.Millisecond), 0)
+					if state.undo.spuriousUndos != 0 {
+						t.Fatal("ordinary ACK undid recovery without spurious evidence")
+					}
+				} else {
+					state.frtoState = tcpFRTOProbeSent
+				}
+				var options [10]byte
+				options[0], options[1] = TCPHeaderOptionSACK, 10
+				binary.BigEndian.PutUint32(options[2:6], 100)
+				binary.BigEndian.PutUint32(options[6:10], 1100)
+				segment := tcpSegment{acknowledgement: 4100, flags: TCPFlagACK, window: 40_000}
+				if !test.frto {
+					segment.setOptions(options[:])
+				}
+				state.processAcknowledgment(&segment, now.Add(2*time.Millisecond), 0)
+				if !test.frto && !state.seenDSACK || !state.deliverySample.valid || state.deliverySample.losses != 0 || state.fastRecovery || state.rtoRecovery {
+					t.Fatalf("ACK did not complete recovery through a valid delivery sample: %+v", state.deliverySample)
+				}
+			} else if !state.restoreSpuriousRecovery(now.Add(time.Millisecond), 0) {
+				t.Fatal("transport undo failed")
+			}
+			if algorithm.inflightHigh < initialHigh || algorithm.mode != bbrProbeBandwidth || algorithm.probePhase != bbr3ProbeRefill && !(test.viaACK && algorithm.probePhase == bbr3ProbeUp) || algorithm.previousProbeTooHigh {
+				t.Fatalf("undo model = high %d phase %s previous-high %t samples %t", algorithm.inflightHigh, algorithm.probePhase, algorithm.previousProbeTooHigh, algorithm.probeSamples)
+			}
+			if algorithm.bandwidthLow != 0 || algorithm.inflightLow != 0 {
+				t.Fatal("REFILL did not reset lower bounds")
+			}
+			if state.controller.state.LostBytes != 4*mss || state.undo.spuriousUndos != 1 {
+				t.Fatal("undo changed lifetime loss accounting")
+			}
+			if state.pacing || !state.pacingDeadline.IsZero() || !algorithm.pacingWakeDeadline.IsZero() || !algorithm.nextSend.Equal(now.Add(3*time.Millisecond)) || algorithm.pacingBurstRemaining != mss {
+				t.Fatal("undo retained a stale wake or changed published-transmission pacing credit")
+			}
+		})
+	}
+}
+
+func TestBBR3UndoLossInducedExit(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mode      bbrMode
+		exit      bbr3UndoState
+		wantMode  bbrMode
+		wantPhase bbr3ProbePhase
+		wantFull  bool
+	}{
+		{name: "Startup loss", mode: bbrDrain, exit: bbr3UndoStartup, wantMode: bbrStartup, wantPhase: bbr3ProbeDown},
+		{name: "normal Startup exit", mode: bbrDrain, wantMode: bbrDrain, wantPhase: bbr3ProbeDown, wantFull: true},
+		{name: "UP loss", mode: bbrProbeBandwidth, exit: bbr3UndoProbeUp, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeRefill, wantFull: true},
+		{name: "normal UP exit", mode: bbrProbeBandwidth, wantMode: bbrProbeBandwidth, wantPhase: bbr3ProbeDown, wantFull: true},
+		{name: "ProbeRTT after Startup loss", mode: bbrProbeRTT, exit: bbr3UndoStartup, wantMode: bbrProbeRTT, wantPhase: bbr3ProbeDown},
+		{name: "ProbeRTT after UP loss", mode: bbrProbeRTT, exit: bbr3UndoProbeUp, wantMode: bbrProbeRTT, wantPhase: bbr3ProbeDown, wantFull: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bbr := newBBR3CongestionControl()
+			bbr.mode, bbr.probePhase, bbr.undoState = test.mode, bbr3ProbeDown, test.exit
+			bbr.fullBandwidthReached = true
+			bbr.fullBandwidth, bbr.fullRounds = 100_000, 3
+			bbr.undoRecovery(time.Unix(100, 0))
+			if bbr.mode != test.wantMode || bbr.probePhase != test.wantPhase || bbr.fullBandwidthReached != test.wantFull || bbr.undoState != bbr3UndoNone {
+				t.Fatalf("undo phase = %s/%s full %t undo %d", bbr.mode, bbr.probePhase, bbr.fullBandwidthReached, bbr.undoState)
+			}
+			if bbr.fullBandwidth != 0 || bbr.fullRounds != 0 {
+				t.Fatal("full-bandwidth detector was not reset")
+			}
+		})
+	}
+}
+
+func TestBBR3UndoClearsProbeLossHistory(t *testing.T) {
+	for _, phase := range []string{"ProbeRTT", "new UP"} {
+		for _, undo := range []bool{false, true} {
+			name := phase
+			if undo {
+				name += " undo"
+			}
+			t.Run(name, func(t *testing.T) {
+				now := time.Unix(100, 0)
+				bbr := newBBR3CongestionControl()
+				bbr.mode, bbr.probePhase = bbrProbeBandwidth, bbr3ProbeUp
+				bbr.fullBandwidthReached = true
+				bbr.bandwidthHigh[1] = 1_000_000
+				bbr.minimumRTT = 5 * time.Millisecond
+				bbr.inflightHigh = 20_000
+				bbr.handleRecoveryEvent(&CongestionEvent{
+					State:    &CongestionState{CongestionWindow: 24_000},
+					Recovery: CongestionRecovery{Stage: CongestionRecoveryCheckpoint},
+				})
+				bbr.handleInflightTooHigh(10_000, false, 24_000, 1000, now)
+				if !bbr.previousProbeTooHigh || bbr.undoState != bbr3UndoProbeUp || bbr.probePhase != bbr3ProbeDown || bbr.inflightHigh >= 20_000 {
+					t.Fatal("loss did not terminate UP and tighten the model")
+				}
+				if phase == "ProbeRTT" {
+					bbr.mode = bbrProbeRTT
+				} else {
+					bbr.enterProbePhase(bbr3ProbeRefill, now.Add(time.Second))
+					bbr.enterProbePhase(bbr3ProbeUp, now.Add(2*time.Second))
+					bbr.probeUpACKed = 1000
+					bbr.ackPhase = bbr3ACKsProbeStarting
+				}
+				if undo {
+					bbr.undoRecovery(now.Add(3 * time.Second))
+					if bbr.inflightHigh != 20_000 || bbr.undoState != bbr3UndoNone {
+						t.Fatal("undo did not restore the model and consume its checkpoint")
+					}
+				}
+				if phase == "ProbeRTT" {
+					if bbr.mode != bbrProbeRTT {
+						t.Fatal("undo interrupted ProbeRTT")
+					}
+					bbr.exitProbeRTT(now.Add(4 * time.Second))
+					bbr.enterProbePhase(bbr3ProbeRefill, now.Add(5*time.Second))
+					bbr.enterProbePhase(bbr3ProbeUp, now.Add(6*time.Second))
+				} else if bbr.mode != bbrProbeBandwidth || bbr.probePhase != bbr3ProbeUp || bbr.probeUpACKed != 1000 || bbr.ackPhase != bbr3ACKsProbeStarting {
+					t.Fatal("undo restarted an already active UP phase")
+				}
+				sample := &tcpDeliveryRateSample{ackTime: now.Add(7 * time.Second), priorInFlight: 20_000}
+				bbr.updateProbeBandwidth(sample, bbr3PacketSnapshot{}, 1_000_000, 24_000, 1000)
+				wantPhase := bbr3ProbeDown
+				if undo {
+					wantPhase = bbr3ProbeUp
+				}
+				if bbr.probePhase != wantPhase || bbr.stoppedRiskyProbe == undo || bbr.previousProbeTooHigh {
+					t.Fatalf("subsequent probe = %s previous-high %t stopped-risky %t, want phase %s undo %t", bbr.probePhase, bbr.previousProbeTooHigh, bbr.stoppedRiskyProbe, wantPhase, undo)
+				}
+			})
+		}
 	}
 }
 

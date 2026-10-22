@@ -107,8 +107,8 @@ func TestCongestionControllerComposesPacingWithoutDeliverySampling(t *testing.T)
 	if delay := controller.pacingDelay(time.Unix(100, 0), 1000, 10_000, 0, 1000, time.Millisecond, 20_000); delay != 7*time.Millisecond {
 		t.Fatalf("custom pacing delay = %v, want 7ms", delay)
 	}
-	_, _ = controller.onDataSend(1000, 1000, time.Unix(100, 0), 1, 0, 10_000, 0, time.Millisecond, 20_000)
-	_ = controller.onRetransmit(1000, 1000, time.Unix(100, 0), 1, 10_000, 0, 1000, time.Millisecond, 20_000)
+	_, _ = controller.onDataSend(1000, 1000, time.Unix(100, 0), 1, 0, 10_000, 0, 0, time.Millisecond, 20_000)
+	_ = controller.onRetransmit(1000, 1000, time.Unix(100, 0), 1, 10_000, 0, 0, 1000, time.Millisecond, 20_000)
 	if implementation.dataEvents != 1 || implementation.pacedSends != 1 || implementation.retransmits != 1 {
 		t.Fatalf("pacing callbacks = event %d send %d retransmit %d, want 1/1/1", implementation.dataEvents, implementation.pacedSends, implementation.retransmits)
 	}
@@ -124,7 +124,7 @@ func TestCongestionControllerComposesDeliverySamplingWithCommonPacing(t *testing
 		t.Fatalf("capabilities = delivery %t custom pacing %t", controller.usesDeliveryRate(), controller.customPacing())
 	}
 	controller.initialize(CongestionPhaseOpen, time.Unix(100, 0), 0, time.Millisecond, 10_000, 20_000, 1000, 1)
-	snapshot, window := controller.onDataSend(1000, 1000, time.Unix(100, 0), 2, 0, 10_000, 0, time.Millisecond, 20_000)
+	snapshot, window := controller.onDataSend(1000, 1000, time.Unix(100, 0), 2, 0, 10_000, 0, 0, time.Millisecond, 20_000)
 	if snapshot.deliveredStamp == 0 || window != 10_000 || controller.pacingSegments != 1 {
 		t.Fatalf("delivery send = stamp %d window %d pacing segments %d", snapshot.deliveredStamp, window, controller.pacingSegments)
 	}
@@ -231,13 +231,13 @@ func TestWindowPacingUsesLinuxRates(t *testing.T) {
 	slowStart := newTCPCongestionController(CongestionControlReno)
 	slowStart.pacingSegments = tcpPacingInitialBurst - 1
 	slowStart.pacingNext = start
-	_, _ = slowStart.onDataSend(mss, mss, start, 0, window, window, window, 100*time.Millisecond, ^uint32(0))
+	_, _ = slowStart.onDataSend(mss, mss, start, 0, window, window, window, window, 100*time.Millisecond, ^uint32(0))
 	slowInterval := slowStart.pacingNext.Sub(start)
 
 	avoidance := newTCPCongestionController(CongestionControlCUBIC)
 	avoidance.pacingSegments = tcpPacingInitialBurst - 1
 	avoidance.pacingNext = start
-	_, _ = avoidance.onDataSend(mss, mss, start, 0, window, window, window, 100*time.Millisecond, window)
+	_, _ = avoidance.onDataSend(mss, mss, start, 0, window, window, window, window, 100*time.Millisecond, window)
 	avoidanceInterval := avoidance.pacingNext.Sub(start)
 
 	if slowInterval < 4999*time.Microsecond || slowInterval > 5001*time.Microsecond {
@@ -284,7 +284,7 @@ func TestMaximumPacingRateLimitsEveryController(t *testing.T) {
 			continue
 		}
 		controller.pacingSegments = tcpPacingInitialBurst - 1
-		_, _ = controller.onDataSend(mss, mss, time.Unix(100, 0), 0, 10*mss, 10*mss, 10*mss, time.Millisecond, 10*mss)
+		_, _ = controller.onDataSend(mss, mss, time.Unix(100, 0), 0, 10*mss, 10*mss, 10*mss, 10*mss, time.Millisecond, 10*mss)
 		if effective := controller.limitPacingRate(controller.pacingRate); effective != float64(limit) || controller.pacingRate <= effective {
 			t.Fatalf("%s pacing model/effective rate = %v/%v, want model above %d and effective at limit", algorithm, controller.pacingRate, effective, limit)
 		}
@@ -328,7 +328,7 @@ func TestWindowPacingDefersAfterInitialBurst(t *testing.T) {
 	start := time.Unix(100, 0)
 	for segment := 0; segment < tcpPacingInitialBurst+4; segment++ {
 		flight := uint32(segment * mss)
-		_, _ = controller.onDataSend(mss, mss, start, 0, flight, 10*mss, flight, 100*time.Millisecond, ^uint32(0))
+		_, _ = controller.onDataSend(mss, mss, start, 0, flight, 10*mss, flight, flight, 100*time.Millisecond, ^uint32(0))
 	}
 	if delay := controller.pacingDelay(start, mss, 10*mss, 10*mss, mss, 100*time.Millisecond, ^uint32(0)); delay <= 0 {
 		t.Fatal("window-based pacer did not defer after its initial burst")

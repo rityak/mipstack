@@ -93,6 +93,18 @@ const (
 	bbr3ACKsProbeStopping
 )
 
+// bbr3UndoState identifies a loss-induced exit from bandwidth probing.
+type bbr3UndoState uint8
+
+const (
+	// bbr3UndoNone indicates that no loss-induced probing exit is pending undo.
+	bbr3UndoNone bbr3UndoState = iota
+	// bbr3UndoStartup marks loss-induced Startup completion for undo.
+	bbr3UndoStartup
+	// bbr3UndoProbeUp marks a loss-induced Probe Up exit for undo.
+	bbr3UndoProbeUp
+)
+
 // bbr3PacketSnapshot is decoded controller-owned per-transmission state.
 type bbr3PacketSnapshot struct {
 	inflight           uint32
@@ -162,6 +174,7 @@ type bbr3CongestionControl struct {
 	lossRecovery         bool
 	packetConservation   bool
 	undoBounds           bool
+	undoState            bbr3UndoState
 
 	inflightLow        uint32
 	inflightHigh       uint32
@@ -315,6 +328,16 @@ func (b *bbr3CongestionControl) syncDeliveryState(state *CongestionState) {
 // handleRecoveryEvent checkpoints, restores, or exits controller recovery state.
 func (b *bbr3CongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 	switch event.Recovery.Stage {
+	case CongestionRecoveryCheckpoint:
+		// BBR draft section 5.5.11 saves model bounds before recoverable
+		// loss can lower them. Window saves for recovery or ProbeRTT must
+		// not replace this episode's checkpoint.
+		b.undoBounds = true
+		b.undoState = bbr3UndoNone
+		b.undoBandwidthLow = b.bandwidthLow
+		b.undoInflightLow = b.inflightLow
+		b.undoInflightHigh = b.inflightHigh
+		b.saveWindow(event.State.CongestionWindow)
 	case CongestionRecoverySelectFlight:
 		event.Recovery.Flight = event.Recovery.OrdinaryFlight
 	case CongestionRecoveryEnter:
@@ -326,10 +349,26 @@ func (b *bbr3CongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 	case CongestionRecoveryPRR, CongestionRecoveryExit, CongestionRecoveryPartialACK, CongestionRecoveryDuplicateACK:
 		event.State.CongestionWindow = event.Recovery.PreviousWindow
 	case CongestionRecoveryUndo:
-		b.undoRecovery()
+		b.undoRecovery(event.Time)
 		if event.State.CongestionWindow < b.priorWindow {
 			event.State.CongestionWindow = b.priorWindow
 		}
+		// BBR draft sections 5.6.4.4 and 5.6.4.7 bound restored cwnd by the
+		// current model. A late DSACK may not trigger a subsequent ACK update.
+		mss := event.State.MaximumSegmentSize
+		window := b.boundWindow(uint64(event.State.CongestionWindow), mss)
+		// BBR draft section 5.6.4.5 also applies ProbeRTT's independent target.
+		if b.mode == bbrProbeRTT {
+			probeTarget := b.modelWindowForBandwidth(b.effectiveBandwidth(), bbr3ProbeRTTWindowGain, mss)
+			if minimum := uint64(bbrMinimumCongestionMSS * mss); probeTarget < minimum {
+				probeTarget = minimum
+			}
+			if window > probeTarget {
+				window = probeTarget
+			}
+		}
+		event.State.CongestionWindow = clampCongestionUint32(window)
+		b.setPacingRate(event.State.CongestionWindow, event.State.SmoothedRTT)
 	}
 }
 
@@ -482,6 +521,11 @@ func (b *bbr3CongestionControl) checkStartupLoss(sample *tcpDeliveryRateSample, 
 		b.lossEventsInRound++
 	}
 	if sample.PacketLossEvidenceValid() && b.lossRoundStart && sample.fastRecovery && b.lossEventsInRound >= bbr3FullLossEvents && b.inflightTooHigh(b.lossesSince(packet), packet.inflight) {
+		// BBR draft section 5.5.11 restores loss-induced Startup completion,
+		// including when ProbeRTT temporarily suspends Startup.
+		if b.undoBounds && b.undoState == bbr3UndoNone {
+			b.undoState = bbr3UndoStartup
+		}
 		b.fullBandwidthReached = true
 		upper := b.quantizeWindowAt(b.modelWindowForBandwidth(b.maximumBandwidth(), 1, mss), mss, false)
 		if uint64(b.latestInflight) > upper {
@@ -844,6 +888,9 @@ func (b *bbr3CongestionControl) handleInflightTooHigh(inflight uint32, applicati
 		b.inflightHigh = clampCongestionUint32(upper)
 	}
 	if b.mode == bbrProbeBandwidth && b.probePhase == bbr3ProbeUp {
+		if b.undoBounds && b.undoState == bbr3UndoNone {
+			b.undoState = bbr3UndoProbeUp
+		}
 		b.enterProbePhase(bbr3ProbeDown, now)
 	}
 }
@@ -902,8 +949,6 @@ func (b *bbr3CongestionControl) updateMinimumRTT(window uint32, sample *tcpDeliv
 		if window < b.priorWindow {
 			window = b.priorWindow
 		}
-		b.bandwidthLow = 0
-		b.inflightLow = 0
 		b.exitProbeRTT(sample.ackTime)
 	}
 	return window
@@ -911,6 +956,10 @@ func (b *bbr3CongestionControl) updateMinimumRTT(window uint32, sample *tcpDeliv
 
 // exitProbeRTT restores Startup or ProbeBW after the measurement interval.
 func (b *bbr3CongestionControl) exitProbeRTT(now time.Time) {
+	// Linux BBRv3 bbr_exit_probe_rtt resets lower bounds before resuming
+	// Startup or ProbeBW, including an exit on idle restart.
+	b.bandwidthLow = 0
+	b.inflightLow = 0
 	if b.fullBandwidthReached {
 		b.mode = bbrProbeBandwidth
 		b.enterProbePhase(bbr3ProbeDown, now)
@@ -1359,14 +1408,8 @@ func (b *bbr3CongestionControl) onDeliverySend(now time.Time, packetsOut, window
 	return window
 }
 
-// saveWindow checkpoints model and window state before recovery or ProbeRTT.
+// saveWindow remembers a usable cwnd before recovery or ProbeRTT reduction.
 func (b *bbr3CongestionControl) saveWindow(window uint32) {
-	if !b.recovery && !b.lossRecovery {
-		b.undoBounds = true
-		b.undoBandwidthLow = b.bandwidthLow
-		b.undoInflightLow = b.inflightLow
-		b.undoInflightHigh = b.inflightHigh
-	}
 	if !b.recovery && !b.lossRecovery && b.mode != bbrProbeRTT {
 		b.priorWindow = window
 	} else if window > b.priorWindow {
@@ -1376,7 +1419,7 @@ func (b *bbr3CongestionControl) saveWindow(window uint32) {
 
 // undoRecovery restores model state after Eifel, DSACK, or F-RTO proves
 // recovery spurious.
-func (b *bbr3CongestionControl) undoRecovery() {
+func (b *bbr3CongestionControl) undoRecovery(now time.Time) {
 	b.resetFullBandwidth()
 	b.recovery = false
 	b.lossRecovery = false
@@ -1389,6 +1432,22 @@ func (b *bbr3CongestionControl) undoRecovery() {
 		b.inflightHigh = bbr3WiderBound(b.inflightHigh, b.undoInflightHigh)
 		b.undoBounds = false
 	}
+	// BBR draft section 5.5.11 restarts loss-terminated probing from Startup
+	// or REFILL without rolling back delivery filters or interrupting ProbeRTT.
+	switch b.undoState {
+	case bbr3UndoStartup:
+		b.fullBandwidthReached = false
+		if b.mode != bbrProbeRTT {
+			b.mode = bbrStartup
+		}
+	case bbr3UndoProbeUp:
+		b.previousProbeTooHigh = false
+		if b.mode != bbrProbeRTT && (b.mode != bbrProbeBandwidth || b.probePhase != bbr3ProbeUp) {
+			b.mode = bbrProbeBandwidth
+			b.enterProbePhase(bbr3ProbeRefill, now)
+		}
+	}
+	b.undoState = bbr3UndoNone
 }
 
 // bbr3WiderBound combines optional integer bounds by choosing the less restrictive.

@@ -4471,8 +4471,12 @@ func TestTCPResetRequiresRetainedReceiveBoundary(t *testing.T) {
 			peer := link.tcp[clientPort]
 			sequence, acknowledgement := peer.serverNext, peer.clientNext
 			next := sequence
+			wantRetained := int64(0)
 			if scenario == "discarded" {
 				_ = connection.SetReadBuffer(1)
+				// Only the low-sequence prefix fits; the original right boundary
+				// belongs to discarded data and must not authorize a reset.
+				wantRetained = 1
 			}
 			_ = link.deliverTCP(8080, clientPort, sequence+20, acknowledgement, TCPFlagACK, 65535, nil, []byte("tail"))
 			_ = readOutboundPacket(t, stack)
@@ -4520,8 +4524,8 @@ func TestTCPResetRequiresRetainedReceiveBoundary(t *testing.T) {
 					}
 				}
 			}
-			if bytes := connection.outOfOrderUnread.Load(); bytes != 0 {
-				t.Fatalf("retained receive bytes = %d, want 0", bytes)
+			if bytes := connection.outOfOrderUnread.Load(); bytes != wantRetained {
+				t.Fatalf("retained receive bytes = %d, want %d", bytes, wantRetained)
 			}
 			right := sequence + 24
 			if scenario == "DSACK" {
@@ -4893,9 +4897,20 @@ func TestTCPPLPMTURequiresIsolatedLossEvidence(t *testing.T) {
 	}
 }
 
+// recordTestTCPLosses exercises loss inference and per-generation accounting
+// without a live connection or congestion-controller callbacks.
+func recordTestTCPLosses(outstanding []sentTCPSegment, mss int) uint32 {
+	markProvenTCPLosses(outstanding, mss, false)
+	var losses uint32
+	for index := range outstanding {
+		losses += recordTCPSegmentLoss(&outstanding[index])
+	}
+	return losses
+}
+
 func TestTCPProvenLossAccountingUsesTransmissionGenerations(t *testing.T) {
 	speculative := sentTCPSegment{sequence: 0, end: 1000, state: sentTCPSegmentTransmitted}
-	if loss := recordTCPSegmentLoss(&speculative, false); loss != 0 || speculative.lossAlreadyReported() {
+	if loss := recordTCPSegmentLoss(&speculative); loss != 0 || speculative.lossAlreadyReported() {
 		t.Fatalf("speculative retransmission loss = %d, reported %t", loss, speculative.lossAlreadyReported())
 	}
 	segments := []sentTCPSegment{
@@ -4905,19 +4920,19 @@ func TestTCPProvenLossAccountingUsesTransmissionGenerations(t *testing.T) {
 		{sequence: 3000, end: 4000, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
 		{sequence: 4000, end: 5000, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
 	}
-	if losses := recordProvenTCPLosses(segments, 1000); losses != 2000 {
+	if losses := recordTestTCPLosses(segments, 1000); losses != 2000 {
 		t.Fatalf("initial proven losses = %d, want 2000", losses)
 	}
-	if losses := recordProvenTCPLosses(segments, 1000); losses != 0 {
+	if losses := recordTestTCPLosses(segments, 1000); losses != 0 {
 		t.Fatalf("repeated proven losses = %d", losses)
 	}
 	segments[0].advanceTransmissionGeneration()
 	segments[0].state.set(sentTCPSegmentSACKRetried, true)
-	if losses := recordProvenTCPLosses(segments, 1000); losses != 0 {
+	if losses := recordTestTCPLosses(segments, 1000); losses != 0 {
 		t.Fatalf("speculative replacement loss = %d", losses)
 	}
 	segments[0].state.set(sentTCPSegmentRACKLost, true)
-	if losses := recordProvenTCPLosses(segments, 1000); losses != 1000 {
+	if losses := recordTestTCPLosses(segments, 1000); losses != 1000 {
 		t.Fatalf("RACK-proven replacement loss = %d, want 1000", losses)
 	}
 	segments[0].state |= sentTCPSegmentLossReported
@@ -4982,12 +4997,18 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	state := tcpEstablishedState{
 		connection: &TCPConn{stack: new(Stack)}, controller: timeoutDSACKController,
 		undo: timeoutDSACK, peerMSS: 1000, congestionWindow: 1000, slowStartThreshold: 8000,
+		outstanding:  []sentTCPSegment{{sequence: 2000, end: 3000, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKRetried | sentTCPSegmentOriginalLost | sentTCPSegmentRACKLost | sentTCPSegmentLossReported}},
+		haveRACKLoss: true,
 	}
+	state.controller.state.LostBytes = 1000
 	if !state.restoreSpuriousRecovery(time.Unix(100, 0), 1000) {
 		t.Fatal("DSACK evidence did not restore timeout recovery")
 	}
 	if state.eifelRTO == nil {
 		t.Fatal("DSACK evidence did not install the RFC 4015 spurious-timeout response")
+	}
+	if state.haveRACKLoss || state.outstanding[0].state.has(sentTCPSegmentOriginalLost|sentTCPSegmentRACKLost) || !state.outstanding[0].state.has(sentTCPSegmentSACKRetried) || !state.outstanding[0].lossAlreadyReported() || state.controller.state.LostBytes != 1000 || sackRecoveryPipe(state.outstanding, 1000) != 2000 {
+		t.Fatalf("timeout undo discarded published flight or loss history: state %#x lost %d Pipe %d", state.outstanding[0].state, state.controller.state.LostBytes, sackRecoveryPipe(state.outstanding, 1000))
 	}
 
 	var repeated tcpRecoveryUndo
@@ -5569,7 +5590,7 @@ func TestTCPCWRRecoveryPointTracksACKProgress(t *testing.T) {
 				point := state.ecnRecoveryPoint
 				if recovery != "ordinary" {
 					state.rtoAttempts = 1
-					if index := state.prepareRetransmission(0, true, false, true, now.Add(2*time.Millisecond)); index != 0 || state.undo == nil || state.undo.transport == nil || state.undo.transport.phase != CongestionPhaseCWR {
+					if index := state.prepareRetransmission(0, true, false, true, false, 0, now.Add(2*time.Millisecond)); index != 0 || state.undo == nil || state.undo.transport == nil || state.undo.transport.phase != CongestionPhaseCWR {
 						t.Fatal("nested timeout did not retain the active CWR episode")
 					}
 					if recovery == "undo-before-point" {
@@ -5616,7 +5637,7 @@ func TestTCPOldACKOnlyReportsNewDeliveryEvidence(t *testing.T) {
 			outstanding: []sentTCPSegment{{sequence: 2000, end: 3000}, {sequence: 3000, end: 4000}, {sequence: 4000, end: 5000}},
 		}
 		for index := range state.outstanding {
-			snapshot, _ := state.controller.onDataSend(1000, 1000, now, 1, uint32(index*1000), 10_000, 0, time.Millisecond, 10_000)
+			snapshot, _ := state.controller.onDataSend(1000, 1000, now, 1, uint32(index*1000), 10_000, 0, 0, time.Millisecond, 10_000)
 			state.outstanding[index].delivery = snapshot
 			state.outstanding[index].state.set(sentTCPSegmentTransmitted, true)
 			state.outstanding[index].hostQueue.queuedAt = 1
@@ -5690,7 +5711,7 @@ func TestTCPRecoveryEventsUseLossObservationTime(t *testing.T) {
 				observation = time.Time{}
 			}
 			before := time.Now()
-			if index := state.prepareRetransmission(0, timeout, false, true, observation); index != 0 {
+			if index := state.prepareRetransmission(0, timeout, false, true, false, 0, observation); index != 0 {
 				t.Fatalf("selected retransmission = %d, want 0", index)
 			}
 			after := time.Now()
@@ -10681,7 +10702,7 @@ func TestTCPZeroWindowRetransmissionDisablesLossEvidence(t *testing.T) {
 		outstanding: []sentTCPSegment{{sequence: 100, end: 1100,
 			state: sentTCPSegmentTransmitted, congestionPacketState: controller.transmissionState()}},
 	}
-	if index := state.prepareRetransmission(0, true, false, false, now); index != 0 {
+	if index := state.prepareRetransmission(0, true, false, false, false, 0, now); index != 0 {
 		t.Fatalf("zero-window retransmission index = %d, want 0", index)
 	}
 	if recorder.lossEvidence {
@@ -10975,7 +10996,7 @@ func TestTCPZeroWindowRetransmissionCancelsPLPMTUProbe(t *testing.T) {
 			state.sendNext = 100 + uint32(payloadSize)
 			state.outstanding = []sentTCPSegment{{sequence: 100, end: state.sendNext, flags: TCPFlagACK, state: sentTCPSegmentTransmitted | sentTCPSegmentMTUProbe}}
 			state.pathMTUState = &tcpEstablishedPathMTUState{discovery: tcpPLPMTU{active: true, searching: true, probeMTU: 2000, probeStart: 100, probeEnd: state.sendNext, searchLow: 1500, searchHigh: 3000}}
-			index := state.prepareRetransmission(0, true, false, false, time.Now())
+			index := state.prepareRetransmission(0, true, false, false, false, 0, time.Now())
 			if index != 0 || len(state.outstanding) != 2 {
 				t.Fatalf("retransmission index/segments = %d/%d, want 0/2", index, len(state.outstanding))
 			}
@@ -11450,12 +11471,11 @@ func TestTCPOutOfOrderEarlierFINWins(t *testing.T) {
 	receiveWindow := uint32(1000)
 	var pieces []tcpReceivedPiece
 	bytes := 0
-	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 0, 200, nil, nil, true, &pieces, &bytes) {
+	connection.receiveTCPData(200, nil, true, receiveWindow, 0, &receiveNext, &pieces, &bytes)
+	if len(pieces) != 1 || pieces[0].sequence != 200 || !pieces[0].fin {
 		t.Fatal("later out-of-order FIN was not retained")
 	}
-	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 0, 150, nil, nil, true, &pieces, &bytes) {
-		t.Fatal("earlier out-of-order FIN was not retained")
-	}
+	connection.receiveTCPData(150, nil, true, receiveWindow, 0, &receiveNext, &pieces, &bytes)
 	if len(pieces) != 1 || pieces[0].sequence != 150 || !pieces[0].fin {
 		t.Fatalf("normalized FIN pieces = %+v, want FIN at 150", pieces)
 	}
@@ -11467,9 +11487,8 @@ func TestTCPOutOfOrderFINCompactsTruncatedRange(t *testing.T) {
 	copy(owner, "abcdefghijklmnopqrstuvwxyz")
 	pieces := []tcpReceivedPiece{{sequence: 104, payload: owner}}
 	bytes := len(owner)
-	if !connection.storeTCPOutOfOrder(100, 64, 0, 106, nil, nil, true, &pieces, &bytes) {
-		t.Fatal("earlier FIN was not retained")
-	}
+	receiveNext := uint32(100)
+	connection.receiveTCPData(106, nil, true, 64, 0, &receiveNext, &pieces, &bytes)
 	if len(pieces) != 1 || !pieces[0].fin || string(pieces[0].payload) != "ab" ||
 		&pieces[0].payload[0] == &owner[0] || cap(pieces[0].payload) != len(pieces[0].payload) || bytes != 2 {
 		t.Fatalf("FIN-truncated range retained owner backing: pieces=%+v bytes=%d capacity=%d", pieces, bytes, cap(pieces[0].payload))
@@ -11789,10 +11808,11 @@ func TestRACKMarksOlderTransmission(t *testing.T) {
 		{sequence: 100, end: 200, hostQueue: testPacketQueueTicketAt(base, base)},
 		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(20*time.Millisecond))},
 	}
-	var latest tcpRACKSample
-	outstanding, _, _, _, latest, _ = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}}, base)
-	latest.rtt = 5 * time.Millisecond
-	markRACKLoss(outstanding, latest, base.Add(20*time.Millisecond), 10*time.Millisecond, base)
+	var delivered []sentTCPSegment
+	outstanding, _, _, _, delivered = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}})
+	state := tcpEstablishedState{connection: &TCPConn{stack: &Stack{timestampEpoch: base}}}
+	state.observeRACKDelivery(delivered, 300, &tcpSegment{}, base.Add(25*time.Millisecond), 0, 0)
+	markRACKLoss(outstanding, state.rackLatestDelivered, base.Add(25*time.Millisecond), 10*time.Millisecond, base)
 	if !outstanding[0].state.has(sentTCPSegmentRACKLost) || outstanding[1].state.has(sentTCPSegmentRACKLost) {
 		t.Fatalf("RACK loss state = [%v %v]", outstanding[0].state.has(sentTCPSegmentRACKLost), outstanding[1].state.has(sentTCPSegmentRACKLost))
 	}
@@ -11856,11 +11876,11 @@ func TestRACKPreservesTransmissionOrderAcrossClockTies(t *testing.T) {
 	if !tcpSequenceGreater(retransmissionOrder, originalOrder) {
 		t.Fatalf("clock-tied transmission order = %d after %d", retransmissionOrder, originalOrder)
 	}
-	if later := newerRACKSample(
-		tcpRACKSample{sentAt: base, end: 200, order: originalOrder},
-		tcpRACKSample{sentAt: base, end: 300, order: originalOrder},
-	); later.end != 300 {
-		t.Fatalf("same-transmission clock tie selected end %d, want 300", later.end)
+	transport.connection = &TCPConn{stack: &Stack{timestampEpoch: base}}
+	transport.rackLatestDelivered = tcpRACKSample{sentAt: original.queuedTime(base), end: 200, order: originalOrder}
+	transport.observeRACKDelivery([]sentTCPSegment{{end: 300, hostQueue: original, transmissionOrder: originalOrder}}, 300, &tcpSegment{}, base.Add(time.Millisecond), 0, 0)
+	if transport.rackLatestDelivered.end != 300 {
+		t.Fatalf("same-transmission clock tie selected end %d, want 300", transport.rackLatestDelivered.end)
 	}
 	segment := sentTCPSegment{
 		sequence:          100,
@@ -11888,6 +11908,23 @@ func TestRACKPreservesTransmissionOrderAcrossClockTies(t *testing.T) {
 	}
 }
 
+func TestRACKDeliveryClipsAcknowledgedEnd(t *testing.T) {
+	base := time.Unix(100, 0)
+	for _, test := range []struct{ end, acknowledged, want uint32 }{
+		{200, 150, 150},
+		{50, ^uint32(0) - 50, ^uint32(0) - 50},
+		{50, 25, 25},
+		{^uint32(0) - 50, 50, ^uint32(0) - 50},
+	} {
+		state := tcpEstablishedState{connection: &TCPConn{stack: &Stack{timestampEpoch: base}}}
+		delivered := []sentTCPSegment{{end: test.end, hostQueue: testPacketQueueTicketAt(base, base)}}
+		state.observeRACKDelivery(delivered, test.acknowledged, &tcpSegment{}, base.Add(time.Millisecond), 0, 0)
+		if got := state.rackLatestDelivered.end; got != test.want {
+			t.Fatalf("delivered end %d capped at %d = %d, want %d", test.end, test.acknowledged, got, test.want)
+		}
+	}
+}
+
 func TestRACKUsesMaximumRemainingWait(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{
@@ -11901,34 +11938,492 @@ func TestRACKUsesMaximumRemainingWait(t *testing.T) {
 	}
 }
 
+func TestRACKLossCutoffMatchesTransmissionTimes(t *testing.T) {
+	for _, epoch := range []time.Time{time.Unix(100, 0), time.Now()} {
+		for _, elapsed := range []time.Duration{-time.Nanosecond, 0, time.Millisecond, 3*time.Millisecond - time.Nanosecond, 3 * time.Millisecond, 3*time.Millisecond + time.Nanosecond, 10 * time.Millisecond} {
+			now := epoch.Add(elapsed)
+			const rtt, window = time.Millisecond, 2 * time.Millisecond
+			outstanding := []sentTCPSegment{
+				{sequence: 100, end: 200, hostQueue: testPacketQueueTicketAt(epoch, epoch)},
+				{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(time.Nanosecond))},
+				{sequence: 300, end: 400, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(time.Millisecond)), state: sentTCPSegmentSACKed},
+				{sequence: 400, end: 500, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(2*time.Millisecond)), state: sentTCPSegmentRACKLost | sentTCPSegmentSACKRetried},
+				{sequence: 500, end: 600},
+				{sequence: 600, end: 700, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(4*time.Millisecond))},
+			}
+			delivered := tcpRACKSample{sentAt: epoch.Add(4 * time.Millisecond), end: 600, rtt: rtt}
+			want := append([]sentTCPSegment(nil), outstanding...)
+			var wantDelay time.Duration
+			wantTimer, wantLoss := false, false
+			for index := range want {
+				segment := &want[index]
+				sentAt := segment.transmittedAt(epoch)
+				latestAt := delivered.sentAt
+				after := latestAt.After(sentAt) || latestAt.Equal(sentAt) && tcpClockTieTransmissionAfter(delivered.order, delivered.end, segment.transmissionOrder, segment.end)
+				deadline := sentAt.Add(rtt + window)
+				if !segment.state.has(sentTCPSegmentSACKed|sentTCPSegmentRACKLost) && after {
+					remaining := deadline.Sub(now)
+					if remaining < 0 {
+						remaining = 0
+					}
+					if !wantTimer || remaining > wantDelay {
+						wantDelay = remaining
+					}
+					wantTimer = true
+				}
+				if !segment.state.has(sentTCPSegmentSACKed) && after && !now.Before(deadline) {
+					segment.state |= sentTCPSegmentRACKLost
+					segment.state.set(sentTCPSegmentSACKRetried, false)
+				}
+				wantLoss = wantLoss || segment.state.has(sentTCPSegmentRACKLost) && !segment.state.has(sentTCPSegmentSACKRetried)
+			}
+			if delay, ok := rackLossDelay(outstanding, delivered, now, window, epoch); ok != wantTimer || delay != wantDelay {
+				t.Fatalf("epoch %v elapsed %v: RACK delay = %v, %t; want %v, %t", epoch, elapsed, delay, ok, wantDelay, wantTimer)
+			}
+			if lost := markRACKLoss(outstanding, delivered, now, window, epoch); lost != wantLoss {
+				t.Fatalf("epoch %v elapsed %v: RACK loss = %t, want %t", epoch, elapsed, lost, wantLoss)
+			}
+			for index := range outstanding {
+				if outstanding[index].state != want[index].state {
+					t.Fatalf("epoch %v elapsed %v range %d: state = %#x, want %#x", epoch, elapsed, index, outstanding[index].state, want[index].state)
+				}
+			}
+		}
+	}
+}
+
 func TestRACKRejectsAmbiguousRetransmissionRTT(t *testing.T) {
-	sample := tcpRACKSample{sentAt: time.Unix(100, 0), end: 200, rtt: 5 * time.Millisecond, timestamp: 200, retransmitted: true}
-	if got := validRACKSample(sample, 10*time.Millisecond, 200); !got.sentAt.IsZero() {
-		t.Fatalf("ambiguous retransmission sample was accepted: %+v", got)
+	base := time.Unix(100, 0)
+	for _, test := range []struct {
+		name          string
+		rtt           time.Duration
+		echo          uint32
+		retransmitted bool
+		valid         bool
+	}{
+		{"below-minimum", 5 * time.Millisecond, 200, true, false},
+		{"older-echo", 20 * time.Millisecond, 199, true, false},
+		{"latest-echo", 20 * time.Millisecond, 200, true, true},
+		{"original", 20 * time.Millisecond, 0, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := tcpEstablishedState{
+				connection: &TCPConn{stack: &Stack{timestampEpoch: base}},
+				rtt:        rttEstimator{minimum: 10 * time.Millisecond},
+			}
+			segment := sentTCPSegment{end: 200, timestamp: 200, hostQueue: testPacketQueueTicketAt(base, base)}
+			segment.state.set(sentTCPSegmentRetransmitted, test.retransmitted)
+			state.observeRACKDelivery([]sentTCPSegment{segment}, 200, &tcpSegment{}, base.Add(test.rtt), test.echo, 0)
+			if valid := !state.rackLatestDelivered.sentAt.IsZero(); valid != test.valid {
+				t.Fatalf("RACK sample = %+v, want valid %t", state.rackLatestDelivered, test.valid)
+			}
+		})
 	}
-	sample.rtt = 20 * time.Millisecond
-	if got := validRACKSample(sample, 10*time.Millisecond, 199); !got.sentAt.IsZero() {
-		t.Fatalf("sample for an older timestamped copy was accepted: %+v", got)
+}
+
+func TestRACKSampleRTTBounds(t *testing.T) {
+	for _, retransmitted := range []bool{false, true} {
+		for _, elapsed := range []time.Duration{-time.Millisecond, -time.Nanosecond, 0, time.Nanosecond, time.Microsecond, time.Millisecond} {
+			t.Run(fmt.Sprintf("retransmitted-%t/%s", retransmitted, elapsed), func(t *testing.T) {
+				base := time.Unix(100, 0)
+				sentAt := base.Add(time.Second)
+				sample := tcpRACKSample{sentAt: sentAt, end: 200, rtt: elapsed, timestamp: 100, retransmitted: retransmitted}
+				state := tcpEstablishedState{connection: &TCPConn{stack: &Stack{timestampEpoch: base}}}
+				segment := sentTCPSegment{end: sample.end, timestamp: sample.timestamp, hostQueue: testPacketQueueTicketAt(base, sentAt)}
+				segment.state.set(sentTCPSegmentRetransmitted, retransmitted)
+				state.observeRACKDelivery([]sentTCPSegment{segment}, sample.end, &tcpSegment{}, sentAt.Add(elapsed), sample.timestamp, 0)
+				got := state.rackLatestDelivered
+				if elapsed < 0 {
+					if !got.sentAt.IsZero() {
+						t.Fatalf("negative RTT sample was accepted: %+v", got)
+					}
+					return
+				}
+				if sample.rtt < time.Microsecond {
+					sample.rtt = time.Microsecond
+				}
+				if got != sample {
+					t.Fatalf("RACK sample = %+v, want %+v", got, sample)
+				}
+			})
+		}
 	}
-	if got := validRACKSample(sample, 10*time.Millisecond, 200); got.sentAt.IsZero() {
-		t.Fatal("sample matching the latest timestamped retransmission was rejected")
+}
+
+func TestTCPRACKIgnoresTransmissionAfterACKArrival(t *testing.T) {
+	for _, name := range []string{"cumulative", "partial", "SACK"} {
+		for _, previous := range []bool{false, true} {
+			for _, clock := range []string{"unstamped", "arrival", "advanced"} {
+				t.Run(fmt.Sprintf("%s/previous-%t/%s", name, previous, clock), func(t *testing.T) {
+					now := time.Unix(100, 0)
+					epoch := now.Add(-time.Second)
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					connection.stack = &Stack{timestampEpoch: epoch}
+					connection.sendBuffer.append(make([]byte, 200))
+					state := tcpEstablishedState{
+						connection: connection, controller: newTCPCongestionController(CongestionControlReno),
+						peerMSS: 100, peerSACK: true, peerWindow: 65535,
+						sendUnacknowledged: 100, sendNext: 300,
+						congestionWindow: 1000, slowStartThreshold: 1000, rtt: newRTTEstimator(time.Second),
+						outstanding: []sentTCPSegment{
+							{sequence: 100, end: 200, state: sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted | sentTCPSegmentSACKRetried, hostQueue: testPacketQueueTicketAt(epoch, now.Add(time.Millisecond))},
+							{sequence: 200, end: 300, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Millisecond))},
+						},
+					}
+					state.rtt.observeAt(time.Microsecond, monotonicStampAt(epoch, now.Add(-30*time.Millisecond)))
+					if previous {
+						state.rackLatestDelivered = tcpRACKSample{sentAt: now.Add(-2 * time.Millisecond), end: 100, rtt: 2 * time.Millisecond}
+					}
+					wantRACK := state.rackLatestDelivered
+					state.rebaseOutstanding()
+					state.controller.initialize(CongestionPhaseOpen, epoch, 0, 0, 1000, 1000, 100, 1)
+					segment := tcpSegment{acknowledgement: 200, flags: TCPFlagACK, window: 65535}
+					if name == "partial" {
+						segment.acknowledgement = 150
+					} else if name == "SACK" {
+						segment.acknowledgement = 100
+						var options [10]byte
+						options[0], options[1] = TCPHeaderOptionSACK, 10
+						binary.BigEndian.PutUint32(options[2:6], 100)
+						binary.BigEndian.PutUint32(options[6:10], 200)
+						segment.setOptions(options[:])
+					}
+					processedAt := now
+					if clock != "unstamped" {
+						segment.receivedAt = monotonicStampAt(epoch, now)
+						if clock == "advanced" {
+							processedAt = tcpQueuedSegmentEventTime(segment, now.Add(2*time.Millisecond), epoch)
+							if processedAt != now.Add(2*time.Millisecond) {
+								t.Fatalf("actor event time regressed: %v", processedAt)
+							}
+						}
+					}
+					state.processAcknowledgment(&segment, processedAt, 0)
+					if state.rackLatestDelivered != wantRACK {
+						t.Fatalf("RACK advanced from an ACK predating the transmission: %+v, want %+v", state.rackLatestDelivered, wantRACK)
+					}
+					wantForwardACK := uint32(200)
+					if name == "partial" {
+						wantForwardACK = 150
+					}
+					if !state.rackForwardACKSet || state.rackForwardACK != wantForwardACK || state.rackReorderingSeen {
+						t.Fatalf("forward ACK = %d, set %t, reordering %t; want %d, true, false", state.rackForwardACK, state.rackForwardACKSet, state.rackReorderingSeen, wantForwardACK)
+					}
+					if state.haveRACKLoss || state.controller.state.LostBytes != 0 {
+						t.Fatalf("ACK inferred false loss: RACK %t, lost bytes %d", state.haveRACKLoss, state.controller.state.LostBytes)
+					}
+					if state.sendUnacknowledged != segment.acknowledgement {
+						t.Fatalf("cumulative ACK was not applied: %d, want %d", state.sendUnacknowledged, segment.acknowledgement)
+					}
+					if name == "SACK" && (state.sackedBytes != 100 || !state.outstanding[0].state.has(sentTCPSegmentSACKed)) {
+						t.Fatal("selective ACK was not applied")
+					}
+					if name == "partial" && state.outstanding[0].sequence != 150 {
+						t.Fatal("partial ACK did not trim the acknowledged prefix")
+					}
+				})
+			}
+		}
 	}
-	sample.retransmitted = false
-	if got := validRACKSample(sample, 10*time.Millisecond, 0); got.sentAt.IsZero() {
-		t.Fatal("original transmission sample was rejected")
+}
+
+func TestTCPRACKSelectsLatestValidDelivery(t *testing.T) {
+	for _, method := range []string{"cumulative", "partial", "SACK"} {
+		for _, previous := range []string{"none", "older", "newer"} {
+			for _, test := range []struct {
+				name       string
+				rtt        time.Duration
+				minimumRTT time.Duration
+				echo       uint32
+				valid      bool
+			}{
+				{"future", -time.Millisecond, time.Microsecond, 200, false},
+				{"old-timestamp-echo", 6 * time.Millisecond, time.Microsecond, 199, false},
+				{"below-minimum-RTT", 2 * time.Millisecond, 5 * time.Millisecond, 200, false},
+				{"new-minimum-RTT", 2 * time.Millisecond, 0, 200, false},
+				{"valid-retransmission", 6 * time.Millisecond, time.Microsecond, 200, true},
+			} {
+				// Karn suppresses a cumulative-ACK RTT sample for this mixed
+				// flight, while SACK can still sample its original transmission.
+				if test.minimumRTT == 0 && method != "SACK" {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/previous-%s/%s", method, previous, test.name), func(t *testing.T) {
+					now := time.Unix(100, 0)
+					epoch := now.Add(-time.Second)
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					connection.stack = &Stack{timestampEpoch: epoch}
+					connection.sendBuffer.append(make([]byte, 300))
+					state := tcpEstablishedState{
+						connection: connection, controller: newTCPCongestionController(CongestionControlReno),
+						peerMSS: 100, peerSACK: true, peerWindow: 65535,
+						sendUnacknowledged: 100, sendNext: 400,
+						congestionWindow: 1000, slowStartThreshold: 1000, rtt: newRTTEstimator(time.Second),
+						outstanding: []sentTCPSegment{
+							{sequence: 100, end: 200, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-20*time.Millisecond))},
+							{sequence: 200, end: 300, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-10*time.Millisecond))},
+							{sequence: 300, end: 400, timestamp: 200, state: sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted | sentTCPSegmentSACKRetried, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-test.rtt))},
+						},
+					}
+					if test.minimumRTT != 0 {
+						state.rtt.observeAt(test.minimumRTT, monotonicStampAt(epoch, now.Add(-30*time.Millisecond)))
+					}
+					if previous == "older" {
+						state.rackLatestDelivered = tcpRACKSample{sentAt: now.Add(-30 * time.Millisecond), end: 90, rtt: 30 * time.Millisecond}
+					} else if previous == "newer" {
+						state.rackLatestDelivered = tcpRACKSample{sentAt: now.Add(-5 * time.Millisecond), end: 90, rtt: 5 * time.Millisecond}
+					}
+					state.rebaseOutstanding()
+					state.controller.initialize(CongestionPhaseOpen, epoch, state.rtt.minimum, state.rtt.srtt, 1000, 1000, 100, 1)
+					segment := tcpSegment{acknowledgement: 400, flags: TCPFlagACK, window: 65535, receivedAt: monotonicStampAt(epoch, now)}
+					if method == "partial" {
+						segment.acknowledgement = 350
+					} else if method == "SACK" {
+						segment.acknowledgement = 100
+						var options [10]byte
+						options[0], options[1] = TCPHeaderOptionSACK, 10
+						binary.BigEndian.PutUint32(options[2:6], 200)
+						binary.BigEndian.PutUint32(options[6:10], 400)
+						segment.setOptions(options[:])
+					}
+					want := tcpRACKSample{sentAt: now.Add(-10 * time.Millisecond), end: 300, rtt: 10 * time.Millisecond}
+					if test.valid {
+						end := uint32(400)
+						if method == "partial" {
+							end = 350
+						}
+						want = tcpRACKSample{sentAt: now.Add(-test.rtt), end: end, rtt: test.rtt, timestamp: 200, retransmitted: true}
+					}
+					if previous == "newer" {
+						rtt := want.rtt
+						want = state.rackLatestDelivered
+						want.rtt = rtt
+					}
+					processedAt := tcpQueuedSegmentEventTime(segment, now.Add(2*time.Millisecond), epoch)
+					state.processAcknowledgment(&segment, processedAt, test.echo)
+					if state.rackLatestDelivered != want {
+						t.Fatalf("latest valid RACK delivery = %+v, want %+v", state.rackLatestDelivered, want)
+					}
+					wantForwardACK := uint32(400)
+					if method == "partial" {
+						wantForwardACK = 350
+					}
+					if !state.rackForwardACKSet || state.rackForwardACK != wantForwardACK || state.rackReorderingSeen {
+						t.Fatalf("forward ACK = %d, set %t, reordering %t; want %d, true, false", state.rackForwardACK, state.rackForwardACKSet, state.rackReorderingSeen, wantForwardACK)
+					}
+					if state.sendUnacknowledged != segment.acknowledgement {
+						t.Fatalf("cumulative ACK = %d, want %d", state.sendUnacknowledged, segment.acknowledgement)
+					}
+					if method == "SACK" && state.sackedBytes != 200 {
+						t.Fatalf("SACKed bytes = %d, want 200", state.sackedBytes)
+					}
+					if method == "partial" && state.outstanding[0].sequence != 350 {
+						t.Fatal("partial ACK did not trim the acknowledged prefix")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTCPRACKSelectsDeliveryRTTAcrossACKRanges(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		ack           uint32
+		blocks        []TCPSACKBlock
+		sentAt        [4]time.Duration
+		retransmitted int
+		wantEnd       uint32
+	}{
+		{name: "SACK ascending", ack: 100, blocks: []TCPSACKBlock{{200, 300}, {400, 500}},
+			sentAt: [4]time.Duration{25, 10, 25, 20}, retransmitted: -1, wantEnd: 500},
+		{name: "SACK descending", ack: 100, blocks: []TCPSACKBlock{{400, 500}, {200, 300}},
+			sentAt: [4]time.Duration{25, 10, 25, 20}, retransmitted: -1, wantEnd: 500},
+		{name: "SACK retransmission", ack: 100, blocks: []TCPSACKBlock{{400, 500}, {200, 300}},
+			sentAt: [4]time.Duration{25, 20, 25, 10}, retransmitted: 1, wantEnd: 300},
+		{name: "cumulative", ack: 300,
+			sentAt: [4]time.Duration{20, 10, 25, 25}, retransmitted: 0, wantEnd: 200},
+		{name: "partial cumulative", ack: 250,
+			sentAt: [4]time.Duration{20, 10, 25, 25}, retransmitted: 0, wantEnd: 200},
+		{name: "cumulative and SACK", ack: 200, blocks: []TCPSACKBlock{{400, 500}},
+			sentAt: [4]time.Duration{20, 25, 25, 10}, retransmitted: 0, wantEnd: 200},
+	} {
+		for _, previous := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/previous-%t", test.name, previous), func(t *testing.T) {
+				epoch := time.Unix(100, 0)
+				arrival := epoch.Add(30 * time.Millisecond)
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: epoch}
+				connection.sendBuffer.append(make([]byte, 400))
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(CongestionControlReno),
+					peerMSS: 100, peerSACK: true, peerWindow: 65535,
+					sendUnacknowledged: 100, sendNext: 500,
+					congestionWindow: 1000, slowStartThreshold: 1000,
+					rtt: newRTTEstimator(time.Second), rackReorderingSeen: true,
+				}
+				for index, elapsed := range test.sentAt {
+					segment := sentTCPSegment{
+						sequence: uint32(100 + 100*index), end: uint32(200 + 100*index),
+						state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(elapsed*time.Millisecond)),
+					}
+					segment.state.set(sentTCPSegmentRetransmitted, index == test.retransmitted)
+					state.outstanding = append(state.outstanding, segment)
+				}
+				want := tcpRACKSample{sentAt: epoch.Add(20 * time.Millisecond), end: test.wantEnd, rtt: 10 * time.Millisecond, retransmitted: test.retransmitted >= 0}
+				if previous {
+					state.rackLatestDelivered = tcpRACKSample{sentAt: epoch.Add(25 * time.Millisecond), end: 100, rtt: 2 * time.Millisecond}
+					want = state.rackLatestDelivered
+					want.rtt = 10 * time.Millisecond
+				}
+				state.rtt.observeAt(time.Millisecond, monotonicStampAt(epoch, epoch.Add(29*time.Millisecond)))
+				state.rebaseOutstanding()
+				state.controller.initialize(CongestionPhaseOpen, epoch, state.rtt.minimum, state.rtt.srtt, 1000, 1000, 100, 1)
+				ack := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535, receivedAt: monotonicStampAt(epoch, arrival)}
+				if len(test.blocks) != 0 {
+					options := make([]byte, 2+8*len(test.blocks))
+					options[0], options[1] = TCPHeaderOptionSACK, byte(len(options))
+					for index, block := range test.blocks {
+						binary.BigEndian.PutUint32(options[2+8*index:6+8*index], block.LeftEdge)
+						binary.BigEndian.PutUint32(options[6+8*index:10+8*index], block.RightEdge)
+					}
+					ack.setOptions(options)
+				}
+				state.processAcknowledgment(&ack, arrival, 0)
+				if state.rackLatestDelivered != want {
+					t.Fatalf("RACK delivery = %+v, want %+v", state.rackLatestDelivered, want)
+				}
+				outstanding := []sentTCPSegment{{sequence: 600, end: 700, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(19900*time.Microsecond))}}
+				const window = 250 * time.Microsecond
+				deadline := epoch.Add(30150 * time.Microsecond)
+				before := deadline.Add(-time.Nanosecond)
+				if delay, ok := rackLossDelay(outstanding, state.rackLatestDelivered, before, window, epoch); !ok || delay != time.Nanosecond {
+					t.Fatalf("RACK remaining wait = %v, %t; want 1ns, true", delay, ok)
+				}
+				if markRACKLoss(outstanding, state.rackLatestDelivered, before, window, epoch) {
+					t.Fatal("RACK declared loss before the delivery-based deadline")
+				}
+				if !markRACKLoss(outstanding, state.rackLatestDelivered, deadline, window, epoch) {
+					t.Fatal("RACK did not declare loss at the delivery-based deadline")
+				}
+			})
+		}
+	}
+}
+
+func TestTCPRACKOlderDeliveryRefreshesRTT(t *testing.T) {
+	epoch := time.Unix(100, 0)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	connection.stack = &Stack{timestampEpoch: epoch}
+	connection.sendBuffer.append(make([]byte, 300))
+	state := tcpEstablishedState{
+		connection: connection, controller: newTCPCongestionController(CongestionControlReno),
+		peerMSS: 100, peerSACK: true, peerWindow: 65535,
+		sendUnacknowledged: 100, sendNext: 400,
+		congestionWindow: 1000, slowStartThreshold: 1000, rtt: newRTTEstimator(time.Second),
+		rackReorderingSeen: true,
+		outstanding: []sentTCPSegment{
+			{sequence: 100, end: 200, state: sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted | sentTCPSegmentOriginalLost | sentTCPSegmentSACKRetried, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(18*time.Millisecond))},
+			{sequence: 200, end: 300, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(10*time.Millisecond))},
+			{sequence: 300, end: 400, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(20*time.Millisecond))},
+		},
+	}
+	state.rtt.observeAt(10*time.Millisecond, monotonicStampAt(epoch, epoch.Add(29*time.Millisecond)))
+	state.rebaseOutstanding()
+	state.controller.initialize(CongestionPhaseOpen, epoch, state.rtt.minimum, state.rtt.srtt, 1000, 1000, 100, 1)
+	ack := tcpSegment{acknowledgement: 100, flags: TCPFlagACK, window: 65535}
+	var options [10]byte
+	options[0], options[1] = TCPHeaderOptionSACK, 10
+	binary.BigEndian.PutUint32(options[2:6], 300)
+	binary.BigEndian.PutUint32(options[6:10], 400)
+	ack.setOptions(options[:])
+	firstArrival := epoch.Add(30 * time.Millisecond)
+	ack.receivedAt = monotonicStampAt(epoch, firstArrival)
+	state.processAcknowledgment(&ack, firstArrival, 0)
+	if !state.outstanding[1].state.has(sentTCPSegmentRACKLost) || state.outstanding[0].state.has(sentTCPSegmentRACKLost) {
+		t.Fatalf("first SACK loss state = [%#x %#x]", state.outstanding[0].state, state.outstanding[1].state)
+	}
+	if deadline, ok := state.rackDeadline(firstArrival, true); !ok || deadline != epoch.Add(30500*time.Microsecond) {
+		t.Fatalf("first SACK deadline = %v, %t; want epoch+30.5ms", deadline.Sub(epoch), ok)
+	}
+	latest := state.rackLatestDelivered
+	binary.BigEndian.PutUint32(options[2:6], 200)
+	binary.BigEndian.PutUint32(options[6:10], 300)
+	ack.setOptions(options[:])
+	arrival := epoch.Add(30400 * time.Microsecond)
+	ack.receivedAt = monotonicStampAt(epoch, arrival)
+	state.processAcknowledgment(&ack, arrival, 0)
+	latest.rtt = 20400 * time.Microsecond
+	if state.rackLatestDelivered != latest || state.sackedBytes != 200 || state.outstanding[0].state.has(sentTCPSegmentRACKLost) {
+		t.Fatalf("older delivery = %+v, SACKed %d, remaining state %#x; want %+v, 200, no loss", state.rackLatestDelivered, state.sackedBytes, state.outstanding[0].state, latest)
+	}
+	wantDeadline := epoch.Add(40900 * time.Microsecond)
+	if deadline, ok := state.rackDeadline(arrival, true); !ok || deadline != wantDeadline {
+		t.Fatalf("older delivery deadline = %v, %t; want epoch+40.9ms", deadline.Sub(epoch), ok)
+	}
+	repeatedArrival := arrival.Add(time.Microsecond)
+	ack.receivedAt = monotonicStampAt(epoch, repeatedArrival)
+	state.processAcknowledgment(&ack, repeatedArrival, 0)
+	if state.rackLatestDelivered != latest {
+		t.Fatal("repeated SACK refreshed the delivery RTT")
+	}
+	markRACKLoss(state.outstanding, latest, wantDeadline.Add(-time.Nanosecond), 2500*time.Microsecond, epoch)
+	if state.outstanding[0].state.has(sentTCPSegmentRACKLost) {
+		t.Fatal("RACK declared the remaining retransmission lost before its deadline")
+	}
+	if !markRACKLoss(state.outstanding, latest, wantDeadline, 2500*time.Microsecond, epoch) || !state.outstanding[0].state.has(sentTCPSegmentRACKLost) {
+		t.Fatal("RACK did not declare loss at the refreshed deadline")
+	}
+}
+
+func TestTCPRACKCumulativeACKDoesNotResampleSACKedData(t *testing.T) {
+	for _, ack := range []uint32{150, 200} {
+		t.Run(fmt.Sprint(ack), func(t *testing.T) {
+			epoch := time.Unix(100, 0)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: epoch}
+			connection.sendBuffer.append(make([]byte, 100))
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(CongestionControlReno),
+				peerMSS: 100, peerSACK: true, peerWindow: 65535,
+				sendUnacknowledged: 100, sendNext: 200,
+				congestionWindow: 1000, slowStartThreshold: 1000, rtt: newRTTEstimator(time.Second),
+				rackLatestDelivered: tcpRACKSample{sentAt: epoch.Add(10 * time.Millisecond), end: 200, rtt: 10 * time.Millisecond},
+				rackForwardACK:      200, rackForwardACKSet: true,
+				outstanding: []sentTCPSegment{{sequence: 100, end: 200, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed, hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(10*time.Millisecond))}},
+			}
+			state.rtt.observeAt(10*time.Millisecond, monotonicStampAt(epoch, epoch.Add(20*time.Millisecond)))
+			state.rebaseOutstanding()
+			state.recountSACK()
+			state.controller.initialize(CongestionPhaseOpen, epoch, state.rtt.minimum, state.rtt.srtt, 1000, 1000, 100, 1)
+			want := state.rackLatestDelivered
+			arrival := epoch.Add(30 * time.Millisecond)
+			segment := tcpSegment{acknowledgement: ack, flags: TCPFlagACK, window: 65535, receivedAt: monotonicStampAt(epoch, arrival)}
+			state.processAcknowledgment(&segment, arrival, 0)
+			if state.rackLatestDelivered != want || state.sendUnacknowledged != ack {
+				t.Fatalf("cumulative ACK delivery = %+v at %d, want %+v at %d", state.rackLatestDelivered, state.sendUnacknowledged, want, ack)
+			}
+			if state.rackForwardACK != 200 || state.rackReorderingSeen {
+				t.Fatalf("SACKed delivery changed reordering evidence: forward ACK %d, reordering %t", state.rackForwardACK, state.rackReorderingSeen)
+			}
+		})
 	}
 }
 
 func TestRACKRepeatedSACKIsNotNewDelivery(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{{sequence: 100, end: 200, timestamp: 10, hostQueue: testPacketQueueTicketAt(base, base)}}
-	outstanding, _, _, newInformation, latest, _ := applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}}, base)
-	if !newInformation || latest.sentAt != base {
-		t.Fatalf("initial SACK = new %t latest %+v", newInformation, latest)
+	outstanding, _, _, newInformation, delivered := applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}})
+	state := tcpEstablishedState{connection: &TCPConn{stack: &Stack{timestampEpoch: base}}}
+	state.observeRACKDelivery(delivered, 200, &tcpSegment{}, base.Add(time.Millisecond), 0, 0)
+	if !newInformation || len(delivered) != 1 || !state.rackLatestDelivered.sentAt.Equal(base) {
+		t.Fatalf("initial SACK = new %t delivered %+v", newInformation, delivered)
 	}
-	_, _, _, newInformation, latest, _ = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}}, base)
-	if newInformation || !latest.sentAt.IsZero() {
-		t.Fatalf("repeated SACK = new %t latest %+v", newInformation, latest)
+	_, _, _, newInformation, delivered = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}})
+	previous := state.rackLatestDelivered
+	state.observeRACKDelivery(delivered, 200, &tcpSegment{}, base.Add(2*time.Millisecond), 0, 0)
+	if newInformation || len(delivered) != 0 || state.rackLatestDelivered != previous {
+		t.Fatalf("repeated SACK = new %t delivered %+v", newInformation, delivered)
 	}
 }
 
@@ -11992,6 +12487,41 @@ func TestTCPRTTSampleUsesSegmentArrivalTime(t *testing.T) {
 	}
 	if sample := elapsedRTTSampleAt(time.Time{}, base); sample != 0 {
 		t.Fatalf("missing RTT sample = %v, want 0", sample)
+	}
+}
+
+func TestTCPCumulativeACKRTTSampleMatchesElapsedTime(t *testing.T) {
+	for clock, epoch := range []time.Time{time.Unix(100, 0), time.Now()} {
+		for _, elapsed := range []time.Duration{-time.Nanosecond, 0, time.Nanosecond, time.Microsecond, time.Millisecond, 2 * tcpMaximumRTO} {
+			for _, stamped := range []bool{false, true} {
+				t.Run(fmt.Sprintf("clock-%d/stamped-%t/%v", clock, stamped, elapsed), func(t *testing.T) {
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					connection.stack = &Stack{timestampEpoch: epoch}
+					connection.sendBuffer.append(make([]byte, 100))
+					transmission := sentTCPSegment{sequence: 100, end: 200, state: sentTCPSegmentTransmitted}
+					var sentAt time.Time
+					if stamped {
+						sentAt = epoch
+						transmission.hostQueue = testPacketQueueTicketAt(epoch, sentAt)
+					}
+					state := tcpEstablishedState{
+						connection: connection, controller: newTCPCongestionController(CongestionControlReno),
+						peerMSS: 100, peerWindow: 65535, sendUnacknowledged: 100, sendNext: 200,
+						congestionWindow: 1000, slowStartThreshold: 1000,
+						rtt: newRTTEstimator(time.Second), outstanding: []sentTCPSegment{transmission},
+					}
+					state.controller.initialize(CongestionPhaseOpen, epoch, 0, 0, 1000, 1000, 100, 1)
+					eventAt := epoch.Add(elapsed)
+					want := state.rtt
+					want.observeAt(elapsedRTTSampleAt(sentAt, eventAt), monotonicStampAt(epoch, eventAt))
+					segment := tcpSegment{acknowledgement: 200, flags: TCPFlagACK, window: 65535, receivedAt: monotonicStampAt(epoch, epoch)}
+					state.processAcknowledgment(&segment, eventAt, 0)
+					if state.rtt != want {
+						t.Fatalf("cumulative ACK RTT estimator = %+v, want %+v", state.rtt, want)
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -12422,11 +12952,11 @@ func TestTCPRepeatedSACKIsNotNewInformation(t *testing.T) {
 	blocks := []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
-	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks, time.Time{})
+	outstanding, _, present, fresh, delivered = applyTCPSACK(outstanding, blocks)
 	if !present || !fresh || len(delivered) != 1 || delivered[0].delivery.deliveredStamp == 0 || outstanding[1].delivery.deliveredStamp != 0 {
 		t.Fatalf("first SACK state = present %t, fresh %t; want true, true", present, fresh)
 	}
-	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks, time.Time{})
+	outstanding, _, present, fresh, delivered = applyTCPSACK(outstanding, blocks)
 	if !present || fresh || len(delivered) != 0 {
 		t.Fatalf("repeated SACK state = present %t, fresh %t; want true, false", present, fresh)
 	}
@@ -12438,7 +12968,7 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 	outstanding := []sentTCPSegment{{sequence: 100, end: 400, flags: TCPFlagACK | TCPFlagPSH, state: sentTCPSegmentTransmitted}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
-	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}}, time.Time{})
+	outstanding, _, present, fresh, delivered = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}})
 	if !present || !fresh || len(delivered) != 1 || len(outstanding) != 3 {
 		t.Fatalf("partial SACK state = present %t fresh %t delivered %d segments %d", present, fresh, len(delivered), len(outstanding))
 	}
@@ -12462,16 +12992,40 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 // pieces sharing one publication retain RFC 8985's ending-sequence order.
 func TestTCPSACKOrdersSplitRangesWithinOneTransmission(t *testing.T) {
 	epoch := time.Unix(100, 0)
-	outstanding := []sentTCPSegment{{
-		sequence: 100, end: 400, state: sentTCPSegmentTransmitted,
-		hostQueue: testPacketQueueTicketAt(epoch, epoch), transmissionOrder: 7,
-	}}
-	_, _, _, _, latest, _ := applyTCPSACK(outstanding, []TCPSACKBlock{
-		{LeftEdge: 150, RightEdge: 200},
-		{LeftEdge: 300, RightEdge: 350},
-	}, epoch)
-	if latest.order != 7 || latest.end != 350 {
-		t.Fatalf("latest split SACK transmission = order %d end %d, want order 7 end 350", latest.order, latest.end)
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse-%t", reverse), func(t *testing.T) {
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: epoch}
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(CongestionControlReno),
+				peerMSS: 100, peerSACK: true, peerWindow: 65535,
+				sendUnacknowledged: 100, sendNext: 400,
+				congestionWindow: 1000, slowStartThreshold: 1000, rtt: newRTTEstimator(time.Second),
+				outstanding: []sentTCPSegment{{
+					sequence: 100, end: 400, state: sentTCPSegmentTransmitted,
+					hostQueue: testPacketQueueTicketAt(epoch, epoch), transmissionOrder: 7,
+				}},
+			}
+			state.rebaseOutstanding()
+			state.controller.initialize(CongestionPhaseOpen, epoch, 0, 0, 1000, 1000, 100, 1)
+			blocks := []TCPSACKBlock{{LeftEdge: 150, RightEdge: 200}, {LeftEdge: 300, RightEdge: 350}}
+			if reverse {
+				blocks[0], blocks[1] = blocks[1], blocks[0]
+			}
+			var options [18]byte
+			options[0], options[1] = TCPHeaderOptionSACK, 18
+			for index, block := range blocks {
+				binary.BigEndian.PutUint32(options[2+index*8:6+index*8], block.LeftEdge)
+				binary.BigEndian.PutUint32(options[6+index*8:10+index*8], block.RightEdge)
+			}
+			segment := tcpSegment{acknowledgement: 100, flags: TCPFlagACK, window: 65535}
+			segment.setOptions(options[:])
+			state.processAcknowledgment(&segment, epoch.Add(10*time.Millisecond), 0)
+			want := tcpRACKSample{sentAt: epoch, order: 7, end: 350, rtt: 10 * time.Millisecond}
+			if state.rackLatestDelivered != want {
+				t.Fatalf("latest split SACK transmission = %+v, want %+v", state.rackLatestDelivered, want)
+			}
+		})
 	}
 }
 
@@ -12479,7 +13033,7 @@ func TestTCPSACKSplitMetadataIsBounded(t *testing.T) {
 	payloadSize := uint32(4 * tcpMaximumSACKSplitRanges)
 	outstanding := []sentTCPSegment{{sequence: 0, end: payloadSize, state: sentTCPSegmentTransmitted}}
 	for offset := uint32(1); offset+1 < payloadSize; offset += 2 {
-		outstanding, _, _, _, _, _ = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: offset, RightEdge: offset + 1}}, time.Time{})
+		outstanding, _, _, _, _ = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: offset, RightEdge: offset + 1}})
 	}
 	splitRanges := 0
 	for _, segment := range outstanding {
@@ -12590,15 +13144,732 @@ func TestTCPSACKIsLostAndPipe(t *testing.T) {
 	}
 }
 
+func TestTCPSACKLossThresholds(t *testing.T) {
+	const mss = 1000
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		t.Run(algorithm, func(t *testing.T) {
+			for _, test := range []struct {
+				name  string
+				sizes []int
+				rack  bool
+				lost  bool
+			}{
+				{name: "below range threshold", sizes: []int{1, 1}},
+				{name: "at range threshold", sizes: []int{1, 1, 1}, lost: true},
+				{name: "at byte threshold", sizes: []int{mss, mss}},
+				{name: "above byte threshold", sizes: []int{mss, mss + 1}, lost: true},
+				{name: "RACK below thresholds", sizes: []int{1}, rack: true, lost: true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					for _, oldACK := range []bool{false, true} {
+						now := time.Unix(100, 0)
+						epoch := now.Add(-time.Second)
+						connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+						connection.stack = &Stack{timestampEpoch: epoch}
+						state := tcpEstablishedState{
+							connection: connection, controller: newTCPCongestionController(algorithm),
+							peerMSS: mss, peerSACK: true, peerWindow: 40_000,
+							sendUnacknowledged: 100, sendNext: 1100,
+							congestionWindow: 10 * mss, slowStartThreshold: 20 * mss,
+							rackReorderingSeen: true, rtt: newRTTEstimator(time.Second),
+						}
+						state.controller.initialize(CongestionPhaseOpen, epoch, 100*time.Millisecond, 100*time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+						defer state.controller.release(now, state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), mss, state.rtt.srtt, state.rtt.minimum)
+						state.rtt.minimum, state.rtt.srtt = 100*time.Millisecond, 100*time.Millisecond
+						ticket := testPacketQueueTicketAt(epoch, now.Add(-100*time.Millisecond))
+						state.outstanding = []sentTCPSegment{{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted, hostQueue: ticket}}
+						if test.rack {
+							state.outstanding[0].hostQueue = testPacketQueueTicketAt(epoch, now.Add(-200*time.Millisecond))
+						}
+						for _, size := range test.sizes {
+							state.outstanding = append(state.outstanding, sentTCPSegment{sequence: state.sendNext, end: state.sendNext + uint32(size), state: sentTCPSegmentTransmitted, hostQueue: ticket})
+							state.sendNext += uint32(size)
+						}
+						state.rebaseOutstanding()
+						var options [10]byte
+						options[0], options[1] = TCPHeaderOptionSACK, 10
+						binary.BigEndian.PutUint32(options[2:6], 1100)
+						binary.BigEndian.PutUint32(options[6:10], state.sendNext)
+						segment := tcpSegment{acknowledgement: 100, flags: TCPFlagACK, window: 40_000}
+						if oldACK {
+							segment.acknowledgement--
+						}
+						segment.setOptions(options[:])
+						state.processAcknowledgment(&segment, now, 0)
+						wantLoss := uint64(0)
+						if test.lost && (state.controller.usesDeliveryRate() || state.controller.usesLossEvents()) {
+							wantLoss = mss
+						}
+						if state.fastRecovery != test.lost || state.controller.state.LostBytes != wantLoss || state.haveRACKLoss != test.rack || state.duplicateACKs >= tcpDuplicateACKThreshold || state.outstanding[0].state.has(sentTCPSegmentTransmissionLost) != test.lost || state.outstanding[0].lossAlreadyReported() != test.lost {
+							t.Fatalf("old ACK %t: recovery/loss/RACK/duplicates = %t/%d/%t/%d", oldACK, state.fastRecovery, state.controller.state.LostBytes, state.haveRACKLoss, state.duplicateACKs)
+						}
+						state.processAcknowledgment(&segment, now, 0)
+						if state.controller.state.LostBytes != wantLoss || state.fastRecovery != test.lost {
+							t.Fatalf("old ACK %t: repeated evidence changed loss or recovery", oldACK)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestTCPRACKPipePreservesOriginalLoss(t *testing.T) {
+	const mss = 1000
+	outstanding := []sentTCPSegment{{sequence: 1000, end: 2000, state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost}}
+	if newlyLost, replacementLost := markProvenTCPLosses(outstanding, mss, false); !newlyLost || replacementLost || !outstanding[0].state.has(sentTCPSegmentOriginalLost) || outstanding[0].lossAlreadyReported() {
+		t.Fatalf("unreported RACK loss = %+v", outstanding[0])
+	}
+	marked := outstanding[0].state
+	if newlyLost, replacementLost := markProvenTCPLosses(outstanding, mss, false); newlyLost || replacementLost || outstanding[0].state != marked {
+		t.Fatal("repeated RACK evidence changed loss state before reporting")
+	}
+	if losses := recordTestTCPLosses(outstanding, mss); losses != mss || sackRecoveryPipe(outstanding, mss) != 0 {
+		t.Fatalf("original loss = %d bytes, Pipe %d", losses, sackRecoveryPipe(outstanding, mss))
+	}
+	for generation := 0; generation < 2; generation++ {
+		outstanding[0].advanceTransmissionGeneration()
+		outstanding[0].state &^= sentTCPSegmentRACKLost
+		outstanding[0].state |= sentTCPSegmentSACKRetried
+		if pipe := sackRecoveryPipe(outstanding, mss); pipe != mss {
+			t.Fatalf("generation %d Pipe = %d, want %d", generation, pipe, mss)
+		}
+		if losses := recordTestTCPLosses(outstanding, mss); losses != 0 || sackSegmentLost(outstanding, 0, mss) {
+			t.Fatalf("original loss reauthorized replacement: loss %d state %#x", losses, outstanding[0].state)
+		}
+		outstanding[0].state |= sentTCPSegmentRACKLost
+		outstanding[0].state &^= sentTCPSegmentSACKRetried
+		if losses := recordTestTCPLosses(outstanding, mss); losses != mss || sackRecoveryPipe(outstanding, mss) != 0 {
+			t.Fatalf("generation %d loss = %d, Pipe %d", generation, losses, sackRecoveryPipe(outstanding, mss))
+		}
+	}
+	outstanding[0].advanceTransmissionGeneration()
+	outstanding[0].state &^= sentTCPSegmentRACKLost
+	outstanding[0].state |= sentTCPSegmentSACKRetried
+	split := splitTCPSegments(outstanding, mss/2)
+	if len(split) != 2 || !split[0].state.has(sentTCPSegmentOriginalLost) || !split[1].state.has(sentTCPSegmentOriginalLost) || sackRecoveryPipe(split, mss/2) != mss {
+		t.Fatalf("split replacement = %+v, Pipe %d", split, sackRecoveryPipe(split, mss/2))
+	}
+}
+
+func TestTCPRTOTransmissionFlight(t *testing.T) {
+	state := tcpEstablishedState{outstanding: []sentTCPSegment{{sequence: 0xfffffff0, end: 0x31, flags: TCPFlagACK | TCPFlagFIN}}}
+	for flags := sentTCPSegmentState(0); flags < sentTCPSegmentTransmissionLost<<1; flags++ {
+		state.outstanding[0].state = flags
+		var copies uint32
+		if !flags.has(sentTCPSegmentSACKed) {
+			copies = 1
+			if flags.has(sentTCPSegmentOriginalLost) {
+				copies--
+			}
+			if flags.has(sentTCPSegmentRetransmitted) && !flags.has(sentTCPSegmentTransmissionLost) {
+				copies++
+			}
+		}
+		if got, want := state.rtoTransmissionFlight(), copies*65; got != want {
+			t.Fatalf("flags %#x: transmission flight = %d, want %d", flags, got, want)
+		}
+	}
+}
+
+type tcpBatchFlightRecorder struct {
+	flights  chan uint32
+	timeouts chan struct{}
+	window   uint32
+}
+
+func (r *tcpBatchFlightRecorder) HandleCongestionEvent(event *CongestionEvent) {
+	switch event.Type {
+	case CongestionEventInitialize:
+		event.State.CongestionWindow = r.window
+	case CongestionEventTimeout:
+		select {
+		case r.timeouts <- struct{}{}:
+		default:
+		}
+	case CongestionEventPacketRetransmitted:
+		if event.State.Phase == CongestionPhaseLoss {
+			r.flights <- event.State.BytesInFlight
+		}
+	}
+}
+
+func TestTCPRTOBatchFlightSnapshots(t *testing.T) {
+	for _, blocked := range []bool{false, true} {
+		for _, fin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("blocked-%t/FIN-%t", blocked, fin), func(t *testing.T) {
+				const mss, count = 1000, 10
+				first := uint32(0xfffffff0)
+				local, remote := netip.MustParseAddr("192.0.2.213"), netip.MustParseAddr("192.0.2.214")
+				recorder := &tcpBatchFlightRecorder{flights: make(chan uint32, 32), timeouts: make(chan struct{}, 1), window: count*mss + 1}
+				factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+					Name: "test-rto-batch-flight", Features: CongestionControlFeatureTransmissionEvents,
+					New: func(CongestionControlContext) CongestionController { return recorder },
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1200, TCP: TCPSocketDefaults{CongestionControlFactory: factory}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = stack.Close() })
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				c := newTCPConn(stack, "tcp4", tcpKey{local: netip.AddrPortFrom(local, 12345), remote: netip.AddrPortFrom(remote, 80)}, 1200, tcpSocketOptionSet{})
+				c.receiveNext, c.peerWindow, c.peerMSS = 200, 65535, mss
+				c.peerSACK, c.peerECN, c.writeClosed = true, true, fin
+				c.sendBuffer.append(bytes.Repeat([]byte{0x5b}, count*mss))
+				stack.mu.Lock()
+				stack.tcp[c.key] = c
+				stack.stats.activeTCPConnections.Add(1)
+				stack.mu.Unlock()
+				actorTimer := newOwnedTimer()
+				go func() {
+					defer stack.removeTCP(c)
+					defer close(c.done)
+					defer actorTimer.close()
+					c.finish(c.established(first, actorTimer, tcpInitialReceive{}))
+				}()
+				c.wakeActor(tcpActorWakeSend)
+				t.Cleanup(func() {
+					c.abort(net.ErrClosed)
+					select {
+					case <-c.done:
+					case <-time.After(2 * time.Second):
+						t.Error("RTO flight actor did not terminate")
+					}
+				})
+				packets := count
+				if fin {
+					packets++
+				}
+				read := func(index int) {
+					t.Helper()
+					entry, available := waitTestPacketEntry(&stack.outbound, 3*time.Second)
+					if !available {
+						t.Fatalf("no output for range %d: %+v", index, c.Info())
+					}
+					packet, ok := parseIPPacket(consumeTestPacket(&stack.outbound, entry), false)
+					if !ok || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+						t.Fatalf("invalid TCP output for range %d", index)
+					}
+					if sequence := binary.BigEndian.Uint32(packet.payload[4:8]); sequence != first+uint32(index*mss) {
+						t.Fatalf("range %d sequence = %d, want %d", index, sequence, first+uint32(index*mss))
+					}
+					header := int(packet.payload[12]>>4) * 4
+					if index < count {
+						if header < tcpHeaderSize || header > len(packet.payload) || !bytes.Equal(packet.payload[header:], bytes.Repeat([]byte{0x5b}, mss)) {
+							t.Fatalf("invalid data for range %d", index)
+						}
+					} else if packet.payload[13]&TCPFlagFIN == 0 || header != len(packet.payload) {
+						t.Fatal("last range is not FIN-only")
+					}
+				}
+				for index := 0; index < packets; index++ {
+					read(index)
+				}
+				var held []uint16
+				defer func() {
+					for _, slot := range held {
+						stack.outbound.releaseReserved(slot)
+					}
+				}()
+				if blocked {
+					for {
+						slot, ok := stack.outbound.tryReserve()
+						if !ok {
+							break
+						}
+						held = append(held, slot)
+					}
+					select {
+					case <-recorder.timeouts:
+					case <-time.After(2 * time.Second):
+						t.Fatal("blocked output did not enter RTO recovery")
+					}
+					last := len(held) - 1
+					stack.outbound.releaseReserved(held[last])
+					held = held[:last]
+				}
+				read(0)
+				select {
+				case flight := <-recorder.flights:
+					if flight != 0 {
+						t.Fatalf("first RTO flight = %d, want 0", flight)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("missing RTO transmission event")
+				}
+				if blocked {
+					// Four free slots permit a multi-packet recovery turn, followed
+					// by capacity retries that must derive fresh flight each turn.
+					for range [3]struct{}{} {
+						last := len(held) - 1
+						stack.outbound.releaseReserved(held[last])
+						held = held[:last]
+					}
+				}
+				// Negotiated ECE ends F-RTO independently of loss recovery. With
+				// no new data or ACKs, every remaining publication belongs to the
+				// same RTO flight, including the FIN sequence byte.
+				time.Sleep(time.Millisecond)
+				if err = writeTestPacket(stack, buildTestTCP(remote, local, 80, 12345, 200, first+mss, TCPFlagACK|TCPFlagECE, 65535, nil, nil)); err != nil {
+					t.Fatal(err)
+				}
+				for index := 1; index < packets; index++ {
+					read(index)
+					select {
+					case flight := <-recorder.flights:
+						if want := uint32((index - 1) * mss); flight != want {
+							t.Fatalf("range %d flight = %d, want %d", index, flight, want)
+						}
+					case <-time.After(time.Second):
+						t.Fatalf("missing transmission event for range %d", index)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestTCPRTOTransmissionLoss(t *testing.T) {
+	const mss = 1000
+	for _, test := range []struct {
+		name      string
+		age, rtt  time.Duration
+		flags     sentTCPSegmentState
+		pending   bool
+		unsetTime bool
+		lost      bool
+		flight    uint32
+		newLosses uint64
+	}{
+		{name: "aged original", age: time.Second, rtt: 100 * time.Millisecond, lost: true, newLosses: mss},
+		{name: "exact RTT", age: 100 * time.Millisecond, rtt: 100 * time.Millisecond, lost: true, newLosses: mss},
+		{name: "just before RTT", age: 100*time.Millisecond - time.Nanosecond, rtt: 100 * time.Millisecond, flight: mss},
+		{name: "just after RTT", age: 100*time.Millisecond + time.Nanosecond, rtt: 100 * time.Millisecond, lost: true, newLosses: mss},
+		{name: "recent original", age: 50 * time.Millisecond, rtt: 100 * time.Millisecond, flight: mss},
+		{name: "unknown RTT", age: time.Millisecond, lost: true, newLosses: mss},
+		{name: "future queue stamp", age: -time.Nanosecond, flight: mss},
+		{name: "cutoff before epoch", age: 2 * time.Second, rtt: 2*time.Second + time.Nanosecond, flight: mss},
+		{name: "cutoff at epoch", age: 2 * time.Second, rtt: 2 * time.Second, lost: true, newLosses: mss},
+		{name: "cutoff after epoch", age: 2 * time.Second, rtt: 2*time.Second - time.Nanosecond, lost: true, newLosses: mss},
+		{name: "unset queue stamp", rtt: 2*time.Second + time.Nanosecond, unsetTime: true, lost: true, newLosses: mss},
+		{name: "recent replacement", age: 50 * time.Millisecond, rtt: 100 * time.Millisecond, flags: sentTCPSegmentRetransmitted | sentTCPSegmentOriginalLost | sentTCPSegmentSACKRetried, flight: mss},
+		{name: "aged replacement", age: time.Second, rtt: 100 * time.Millisecond, flags: sentTCPSegmentRetransmitted | sentTCPSegmentOriginalLost | sentTCPSegmentSACKRetried, lost: true, newLosses: mss},
+		{name: "recent speculative copy", age: 50 * time.Millisecond, rtt: 100 * time.Millisecond, flags: sentTCPSegmentRetransmitted | sentTCPSegmentSACKRetried, flight: 2 * mss},
+		{name: "already reported", age: time.Second, flags: sentTCPSegmentOriginalLost | sentTCPSegmentLossReported | sentTCPSegmentTransmissionLost, lost: true},
+		{name: "reported generation after undo", age: time.Second, flags: sentTCPSegmentLossReported, lost: true},
+		{name: "inferred but unreported", age: time.Second, flags: sentTCPSegmentOriginalLost | sentTCPSegmentTransmissionLost, lost: true, newLosses: mss},
+		{name: "SACKed", age: time.Second, flags: sentTCPSegmentSACKed},
+		{name: "host queue original", age: time.Second, pending: true, flight: mss},
+		{name: "host queue replacement", age: time.Second, pending: true, flags: sentTCPSegmentOriginalLost | sentTCPSegmentRetransmitted | sentTCPSegmentSACKRetried, flight: mss},
+		{name: "recent original recovery markers", age: 50 * time.Millisecond, rtt: 100 * time.Millisecond, flags: sentTCPSegmentSACKRetried | sentTCPSegmentRACKLost, flight: mss},
+		{name: "SACKed recovery markers", age: time.Second, flags: sentTCPSegmentSACKed | sentTCPSegmentSACKRetried | sentTCPSegmentRACKLost},
+		{name: "host queue recovery markers", age: time.Second, pending: true, flags: sentTCPSegmentSACKRetried | sentTCPSegmentRACKLost, flight: mss},
+		{name: "reported recovery markers", age: time.Second, flags: sentTCPSegmentOriginalLost | sentTCPSegmentLossReported | sentTCPSegmentTransmissionLost | sentTCPSegmentSACKRetried | sentTCPSegmentRACKLost, lost: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, clock := range []struct {
+				name     string
+				now      time.Time
+				recovery bool
+			}{
+				{name: "wall", now: time.Unix(100, 0)},
+				{name: "monotonic", now: time.Now()},
+				{name: "wall-in-recovery", now: time.Unix(100, 0), recovery: true},
+				{name: "monotonic-in-recovery", now: time.Now(), recovery: true},
+			} {
+				t.Run(clock.name, func(t *testing.T) {
+					now := clock.now
+					epoch := now.Add(-2 * time.Second)
+					stack := &Stack{timestampEpoch: epoch}
+					ticket := testPacketQueueTicketAt(epoch, now.Add(-test.age))
+					if test.unsetTime {
+						ticket.queuedAt = 0
+					}
+					if test.pending {
+						stack.outbound.initFIFO(1, epoch)
+						slot, _ := stack.outbound.tryReserve()
+						queued, _ := stack.outbound.enqueueReservedTCP(slot, []byte{1}, false, 1, false)
+						ticket.token = queued.token
+					}
+					state := tcpEstablishedState{
+						connection: &TCPConn{stack: stack}, controller: newTCPCongestionController(CongestionControlBBR3),
+						peerMSS: mss, peerSACK: true, fastRecovery: clock.recovery,
+						sendUnacknowledged: 100, sendNext: 2100, congestionWindow: 10 * mss, slowStartThreshold: 20 * mss,
+						rackLatestDelivered: tcpRACKSample{rtt: test.rtt}, rtt: newRTTEstimator(time.Second),
+						outstanding: []sentTCPSegment{
+							{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Second))},
+							{sequence: 1100, end: 2100, state: sentTCPSegmentTransmitted | test.flags, hostQueue: ticket},
+						},
+					}
+					if test.flags.has(sentTCPSegmentSACKed) {
+						state.sackedRanges, state.sackedBytes = 1, mss
+					}
+					state.controller.initialize(CongestionPhaseRecovery, epoch, test.rtt, test.rtt, state.congestionWindow, state.slowStartThreshold, mss, 1)
+					if index := state.prepareRetransmission(0, true, false, true, false, 0, now); index != 0 {
+						t.Fatalf("RTO target = %d", index)
+					}
+					segment := &state.outstanding[1]
+					if lost := segment.state.has(sentTCPSegmentTransmissionLost); lost != test.lost {
+						t.Fatalf("latest-copy loss = %t, state %#x", lost, segment.state)
+					}
+					if segment.state.has(sentTCPSegmentSACKed) != test.flags.has(sentTCPSegmentSACKed) || segment.state.has(sentTCPSegmentSACKRetried|sentTCPSegmentRACKLost) {
+						t.Fatalf("RTO selection state = %#x", segment.state)
+					}
+					if flight := state.rtoTransmissionFlight(); flight != test.flight {
+						t.Fatalf("transmission flight = %d, want %d", flight, test.flight)
+					}
+					losses := state.controller.state.LostBytes
+					if losses != mss+test.newLosses {
+						t.Fatalf("lost bytes = %d, want %d", losses, mss+test.newLosses)
+					}
+					state.prepareRetransmission(0, true, false, true, false, 0, now)
+					if state.controller.state.LostBytes != losses {
+						t.Fatal("repeated timeout reported the same generations twice")
+					}
+					state.outstanding[0].advanceTransmissionGeneration()
+					state.outstanding[0].hostQueue = testPacketQueueTicketAt(epoch, now)
+					if flight := state.rtoTransmissionFlight(); flight != test.flight+mss {
+						t.Fatalf("published flight = %d, want %d", flight, test.flight+mss)
+					}
+					state.prepareRetransmission(0, true, false, true, false, 0, now.Add(time.Second))
+					wantLosses := losses + mss
+					if !test.lost && !test.pending && !test.flags.has(sentTCPSegmentSACKed) {
+						wantLosses += mss
+					}
+					if state.controller.state.LostBytes != wantLosses {
+						t.Fatalf("replacement timeout loss = %d", state.controller.state.LostBytes)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestTCPRTOAfterSACKReneging(t *testing.T) {
+	const mss = 1000
+	for _, test := range []struct {
+		name    string
+		flags   sentTCPSegmentState
+		pending bool
+	}{
+		{name: "recent original"},
+		{name: "recent SACKed original", flags: sentTCPSegmentSACKed},
+		{name: "recent SACKed replacement", flags: sentTCPSegmentSACKed | sentTCPSegmentRetransmitted | sentTCPSegmentOriginalLost},
+		{name: "host-owned original", flags: sentTCPSegmentSACKed, pending: true},
+		{name: "host-owned replacement", flags: sentTCPSegmentSACKed | sentTCPSegmentRetransmitted | sentTCPSegmentOriginalLost, pending: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			epoch := now.Add(-2 * time.Second)
+			stack := &Stack{timestampEpoch: epoch}
+			ticket := testPacketQueueTicketAt(epoch, now.Add(-75*time.Millisecond))
+			if test.pending {
+				stack.outbound.initFIFO(1, epoch)
+				slot, _ := stack.outbound.tryReserve()
+				queued, _ := stack.outbound.enqueueReservedTCP(slot, []byte{1}, false, 1, false)
+				ticket.token = queued.token
+			}
+			state := tcpEstablishedState{
+				connection: &TCPConn{stack: stack}, controller: newTCPCongestionController(CongestionControlBBR3),
+				peerMSS: mss, peerSACK: true, peerWindow: 65535,
+				sendUnacknowledged: 100, sendNext: 2100,
+				congestionWindow: 10 * mss, slowStartThreshold: 20 * mss,
+				rtt: newRTTEstimator(time.Second), rackLatestDelivered: tcpRACKSample{rtt: 100 * time.Millisecond},
+				outstanding: []sentTCPSegment{
+					{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Second))},
+					{sequence: 1100, end: 2100, state: sentTCPSegmentTransmitted | test.flags, hostQueue: ticket},
+				},
+			}
+			state.recountSACK()
+			state.controller.initialize(CongestionPhaseOpen, epoch, 100*time.Millisecond, 100*time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+			recorder := &bbr3RenegingRecorder{algorithm: state.controller.algorithm.(*bbr3CongestionControl)}
+			state.controller.algorithm = recorder
+			if index := state.prepareRetransmission(-1, true, false, true, false, 0, now); index != 0 {
+				t.Fatalf("reneging RTO target = %d, want 0", index)
+			}
+			wantFlight, wantLosses := uint32(0), uint64(2*mss)
+			if test.pending {
+				wantFlight, wantLosses = mss, mss
+			}
+			if !state.sackRenegingRecovery || state.sackedRanges != 0 || state.sackedBytes != 0 || state.frtoState != tcpFRTOInactive {
+				t.Fatal("confirmed reneging retained SACK state or enabled F-RTO")
+			}
+			if flight := state.rtoTransmissionFlight(); flight != wantFlight || state.controller.state.LostBytes != wantLosses || recorder.validLoss.Load() != 0 || recorder.staleLoss.Load() != wantLosses/mss {
+				t.Fatalf("reneging flight/loss/evidence = %d/%d/%d/%d, want %d/%d/0/%d", flight, state.controller.state.LostBytes, recorder.validLoss.Load(), recorder.staleLoss.Load(), wantFlight, wantLosses, wantLosses/mss)
+			}
+			state.prepareRetransmission(0, true, false, false, false, 0, now)
+			if state.controller.state.LostBytes != wantLosses {
+				t.Fatal("repeated preparation reported a generation twice")
+			}
+			state.outstanding[0].advanceTransmissionGeneration()
+			state.controller.onRetransmit(mss, mss, now, monotonicStampAt(epoch, now), state.congestionWindow, state.congestionFlight(), wantFlight, 2*mss, state.rtt.srtt, state.slowStartThreshold)
+			if snapshot := bbr3DecodePacketState(state.controller.transmissionState()).inflight; snapshot != wantFlight+mss {
+				t.Fatalf("reneging replacement snapshot = %d, want %d", snapshot, wantFlight+mss)
+			}
+			if !test.pending {
+				state.outstanding[1].advanceTransmissionGeneration()
+				state.outstanding[1].hostQueue = testPacketQueueTicketAt(epoch, now)
+			}
+			// The recovery flag outlives this timeout. A later ordinary RTO
+			// must still retain a recent replacement without fresh reneging.
+			state.prepareRetransmission(0, true, false, true, false, 0, now.Add(time.Millisecond))
+			if flight := state.rtoTransmissionFlight(); flight != mss {
+				t.Fatalf("ordinary RTO during reneging recovery flight = %d, want %d", flight, mss)
+			}
+		})
+	}
+}
+
+func TestTCPRTOFlightSurvivesScoreboardChanges(t *testing.T) {
+	state := tcpEstablishedState{outstanding: []sentTCPSegment{{
+		sequence: 0xfffffff0, end: 0x31, flags: TCPFlagACK | TCPFlagFIN,
+		state: sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted | sentTCPSegmentOriginalLost | sentTCPSegmentSACKRetried,
+	}}}
+	if flight := state.rtoTransmissionFlight(); flight != 65 {
+		t.Fatalf("FIN/wrapped live replacement flight = %d, want 65", flight)
+	}
+	state.outstanding = splitTCPSegments(state.outstanding, 16)
+	if flight := state.rtoTransmissionFlight(); len(state.outstanding) != 4 || flight != 65 {
+		t.Fatalf("PMTU split flight = %d, ranges %d", flight, len(state.outstanding))
+	}
+	trimAcknowledgedTCPSegment(&state.outstanding[0], 0xfffffff8)
+	if flight := state.rtoTransmissionFlight(); flight != 57 {
+		t.Fatalf("partial-ACK flight = %d, want 57", flight)
+	}
+	state.outstanding[1].state |= sentTCPSegmentSACKed
+	if flight := state.rtoTransmissionFlight(); flight != 41 {
+		t.Fatalf("SACK flight = %d, want 41", flight)
+	}
+	state.outstanding[1].state &^= sentTCPSegmentSACKed
+	state.outstanding[1].markLost(true)
+	if bytes := recordTCPSegmentLoss(&state.outstanding[1]); bytes != 16 || state.rtoTransmissionFlight() != 41 {
+		t.Fatalf("reneged-copy loss = %d, flight %d", bytes, state.rtoTransmissionFlight())
+	}
+	state.outstanding[1].advanceTransmissionGeneration()
+	if flight := state.rtoTransmissionFlight(); flight != 57 {
+		t.Fatalf("new PMTU replacement flight = %d, want 57", flight)
+	}
+	state.outstanding = []sentTCPSegment{{sequence: 10, end: 11, flags: TCPFlagFIN, state: sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted | sentTCPSegmentOriginalLost}}
+	if flight := state.rtoTransmissionFlight(); flight != 1 {
+		t.Fatalf("FIN-only flight = %d, want 1", flight)
+	}
+	state.outstanding = nil
+	if flight := state.rtoTransmissionFlight(); flight != 0 {
+		t.Fatalf("empty flight = %d", flight)
+	}
+}
+
+func TestTCPRTORetainsRecentReplacementAfterSACK(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	epoch := now.Add(-time.Second)
+	state := tcpEstablishedState{
+		connection: &TCPConn{stack: &Stack{timestampEpoch: epoch}},
+		controller: newTCPCongestionController(CongestionControlBBR3),
+		peerMSS:    mss, peerSACK: true, sendNext: 5 * mss,
+		congestionWindow: 10 * mss, slowStartThreshold: 20 * mss, rtt: newRTTEstimator(time.Second),
+		rackLatestDelivered: tcpRACKSample{rtt: 100 * time.Millisecond},
+		outstanding: []sentTCPSegment{
+			{sequence: 0, end: mss, state: sentTCPSegmentTransmitted},
+			{sequence: mss, end: 2 * mss, state: sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted | sentTCPSegmentSACKRetried, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-50*time.Millisecond))},
+			{sequence: 2 * mss, end: 3 * mss, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+			{sequence: 3 * mss, end: 4 * mss, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+			{sequence: 4 * mss, end: 5 * mss, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+		},
+		sackedRanges: 3, sackedBytes: 3 * mss,
+	}
+	state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+	state.prepareRetransmission(0, true, false, true, false, 0, now)
+	if state.outstanding[1].state.has(sentTCPSegmentSACKRetried) || state.rtoTransmissionFlight() != 2*mss {
+		t.Fatal("RTO did not retain both recent speculative copies")
+	}
+	if lost := recordTestTCPLosses(state.outstanding, mss); lost != 0 || state.rtoTransmissionFlight() != mss || state.outstanding[1].state.has(sentTCPSegmentTransmissionLost) {
+		t.Fatalf("SACK-only loss = %d, latest flight %d, state %#x", lost, state.rtoTransmissionFlight(), state.outstanding[1].state)
+	}
+	state.outstanding[1].state |= sentTCPSegmentRACKLost
+	if lost := recordTestTCPLosses(state.outstanding, mss); lost != mss || state.rtoTransmissionFlight() != 0 {
+		t.Fatalf("RACK loss = %d, flight %d", lost, state.rtoTransmissionFlight())
+	}
+}
+
+func TestTCPRTOFlightUndoAndControllerChange(t *testing.T) {
+	const mss = 1000
+	now := time.Now()
+	state := tcpEstablishedState{
+		connection: &TCPConn{stack: &Stack{timestampEpoch: now.Add(-time.Second)}},
+		controller: newTCPCongestionController(CongestionControlBBR3),
+		peerMSS:    mss, congestionWindow: 10 * mss, slowStartThreshold: 20 * mss,
+		sendUnacknowledged: 100, sendNext: 2100, rtt: newRTTEstimator(time.Second),
+		outstanding: []sentTCPSegment{
+			{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted},
+			{sequence: 1100, end: 2100, state: sentTCPSegmentTransmitted},
+		},
+	}
+	state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+	state.prepareRetransmission(0, true, false, true, false, 0, now)
+	state.outstanding[0].advanceTransmissionGeneration()
+	state.outstanding[0].state |= sentTCPSegmentSACKRetried
+	losses := state.controller.state.LostBytes
+	if !state.restoreSpuriousRecovery(now.Add(time.Millisecond), 0) {
+		t.Fatal("timeout was not undone")
+	}
+	if flight := state.rtoTransmissionFlight(); flight != 3*mss || state.controller.state.LostBytes != losses || state.outstanding[0].state.has(sentTCPSegmentTransmissionLost) {
+		t.Fatalf("undo flight = %d, lost bytes %d/%d", flight, state.controller.state.LostBytes, losses)
+	}
+	state.prepareRetransmission(0, true, false, true, false, 0, now.Add(time.Second))
+	state.outstanding[0].advanceTransmissionGeneration()
+	if flight := state.rtoTransmissionFlight(); flight != mss {
+		t.Fatalf("RTO replacement flight = %d", flight)
+	}
+	flags := [2]sentTCPSegmentState{state.outstanding[0].state, state.outstanding[1].state}
+	factory, _ := registeredCongestionControlFactory(CongestionControlReno)
+	state.changeCongestionController(factory, 0)
+	if state.outstanding[0].state != flags[0] || state.outstanding[1].state != flags[1] || state.rtoTransmissionFlight() != mss {
+		t.Fatal("controller change altered live-copy membership")
+	}
+}
+
+func TestTCPSACKReplacementRetainsOriginalLoss(t *testing.T) {
+	const mss = 1000
+	for _, test := range []struct {
+		name     string
+		sizes    []uint32
+		original bool
+	}{
+		{name: "below threshold", sizes: []uint32{mss}, original: false},
+		{name: "range threshold", sizes: []uint32{100, 100, 100}, original: true},
+		{name: "byte threshold", sizes: []uint32{mss, mss + 1}, original: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			outstanding := []sentTCPSegment{{sequence: 0, end: mss, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKRetried}}
+			outstanding[0].advanceTransmissionGeneration()
+			sequence := uint32(mss)
+			for _, size := range test.sizes {
+				outstanding = append(outstanding, sentTCPSegment{sequence: sequence, end: sequence + size, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed})
+				sequence += size
+			}
+			if losses := recordTestTCPLosses(outstanding, mss); losses != 0 || outstanding[0].lossAlreadyReported() || outstanding[0].state.has(sentTCPSegmentOriginalLost) != test.original {
+				t.Fatalf("replacement loss = %d, original %t, reported %t", losses, outstanding[0].state.has(sentTCPSegmentOriginalLost), outstanding[0].lossAlreadyReported())
+			}
+			wantPipe := uint32(2 * mss)
+			if test.original {
+				wantPipe = mss
+			}
+			if pipe := sackRecoveryPipe(outstanding, mss); pipe != wantPipe {
+				t.Fatalf("replacement Pipe = %d, want %d", pipe, wantPipe)
+			}
+			outstanding[0].state |= sentTCPSegmentRACKLost
+			outstanding[0].state &^= sentTCPSegmentSACKRetried
+			if losses := recordTestTCPLosses(outstanding, mss); losses != mss || sackRecoveryPipe(outstanding, mss) != 0 {
+				t.Fatalf("RACK replacement loss = %d, Pipe %d", losses, sackRecoveryPipe(outstanding, mss))
+			}
+			if losses := recordTestTCPLosses(outstanding, mss); losses != 0 {
+				t.Fatalf("replacement loss reported twice: %d", losses)
+			}
+		})
+	}
+}
+
+func TestTCPEifelPartialACKDoesNotReportSpuriousLoss(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		echo uint32
+		ecn  bool
+		frto bool
+		sack bool
+		undo bool
+		loss uint64
+	}{
+		{name: "original timestamp", echo: 100, frto: true, undo: true},
+		{name: "retransmission timestamp", echo: 1200, loss: 1000},
+		{name: "F-RTO probe allowance", echo: 1200, frto: true},
+		{name: "ECN feedback", echo: 100, ecn: true, frto: true, loss: 1000},
+		{name: "fresh SACK loss after undo", echo: 100, sack: true, undo: true, loss: 1000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			start := time.Now().Add(-2 * time.Second)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: start}
+			connection.sendBuffer.append(make([]byte, 2000))
+			connection.peerTimestamp, connection.peerECN = true, test.ecn
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(CongestionControlBBR3),
+				peerMSS: 1000, peerWindow: 65535, sendUnacknowledged: 1000, sendNext: 3000,
+				congestionWindow: 10000, slowStartThreshold: 10000,
+				rtt:                 rttEstimator{initialized: true, srtt: 100 * time.Millisecond, minimum: 100 * time.Millisecond, rto: time.Second},
+				rackLatestDelivered: tcpRACKSample{rtt: 100 * time.Millisecond},
+				outstanding:         []sentTCPSegment{{sequence: 1000, end: 2000}, {sequence: 2000, end: 3000}},
+			}
+			if test.sack {
+				state.peerSACK, state.sendNext = true, 6000
+				connection.peerSACK = true
+				connection.sendBuffer.append(make([]byte, 3000))
+				for sequence := uint32(3000); sequence < state.sendNext; sequence += 1000 {
+					state.outstanding = append(state.outstanding, sentTCPSegment{sequence: sequence, end: sequence + 1000})
+				}
+			}
+			state.rebaseOutstanding()
+			state.controller.initialize(CongestionPhaseOpen, start, state.rtt.srtt, state.rtt.minimum, 10000, 10000, 1000, 1)
+			for index := range state.outstanding {
+				sentAt := start.Add(time.Duration(100+index*50) * time.Millisecond)
+				if index != 0 {
+					// Keep later originals recent at the RTO; this ACK must
+					// independently establish or undo their loss evidence.
+					sentAt = start.Add(time.Duration(1100+index*10) * time.Millisecond)
+				}
+				segment := &state.outstanding[index]
+				segment.state = sentTCPSegmentTransmitted
+				segment.hostQueue.queuedAt = monotonicStampAt(start, sentAt)
+				segment.timestamp = uint32(100 + index*50)
+				segment.delivery, _ = state.controller.onDataSend(1000, 1000, sentAt, segment.hostQueue.queuedAt, uint32(index*1000), 10000, uint32(index*1000), uint32(index*1000), state.rtt.srtt, 10000)
+				segment.congestionPacketState = state.controller.transmissionState()
+			}
+			retransmittedAt := start.Add(1200 * time.Millisecond)
+			if index := state.prepareRetransmission(0, true, false, true, false, 0, retransmittedAt); index != 0 {
+				t.Fatalf("RTO selected range %d, want 0", index)
+			}
+			beforeLost := state.controller.state.LostBytes
+			state.undo.recordRetransmission(1000, 2000, 1200, false)
+			transmissionFlight := state.rtoTransmissionFlight()
+			state.outstanding[0].advanceTransmissionGeneration()
+			state.outstanding[0].state |= sentTCPSegmentSACKRetried
+			state.outstanding[0].timestamp = 1200
+			state.outstanding[0].hostQueue.queuedAt = monotonicStampAt(start, retransmittedAt)
+			state.outstanding[0].delivery = state.controller.onRetransmit(1000, 1000, retransmittedAt, state.outstanding[0].hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), transmissionFlight, state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+			state.outstanding[0].congestionPacketState = state.controller.transmissionState()
+			state.frtoState = tcpFRTOInactive
+			if test.frto {
+				state.frtoState = tcpFRTOAwaitingACK
+			}
+			flags := byte(TCPFlagACK)
+			if test.ecn {
+				flags |= TCPFlagECE
+			}
+			segment := tcpSegment{sequence: 100, acknowledgement: 2000, flags: flags, window: 65535}
+			if test.sack {
+				var options [10]byte
+				options[0], options[1] = TCPHeaderOptionSACK, 10
+				binary.BigEndian.PutUint32(options[2:6], 3000)
+				binary.BigEndian.PutUint32(options[6:10], 6000)
+				segment.setOptions(options[:])
+			}
+			state.processAcknowledgment(&segment, start.Add(1300*time.Millisecond), test.echo)
+			if state.rtoRecovery == test.undo || (state.undo.spuriousUndos != 0) != test.undo || state.controller.state.LostBytes != beforeLost+test.loss || state.deliverySample.losses != test.loss || state.outstanding[0].lossAlreadyReported() != (test.loss != 0) {
+				t.Fatalf("partial ACK = recovery %t undos %d losses %d/%d sample %d state %#x", state.rtoRecovery, state.undo.spuriousUndos, beforeLost, state.controller.state.LostBytes, state.deliverySample.losses, state.outstanding[0].state)
+			}
+			if test.undo && !test.sack && state.outstanding[0].state.has(sentTCPSegmentOriginalLost|sentTCPSegmentRACKLost|sentTCPSegmentTransmissionLost) {
+				t.Fatalf("spurious RTO retained loss marks: %#x", state.outstanding[0].state)
+			}
+		})
+	}
+}
+
 func TestTCPPRRDeliveryAndSendCount(t *testing.T) {
-	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, state: sentTCPSegmentSACKed},
-		{sequence: 200, end: 300},
-		{sequence: 300, end: 400},
-	}
-	if delivered := tcpNewlyAcknowledgedBytes(outstanding, 350); delivered != 150 {
-		t.Fatalf("new cumulative delivery = %d, want 150", delivered)
-	}
 	if window := prrCongestionWindow(800, 500, 1000, 100, 0, 100, true, false, 100); window != 850 {
 		t.Fatalf("PRR proportional window = %d, want 850", window)
 	}
@@ -12607,6 +13878,636 @@ func TestTCPPRRDeliveryAndSendCount(t *testing.T) {
 	}
 	if window := prrCongestionWindow(300, 500, 1000, 100, 0, 100, true, true, 100); window != 400 {
 		t.Fatalf("PRR packet-conservation window with new loss = %d, want 400", window)
+	}
+	if window := prrCongestionWindow(500, 500, 1000, 100, 0, 100, false, true, 100); window != 600 {
+		t.Fatalf("PRR forced entry window = %d, want 600", window)
+	}
+	if window := prrCongestionWindow(500, 500, 1000, 100, 100, 100, false, true, 100); window != 500 {
+		t.Fatalf("PRR repeated forced entry window = %d, want 500", window)
+	}
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		controller := newTCPCongestionController(algorithm)
+		controller.initialize(CongestionPhaseRecovery, time.Unix(100, 0), time.Millisecond, time.Millisecond, 6000, 8000, 1000, 1)
+		want := uint32(4100)
+		if algorithm == CongestionControlBBR || algorithm == CongestionControlBBR3 {
+			want = 6000
+		}
+		if window := controller.applyPRRWindow(time.Unix(100, 0), 6000, 4100, 0); window != want {
+			t.Fatalf("%s PRR window = %d, want %d", algorithm, window, want)
+		}
+	}
+}
+
+func TestTCPPRRCumulativeDelivery(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, test := range []struct {
+			name      string
+			ack       uint32
+			sacked    []int
+			withSACK  bool
+			delivered uint64
+		}{
+			{name: "complete ranges", ack: 300, delivered: 200},
+			{name: "partial range", ack: 350, delivered: 250},
+			{name: "earlier SACK", ack: 350, sacked: []int{0}, delivered: 150},
+			{name: "partial earlier SACK", ack: 350, sacked: []int{2}, delivered: 200},
+			{name: "only earlier SACK", ack: 300, sacked: []int{0, 1}},
+			{name: "cumulative and SACK", ack: 350, sacked: []int{0}, withSACK: true, delivered: 250},
+		} {
+			t.Run(algorithm+"/"+test.name, func(t *testing.T) {
+				now := time.Unix(100, 0)
+				epoch := now.Add(-time.Second)
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: epoch}
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(algorithm),
+					peerMSS: 100, peerSACK: true, peerWindow: 65535,
+					sendUnacknowledged: 100, sendNext: 500, fastRecovery: true, recoveryPoint: 500,
+					congestionWindow: 400, slowStartThreshold: 400, prrPriorFlight: 400,
+					rtt: newRTTEstimator(time.Second), outstanding: make([]sentTCPSegment, 4),
+				}
+				for index := range state.outstanding {
+					state.outstanding[index] = sentTCPSegment{
+						sequence: uint32(100 + 100*index), end: uint32(200 + 100*index),
+						state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Millisecond)),
+					}
+				}
+				for _, index := range test.sacked {
+					state.outstanding[index].state |= sentTCPSegmentSACKed
+					state.sackedRanges++
+					state.sackedBytes += 100
+				}
+				state.controller.initialize(CongestionPhaseRecovery, epoch, time.Millisecond, time.Millisecond, 400, 400, 100, 1)
+				state.rebaseOutstanding()
+				segment := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535}
+				if test.withSACK {
+					var options [10]byte
+					options[0], options[1] = TCPHeaderOptionSACK, 10
+					binary.BigEndian.PutUint32(options[2:6], 400)
+					binary.BigEndian.PutUint32(options[6:10], 500)
+					segment.setOptions(options[:])
+				}
+				state.processAcknowledgment(&segment, now, 0)
+				if !state.fastRecovery || state.prrDelivered != test.delivered || state.sendUnacknowledged != test.ack || state.outstanding[0].sequence != test.ack {
+					t.Fatalf("cumulative ACK: recovery:%t delivered:%d SND.UNA:%d first:%d, want true/%d/%d/%d", state.fastRecovery, state.prrDelivered, state.sendUnacknowledged, state.outstanding[0].sequence, test.delivered, test.ack, test.ack)
+				}
+				state.processAcknowledgment(&segment, now.Add(time.Millisecond), 0)
+				if state.prrDelivered != test.delivered {
+					t.Fatalf("repeated ACK credited delivery twice: %d, want %d", state.prrDelivered, test.delivered)
+				}
+			})
+		}
+	}
+}
+
+func TestTCPPRREntryRetransmissionReadiness(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC} {
+		t.Run(algorithm+"/no delivery", func(t *testing.T) {
+			const mss = 1000
+			now := time.Unix(100, 0)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: now.Add(-time.Second)}
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(algorithm),
+				peerSACK: true, peerMSS: mss, peerWindow: 65535,
+				sendUnacknowledged: 100, sendNext: 3100,
+				congestionWindow: 6000, slowStartThreshold: 20000,
+				sackedRanges: 1, sackedBytes: mss, rtt: newRTTEstimator(time.Second),
+				outstanding: []sentTCPSegment{
+					{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost},
+					{sequence: 1100, end: 2100, state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost},
+					{sequence: 2100, end: 3100, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+				},
+			}
+			state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+			if index := state.prepareRetransmission(0, false, false, true, false, 0, now); index != 0 {
+				t.Fatalf("timer recovery target = %d, want 0", index)
+			}
+			if !state.fastRecovery || state.prrPriorFlight != 2*mss || state.prrDelivered != 0 || state.prrOut != 0 || state.congestionWindow != 0 {
+				t.Fatalf("timer entry = active:%t flight:%d delivered:%d sent:%d window:%d", state.fastRecovery, state.prrPriorFlight, state.prrDelivered, state.prrOut, state.congestionWindow)
+			}
+			if !state.recoveryOutputReady() || sackRecoveryCanSend(true, 0, mss, state.congestionWindow) {
+				t.Fatal("timer entry must authorize only its retransmission, not new data")
+			}
+			state.outstanding[0].advanceTransmissionGeneration()
+			state.outstanding[0].state.set(sentTCPSegmentRACKLost, false)
+			state.outstanding[0].state.set(sentTCPSegmentSACKRetried, true)
+			state.prrOut += mss
+			if firstUnretriedLoss(state.outstanding, mss) != 1 || state.recoveryOutputReady() || state.canRetransmitRecovery(sackRecoveryPipe(state.outstanding, mss), mss) {
+				t.Fatal("first publication authorized another loss without delivery credit")
+			}
+		})
+	}
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		t.Run(algorithm, func(t *testing.T) {
+			state := tcpEstablishedState{
+				controller: newTCPCongestionController(algorithm), peerSACK: true,
+				peerMSS: 1000, peerWindow: 65535, fastRecovery: true,
+				outstanding: []sentTCPSegment{{sequence: 100, end: 1100, state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost | sentTCPSegmentTransmissionLost}},
+			}
+			want := algorithm == CongestionControlReno || algorithm == CongestionControlCUBIC
+			if ready := state.recoveryOutputReady(); ready != want {
+				t.Fatalf("entry output readiness = %t, want %t", ready, want)
+			}
+			if sackRecoveryCanSend(true, 0, 1000, 0) {
+				t.Fatal("ordinary new data acquired the entry-retransmission exemption")
+			}
+			state.prrOut = 1000
+			if state.recoveryOutputReady() || state.canRetransmitRecovery(0, 1000) {
+				t.Fatal("successful entry retransmission did not consume its exemption")
+			}
+		})
+	}
+}
+
+func TestTCPLateDSACKUndoPreservesProbeRTTWindow(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlBBR, CongestionControlBBR3} {
+		for _, test := range []struct {
+			name        string
+			ack         uint32
+			outstanding bool
+		}{
+			{name: "empty flight", ack: 5000},
+			{name: "old ACK", ack: 4000},
+			{name: "active flight", ack: 5000, outstanding: true},
+			{name: "new delivery", ack: 6000, outstanding: true},
+		} {
+			t.Run(algorithm+"/"+test.name, func(t *testing.T) {
+				const mss = 1000
+				now := time.Unix(100, 0)
+				epoch := now.Add(-time.Second)
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: epoch}
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(algorithm),
+					peerMSS: mss, peerSACK: true, peerWindow: 65535,
+					sendUnacknowledged: 5000, sendNext: 5000, bytesAcknowledged: 5000,
+					congestionWindow: 4000, slowStartThreshold: 20000,
+					rtt: newRTTEstimator(time.Second), undo: new(tcpRecoveryUndo),
+				}
+				state.controller.initialize(CongestionPhaseOpen, epoch, 10*time.Millisecond, 20*time.Millisecond, 20000, 20000, mss, 1)
+				state.undo.begin(false, 4000, 20000, 20000, 10000, &state.controller, state.rtt, now.Add(-time.Second))
+				state.undo.recordRetransmission(1000, 2000, 10, false)
+				state.recordRetransmission(1000, 2000)
+				if test.outstanding {
+					state.sendNext = 6000
+					state.outstanding = []sentTCPSegment{{sequence: 5000, end: 6000, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Millisecond))}}
+					state.rebaseOutstanding()
+				}
+				cap := uint32(4000)
+				switch model := state.controller.algorithm.(type) {
+				case *bbrCongestionControl:
+					model.mode, model.priorWindow = bbrProbeRTT, 20000
+					model.minimumRTT, model.bandwidth = 10*time.Millisecond, 1000000
+					model.minimumRTTStamp = now
+				case *bbr3CongestionControl:
+					model.mode, model.priorWindow = bbrProbeRTT, 20000
+					model.minimumRTT, model.bandwidthHigh[1] = 10*time.Millisecond, 1000000
+					model.minimumRTTStamp, model.probeRTTStamp = now, now
+					cap = 5000 // max(4*MSS, 0.5 * 1 MB/s * 10 ms).
+				}
+				var options [10]byte
+				options[0], options[1] = TCPHeaderOptionSACK, 10
+				binary.BigEndian.PutUint32(options[2:6], 1000)
+				binary.BigEndian.PutUint32(options[6:10], 2000)
+				segment := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535}
+				segment.setOptions(options[:])
+				state.processAcknowledgment(&segment, now, 0)
+				if state.undo.spuriousUndos != 1 || state.congestionWindow > cap {
+					t.Fatalf("DSACK undo = count:%d window:%d, cap:%d", state.undo.spuriousUndos, state.congestionWindow, cap)
+				}
+				switch model := state.controller.algorithm.(type) {
+				case *bbrCongestionControl:
+					if model.mode != bbrProbeRTT || model.priorWindow != 20000 {
+						t.Fatalf("undo changed ProbeRTT mode/prior window: %v/%d", model.mode, model.priorWindow)
+					}
+					model.probeDone, model.probeRound = now, true
+					window := model.updateMinimumRTT(state.congestionWindow, &tcpDeliveryRateSample{ackTime: now.Add(time.Second)}, mss)
+					if model.mode == bbrProbeRTT || window < 20000 {
+						t.Fatalf("ProbeRTT exit lost the saved window: %v/%d", model.mode, window)
+					}
+				case *bbr3CongestionControl:
+					if model.mode != bbrProbeRTT || model.priorWindow != 20000 {
+						t.Fatalf("undo changed ProbeRTT mode/prior window: %v/%d", model.mode, model.priorWindow)
+					}
+					model.probeDone, model.probeRound = now, true
+					window := model.updateMinimumRTT(state.congestionWindow, &tcpDeliveryRateSample{ackTime: now.Add(time.Second)}, mss)
+					if model.mode == bbrProbeRTT || window < 20000 {
+						t.Fatalf("ProbeRTT exit lost the saved window: %v/%d", model.mode, window)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestTCPBBR3LateDSACKUndoPreservesCruiseWindow(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		ack         uint32
+		outstanding bool
+		wantWindow  uint32
+	}{
+		{name: "empty flight", ack: 5000, wantWindow: 17032},
+		{name: "empty flight old ACK", ack: 4000, wantWindow: 17032},
+		{name: "active flight old ACK", ack: 4000, outstanding: true, wantWindow: 17032},
+		{name: "active flight current ACK", ack: 5000, outstanding: true, wantWindow: 17032},
+		{name: "new delivery", ack: 6000, outstanding: true, wantWindow: 6000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const mss = 1000
+			now := time.Unix(100, 0)
+			epoch := now.Add(-time.Second)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: epoch}
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(CongestionControlBBR3),
+				peerMSS: mss, peerSACK: true, peerWindow: 65535,
+				sendUnacknowledged: 5000, sendNext: 5000, bytesAcknowledged: 5000,
+				congestionWindow: 4000, slowStartThreshold: 20000,
+				rtt: newRTTEstimator(time.Second), undo: new(tcpRecoveryUndo),
+			}
+			state.controller.initialize(CongestionPhaseOpen, epoch, 10*time.Millisecond, 20*time.Millisecond, 20000, 20000, mss, 1)
+			model := state.controller.algorithm.(*bbr3CongestionControl)
+			model.mode, model.probePhase = bbrProbeBandwidth, bbr3ProbeDown
+			model.inflightHigh, model.fullBandwidthReached = 20000, true
+			model.minimumRTT, model.bandwidthHigh[1] = 10*time.Millisecond, 1000000
+			model.minimumRTTStamp, model.probeRTTStamp = now, now
+			state.undo.begin(false, 4000, 20000, 20000, 10000, &state.controller, state.rtt, epoch)
+			state.undo.recordRetransmission(1000, 2000, 10, false)
+			state.recordRetransmission(1000, 2000)
+			// Delayed DSACK feedback arrives after the sender has entered Cruise.
+			model.inflightHigh = 12000
+			model.probeStarted, model.probeWait = now, time.Second
+			model.enterProbePhase(bbr3ProbeCruise, now)
+			if test.outstanding {
+				state.sendNext = 6000
+				state.outstanding = []sentTCPSegment{{sequence: 5000, end: 6000, state: sentTCPSegmentTransmitted, hostQueue: testPacketQueueTicketAt(epoch, now.Add(-time.Millisecond))}}
+				state.rebaseOutstanding()
+			}
+			var options [10]byte
+			options[0], options[1] = TCPHeaderOptionSACK, 10
+			binary.BigEndian.PutUint32(options[2:6], 1000)
+			binary.BigEndian.PutUint32(options[6:10], 2000)
+			segment := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535}
+			segment.setOptions(options[:])
+			state.processAcknowledgment(&segment, now, 0)
+			if state.undo.spuriousUndos != 1 || state.undo.active || state.fastRecovery || state.rtoRecovery || state.congestionWindow != test.wantWindow {
+				t.Fatalf("DSACK undo = count %d active %t fast %t RTO %t window %d; want window %d", state.undo.spuriousUndos, state.undo.active, state.fastRecovery, state.rtoRecovery, state.congestionWindow, test.wantWindow)
+			}
+			if model.mode != bbrProbeBandwidth || model.probePhase != bbr3ProbeCruise || model.inflightHigh != 20000 || model.inflightLow != 0 || model.priorWindow != 20000 || model.undoBounds {
+				t.Fatalf("DSACK model = %s/%s high %d low %d prior %d checkpoint %t", model.mode, model.probePhase, model.inflightHigh, model.inflightLow, model.priorWindow, model.undoBounds)
+			}
+		})
+	}
+}
+
+func TestTCPPRRRecoveryEntryCredit(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC} {
+		for _, test := range []struct {
+			name            string
+			ack             uint32
+			priorSACK       bool
+			limitedTransmit bool
+			lostReplacement bool
+			wantDelivery    uint64
+			wantPriorFlight uint32
+		}{
+			{name: "SACK", wantDelivery: 6000, wantPriorFlight: 10000},
+			{name: "cumulative and SACK", ack: 1000, wantDelivery: 7000, wantPriorFlight: 10000},
+			{name: "earlier SACK", priorSACK: true, wantDelivery: 4000, wantPriorFlight: 8000},
+			{name: "Limited Transmit", limitedTransmit: true, wantDelivery: 6000, wantPriorFlight: 10000},
+			{name: "lost replacement", lostReplacement: true, wantDelivery: 6000, wantPriorFlight: 10000},
+		} {
+			t.Run(algorithm+"/"+test.name, func(t *testing.T) {
+				const mss = 1000
+				now := time.Unix(100, 0)
+				epoch := now.Add(-time.Second)
+				connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+				connection.stack = &Stack{timestampEpoch: epoch}
+				state := tcpEstablishedState{
+					connection: connection, controller: newTCPCongestionController(algorithm),
+					peerMSS: mss, peerSACK: true, peerWindow: 65535,
+					sendNext: 10000, congestionWindow: 10000, slowStartThreshold: 20000,
+					rtt: newRTTEstimator(time.Second), outstanding: make([]sentTCPSegment, 10),
+				}
+				for i := range state.outstanding {
+					state.outstanding[i] = sentTCPSegment{
+						sequence: uint32(i * mss), end: uint32((i + 1) * mss),
+						state:     sentTCPSegmentTransmitted,
+						hostQueue: testPacketQueueTicketAt(epoch, now.Add(-500*time.Millisecond)),
+					}
+				}
+				if test.priorSACK {
+					state.outstanding[6].state |= sentTCPSegmentSACKed
+					state.outstanding[7].state |= sentTCPSegmentSACKed
+					state.sackedRanges, state.sackedBytes = 2, 2000
+				}
+				if test.limitedTransmit {
+					state.outstanding[8].state |= sentTCPSegmentLimited
+					state.outstanding[9].state |= sentTCPSegmentLimited
+					state.limitedTransmitActive = true
+				}
+				phase := CongestionPhaseOpen
+				if test.lostReplacement {
+					state.fastRecovery, state.recoveryPoint = true, state.sendNext
+					state.prrPriorFlight, state.prrDelivered, state.prrOut = 12000, 2000, 1000
+					state.outstanding[0].advanceTransmissionGeneration()
+					state.outstanding[0].state |= sentTCPSegmentSACKRetried
+					phase = CongestionPhaseRecovery
+				}
+				state.controller.initialize(phase, epoch, 10*time.Millisecond, 20*time.Millisecond, 10000, 20000, mss, 1)
+				state.rebaseOutstanding()
+				var options [10]byte
+				options[0], options[1] = TCPHeaderOptionSACK, 10
+				binary.BigEndian.PutUint32(options[2:6], 2000)
+				binary.BigEndian.PutUint32(options[6:10], 8000)
+				segment := tcpSegment{acknowledgement: test.ack, flags: TCPFlagACK, window: 65535}
+				segment.setOptions(options[:])
+				state.processAcknowledgment(&segment, now, 0)
+				if !state.fastRecovery || state.prrDelivered != test.wantDelivery || state.prrOut != 0 || state.prrPriorFlight != test.wantPriorFlight {
+					t.Fatalf("entry PRR = active:%t delivered:%d sent:%d flight:%d, want true/%d/0/%d", state.fastRecovery, state.prrDelivered, state.prrOut, state.prrPriorFlight, test.wantDelivery, test.wantPriorFlight)
+				}
+				window := state.congestionWindow
+				state.processAcknowledgment(&segment, now.Add(time.Millisecond), 0)
+				if state.prrDelivered != test.wantDelivery || state.prrOut != 0 || state.prrPriorFlight != test.wantPriorFlight || state.congestionWindow != window {
+					t.Fatal("repeated SACK changed the PRR episode or granted more output")
+				}
+				segment = tcpSegment{acknowledgement: state.sendNext, flags: TCPFlagACK, window: 65535}
+				state.processAcknowledgment(&segment, now.Add(2*time.Millisecond), 0)
+				if state.fastRecovery || state.prrPriorFlight != 0 || state.prrDelivered != 0 || state.prrOut != 0 {
+					t.Fatal("the concluding ACK retained or replenished PRR credit")
+				}
+			})
+		}
+	}
+}
+
+func TestTCPPRRFirstRetransmissionPreservesCredit(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	if err := connection.SetCongestionControl(CongestionControlCUBIC); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x5b}, 10*before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	segments := make([][]byte, 0, 10)
+	for len(segments) < 10 {
+		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !ok {
+			t.Fatalf("initial flight contains %d/10 packets", len(segments))
+		}
+		segments = append(segments, consumeTestPacket(&stack.outbound, entry))
+	}
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, ok := stack.outbound.tryReserve()
+		if !ok {
+			break
+		}
+		held = append(held, slot)
+	}
+	for _, wire := range segments[2:8] {
+		if err := link.handleOutboundPacket(wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	var blocked TCPConnInfo
+	for {
+		blocked = connection.Info()
+		if blocked.InboundQueueBytes == 0 && blocked.FastRecovery {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("SACK processing did not enter recovery: %+v", blocked)
+		}
+		runtime.Gosched()
+	}
+	if blocked.Retransmissions != before.Retransmissions {
+		t.Fatal("blocked recovery published a retransmission")
+	}
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	for i := 0; i < 2; i++ {
+		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !ok {
+			t.Fatalf("retransmission %d lost the remaining entry-ACK credit", i+1)
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, ok := parseIPPacket(wire, false)
+		original, _ := parseIPPacket(segments[i], false)
+		if !ok || packet.protocol != ProtocolTCP || !bytes.Equal(packet.payload[4:8], original.payload[4:8]) {
+			t.Fatalf("retransmission %d does not fill the expected hole: %x", i+1, wire)
+		}
+		// Neither retransmission is acknowledged: the second publication must
+		// use the entry ACK's remaining credit, not a new ACK or timer grant.
+	}
+	after := connection.Info()
+	if after.CongestionWindow != blocked.CongestionWindow || after.Retransmissions != before.Retransmissions+2 {
+		t.Fatalf("first sends changed the grant: before %+v, after %+v", blocked, after)
+	}
+}
+
+func TestTCPPRRTracksNewLoss(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC} {
+		t.Run(algorithm, func(t *testing.T) {
+			for _, test := range []struct {
+				name          string
+				deliverSecond bool
+				alreadyLost   bool
+				speculative   bool
+				wantWindow    uint32
+			}{
+				{name: "unchanged loss count", wantWindow: 4100},
+				{name: "decreasing loss count", deliverSecond: true, wantWindow: 4100},
+				{name: "no new loss", alreadyLost: true, wantWindow: 5100},
+				{name: "speculative replacement", speculative: true, wantWindow: 5100},
+				{name: "known original loss", speculative: true, alreadyLost: true, wantWindow: 6100},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					const mss = 1000
+					now := time.Unix(100, 0)
+					epoch := now.Add(-time.Second)
+					connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+					connection.stack = &Stack{timestampEpoch: epoch}
+					state := tcpEstablishedState{
+						connection: connection, controller: newTCPCongestionController(algorithm),
+						peerMSS: mss, peerSACK: true, peerWindow: 40_000,
+						sendNext: 5100, recoveryPoint: 5100, fastRecovery: true,
+						congestionWindow: 6000, slowStartThreshold: 6000,
+						prrPriorFlight: 12_000, prrDelivered: 6900, prrOut: 6900,
+						rtt: newRTTEstimator(time.Second),
+						outstanding: []sentTCPSegment{
+							{sequence: 0, end: 100},
+							{sequence: 100, end: 1100},
+							{sequence: 1100, end: 2100},
+							{sequence: 2100, end: 3100},
+							{sequence: 3100, end: 4100},
+							{sequence: 4100, end: 5100},
+						},
+					}
+					const lost = sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost | sentTCPSegmentLossReported | sentTCPSegmentTransmissionLost
+					state.outstanding[1].state = lost
+					if test.deliverSecond {
+						state.outstanding[3].state = lost
+					}
+					if test.alreadyLost && !test.speculative {
+						state.outstanding[2].state = lost
+					}
+					for i := range state.outstanding {
+						state.outstanding[i].state |= sentTCPSegmentTransmitted
+						state.outstanding[i].hostQueue = testPacketQueueTicketAt(epoch, now.Add(-500*time.Millisecond))
+					}
+					if test.speculative {
+						state.congestionWindow, state.slowStartThreshold = 8000, 8000
+						state.outstanding[0].state |= lost
+						state.outstanding[1].state &^= lost
+						// SACKed originals predate this speculative replacement.
+						// They can prove loss of its original, but not the new copy.
+						hole := &state.outstanding[2]
+						hole.advanceTransmissionGeneration()
+						hole.state |= sentTCPSegmentSACKRetried
+						hole.hostQueue = testPacketQueueTicketAt(epoch, now.Add(-50*time.Millisecond))
+						if test.alreadyLost {
+							hole.state |= sentTCPSegmentOriginalLost
+						}
+					}
+					state.controller.initialize(CongestionPhaseRecovery, epoch, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+					state.rebaseOutstanding()
+					var options [18]byte
+					options[0], options[1] = TCPHeaderOptionSACK, 18
+					binary.BigEndian.PutUint32(options[2:6], 100)
+					binary.BigEndian.PutUint32(options[6:10], 1100)
+					binary.BigEndian.PutUint32(options[10:14], 2100)
+					binary.BigEndian.PutUint32(options[14:18], 5100)
+					segment := tcpSegment{sequence: 100, acknowledgement: 100, flags: TCPFlagACK, window: 40_000}
+					segment.setOptions(options[:])
+					state.processAcknowledgment(&segment, now, 0)
+					if state.prrDelivered != 11_000 || state.prrOut != 6900 || state.congestionWindow != test.wantWindow {
+						t.Fatalf("PRR delivered/sent/window = %d/%d/%d, want 11000/6900/%d", state.prrDelivered, state.prrOut, state.congestionWindow, test.wantWindow)
+					}
+					if !state.outstanding[0].state.has(sentTCPSegmentSACKed) || !state.outstanding[1].state.has(sentTCPSegmentOriginalLost) {
+						t.Fatal("ACK did not deliver the old loss and confirm the remaining hole")
+					}
+					wantPipe := uint32(0)
+					if test.speculative {
+						wantPipe = mss
+						hole := &state.outstanding[1]
+						if hole.lossAlreadyReported() || hole.state.has(sentTCPSegmentRACKLost|sentTCPSegmentTransmissionLost) || !hole.state.has(sentTCPSegmentSACKRetried) || state.controller.state.LostBytes != 0 {
+							t.Fatalf("SACK evidence reported a live replacement as lost: %#x, loss bytes %d", hole.state, state.controller.state.LostBytes)
+						}
+						beforeWindow := state.congestionWindow
+						state.processAcknowledgment(&segment, now, 0)
+						if state.congestionWindow != beforeWindow || state.prrDelivered != 11_000 || state.controller.state.LostBytes != 0 {
+							t.Fatal("repeated SACK evidence changed PRR or loss accounting")
+						}
+					} else if !state.outstanding[1].lossAlreadyReported() || !state.outstanding[1].state.has(sentTCPSegmentRACKLost) {
+						t.Fatal("newly lost current transmission was not reported")
+					}
+					if sackRecoveryPipe(state.outstanding, mss) != wantPipe || !state.fastRecovery || state.undo != nil {
+						t.Fatal("ACK changed recovery ownership or allocated an unused undo checkpoint")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestTCPPRRNewLossAfterRTOUndo(t *testing.T) {
+	for _, test := range []struct {
+		name, algorithm string
+		sackOnly        bool
+		eifel           bool
+	}{
+		{name: "Reno RACK", algorithm: CongestionControlReno},
+		{name: "Reno SACK", algorithm: CongestionControlReno, sackOnly: true},
+		{name: "CUBIC RACK", algorithm: CongestionControlCUBIC},
+		{name: "CUBIC SACK", algorithm: CongestionControlCUBIC, sackOnly: true},
+		{name: "Reno RACK Eifel ACK", algorithm: CongestionControlReno, eifel: true},
+		{name: "Reno SACK Eifel ACK", algorithm: CongestionControlReno, sackOnly: true, eifel: true},
+		{name: "CUBIC RACK Eifel ACK", algorithm: CongestionControlCUBIC, eifel: true},
+		{name: "CUBIC SACK Eifel ACK", algorithm: CongestionControlCUBIC, sackOnly: true, eifel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const mss = 1000
+			now := time.Unix(100, 0)
+			epoch := now.Add(-time.Second)
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.stack = &Stack{timestampEpoch: epoch}
+			state := tcpEstablishedState{
+				connection: connection, controller: newTCPCongestionController(test.algorithm),
+				peerMSS: mss, peerSACK: true, peerWindow: 40_000,
+				sendNext: 5100, congestionWindow: 6000, slowStartThreshold: 6000,
+				fastRecovery: true, recoveryPoint: 5100,
+				prrPriorFlight: 12_000, prrDelivered: 6900, prrOut: 6900,
+				rtt: newRTTEstimator(time.Second),
+				outstanding: []sentTCPSegment{
+					{sequence: 0, end: 100},
+					{sequence: 100, end: 1100},
+					{sequence: 1100, end: 2100},
+					{sequence: 2100, end: 3100},
+					{sequence: 3100, end: 4100},
+					{sequence: 4100, end: 5100},
+				},
+			}
+			state.controller.initialize(CongestionPhaseRecovery, epoch, time.Millisecond, time.Millisecond, 6000, 6000, mss, 1)
+			defer state.controller.release(now, state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), mss, state.rtt.srtt, state.rtt.minimum)
+			for index := range state.outstanding {
+				state.outstanding[index].state = sentTCPSegmentTransmitted
+				state.outstanding[index].hostQueue = testPacketQueueTicketAt(epoch, now.Add(-500*time.Millisecond))
+			}
+			state.outstanding[1].state |= sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost | sentTCPSegmentLossReported | sentTCPSegmentTransmissionLost
+			state.prepareRetransmission(0, true, false, true, false, 0, now)
+			if !state.outstanding[2].lossAlreadyReported() {
+				t.Fatal("RTO did not report the aged original")
+			}
+			if test.eifel {
+				state.undo.recordRetransmission(0, 100, 100, false)
+				state.outstanding[0].advanceTransmissionGeneration()
+				state.outstanding[0].timestamp = 100
+				state.outstanding[0].hostQueue = testPacketQueueTicketAt(epoch, now)
+			} else {
+				if !state.restoreSpuriousRecovery(now, 0) {
+					t.Fatal("RTO undo failed")
+				}
+				if !state.outstanding[2].lossAlreadyReported() || state.outstanding[2].state.has(sentTCPSegmentOriginalLost|sentTCPSegmentTransmissionLost|sentTCPSegmentRACKLost) {
+					t.Fatal("unexpected original state after RTO undo")
+				}
+				if !state.fastRecovery || state.prrPriorFlight != 12_000 || state.prrDelivered != 6900 || state.prrOut != 6900 {
+					t.Fatal("undo did not resume the prior PRR episode")
+				}
+			}
+			state.rackReorderingSeen = test.sackOnly
+			state.rebaseOutstanding()
+			var options [18]byte
+			options[0], options[1] = TCPHeaderOptionSACK, 18
+			binary.BigEndian.PutUint32(options[2:6], 100)
+			binary.BigEndian.PutUint32(options[6:10], 1100)
+			binary.BigEndian.PutUint32(options[10:14], 2100)
+			binary.BigEndian.PutUint32(options[14:18], 5100)
+			segment := tcpSegment{sequence: 100, acknowledgement: 100, flags: TCPFlagACK, window: 40_000}
+			segment.setOptions(options[:])
+			state.processAcknowledgment(&segment, now, 99)
+			if !state.outstanding[1].state.has(sentTCPSegmentOriginalLost) || state.outstanding[1].state.has(sentTCPSegmentRACKLost) == test.sackOnly {
+				t.Fatalf("ACK did not infer the expected original loss: state %#x", state.outstanding[1].state)
+			}
+			if state.congestionWindow != 4100 {
+				t.Fatalf("PRR cwnd = %d, want 4100 without the SafeACK bonus", state.congestionWindow)
+			}
+			if state.undo.spuriousUndos != 1 || !state.fastRecovery || state.prrDelivered != 11_000 {
+				t.Fatal("ACK did not retain the resumed recovery's delivery credit")
+			}
+		})
 	}
 }
 
@@ -12747,9 +14648,7 @@ func TestTCPOutOfOrderOverlapPreservesFirstData(t *testing.T) {
 	outOfOrder := []tcpReceivedPiece{{sequence: 104, payload: []byte("old")}}
 	outOfOrderBytes := 3
 	incoming := []byte("abcdef")
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 0, 102, incoming, incoming, false, &outOfOrder, &outOfOrderBytes) {
-		t.Fatal("overlapping segment added no new data")
-	}
+	connection.receiveTCPData(102, incoming, false, 32, 0, &receiveNext, &outOfOrder, &outOfOrderBytes)
 	if len(outOfOrder) != 3 || outOfOrderBytes != 6 {
 		t.Fatalf("out-of-order state = %d pieces, %d bytes; want 3, 6", len(outOfOrder), outOfOrderBytes)
 	}
@@ -12767,9 +14666,8 @@ func TestTCPOutOfOrderAdoptsCompleteOwnedRange(t *testing.T) {
 	payload = payload[:len(payload):len(payload)]
 	var pieces []tcpReceivedPiece
 	bytes := 0
-	if !connection.storeTCPOutOfOrder(100, 32, 0, 104, payload, payload, false, &pieces, &bytes) {
-		t.Fatal("out-of-order payload was not retained")
-	}
+	receiveNext := uint32(100)
+	connection.receiveTCPData(104, payload, false, 32, 0, &receiveNext, &pieces, &bytes)
 	if len(pieces) != 1 || &pieces[0].payload[0] != &payload[0] {
 		t.Fatal("single uncovered range did not transfer its backing")
 	}
@@ -12782,9 +14680,8 @@ func TestTCPOutOfOrderCompactsPartialOwnedRange(t *testing.T) {
 	payload := owner[28:]
 	var pieces []tcpReceivedPiece
 	bytes := 0
-	if !connection.storeTCPOutOfOrder(100, 32, 0, 104, payload, owner, false, &pieces, &bytes) {
-		t.Fatal("partial out-of-order payload was not retained")
-	}
+	receiveNext := uint32(100)
+	connection.receiveTCPOutOfOrder(&receiveNext, 32, 0, 104, payload, owner, false, &pieces, &bytes)
 	if len(pieces) != 1 || string(pieces[0].payload) != "tail" || &pieces[0].payload[0] == &owner[28] || cap(pieces[0].payload) != len(pieces[0].payload) {
 		t.Fatalf("partial payload retained owner backing: pieces=%+v capacity=%d", pieces, cap(pieces[0].payload))
 	}
@@ -12806,6 +14703,27 @@ func TestTCPPromoteCompactsPartiallyDeliveredRange(t *testing.T) {
 	}
 }
 
+func TestTCPPromoteReleasesConsumedRangeReferences(t *testing.T) {
+	connection := &TCPConn{receiveCapacity: 8, readNotify: make(chan struct{})}
+	backing := []tcpReceivedPiece{
+		{sequence: 100, payload: []byte("a")},
+		{sequence: 101, payload: []byte("b")},
+		{sequence: 103, payload: []byte("d"), fin: true},
+	}
+	pieces, retained, next := backing, 3, uint32(100)
+	if delivered, closed := connection.promoteTCPReceived(0, &next, &pieces, &retained); !delivered || closed || next != 102 || len(pieces) != 1 || retained != 1 {
+		t.Fatalf("promotion = delivered %t closed %t next %d pieces %d bytes %d", delivered, closed, next, len(pieces), retained)
+	}
+	for index := 0; index < 2; index++ {
+		if backing[index].payload != nil || backing[index].fin || backing[index].sequence != 0 {
+			t.Fatalf("consumed slot %d still retains a range: %+v", index, backing[index])
+		}
+	}
+	if delivered, closed := connection.receiveTCPData(next, []byte("c"), false, 8, 0, &next, &pieces, &retained); !delivered || !closed || next != 105 || pieces != nil || retained != 0 || string(testTCPReadBufferBytes(&connection.readBuffer)) != "abcd" {
+		t.Fatalf("final promotion = delivered %t closed %t next %d pieces %d bytes %d", delivered, closed, next, len(pieces), retained)
+	}
+}
+
 // TestTCPOutOfOrderUsesPromisedWindow verifies that sparse data near the
 // advertised right edge remains admissible after another range uses memory.
 func TestTCPOutOfOrderUsesPromisedWindow(t *testing.T) {
@@ -12814,15 +14732,397 @@ func TestTCPOutOfOrderUsesPromisedWindow(t *testing.T) {
 	var outOfOrder []tcpReceivedPiece
 	outOfOrderBytes := 0
 	first := []byte("first")
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 0, 120, first, first, false, &outOfOrder, &outOfOrderBytes) {
+	connection.receiveTCPData(120, first, false, 32, 0, &receiveNext, &outOfOrder, &outOfOrderBytes)
+	if outOfOrderBytes != len(first) {
 		t.Fatal("first out-of-order range was rejected")
 	}
 	edge := []byte("edge")
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 0, 128, edge, edge, false, &outOfOrder, &outOfOrderBytes) {
-		t.Fatal("range at the promised right edge was rejected after buffer use")
-	}
+	connection.receiveTCPData(128, edge, false, 32, 0, &receiveNext, &outOfOrder, &outOfOrderBytes)
 	if outOfOrderBytes != 9 {
 		t.Fatalf("out-of-order bytes = %d, want 9", outOfOrderBytes)
+	}
+}
+
+func TestTCPOutOfOrderFullQueueAcceptsGap(t *testing.T) {
+	for _, start := range []uint32{100, 0xfffffff0} {
+		t.Run(fmt.Sprintf("sequence-%x", start), func(t *testing.T) {
+			const capacity = tcpMaximumOutOfOrder
+			connection := &TCPConn{receiveCapacity: capacity, readNotify: make(chan struct{})}
+			next := start
+			var pieces []tcpReceivedPiece
+			retained := 0
+			want := make([]byte, capacity+1)
+			want[0] = 42
+			for index := 0; index < capacity; index++ {
+				want[index+1] = byte(index)
+				connection.receiveTCPData(start+1+uint32(index), want[index+1:index+2:index+2], index == capacity-1, capacity+2, 1, &next, &pieces, &retained)
+			}
+			if len(pieces) != capacity || retained != capacity || next != start || connection.readBuffer.size != 0 {
+				t.Fatalf("full queue = pieces %d bytes %d next %d readable %d", len(pieces), retained, next, connection.readBuffer.size)
+			}
+			if delivered, closed := connection.receiveTCPData(start, want[:1:1], false, capacity+2, 1, &next, &pieces, &retained); !delivered || !closed {
+				t.Fatalf("gap filling = delivered %t closed %t", delivered, closed)
+			}
+			if next != start+capacity+2 || retained != 0 || pieces != nil || connection.outOfOrderUnread.Load() != 0 || !bytes.Equal(testTCPReadBufferBytes(&connection.readBuffer), want) {
+				t.Fatalf("gap result = next %d pieces %d bytes %d readable %d", next, len(pieces), retained, connection.readBuffer.size)
+			}
+		})
+	}
+}
+
+func TestTCPOutOfOrderFullQueuePrunesHighestRanges(t *testing.T) {
+	for _, start := range []uint32{100, 0xfffffff0} {
+		t.Run(fmt.Sprintf("sequence-%x", start), func(t *testing.T) {
+			const capacity = 2*tcpMaximumOutOfOrder + 10
+			connection := &TCPConn{receiveCapacity: capacity, readNotify: make(chan struct{})}
+			next := start
+			pieces := make([]tcpReceivedPiece, tcpMaximumOutOfOrder)
+			for index := range pieces {
+				pieces[index] = tcpReceivedPiece{sequence: next + 4 + uint32(2*index), payload: []byte{byte(index)}}
+			}
+			retained := len(pieces)
+			last := pieces[len(pieces)-1].sequence
+			if delivered, closed := connection.receiveTCPData(next+2, []byte{'y'}, false, capacity, 0, &next, &pieces, &retained); delivered || closed {
+				t.Fatalf("gapped insertion = delivered %t closed %t", delivered, closed)
+			}
+			if len(pieces) != tcpMaximumOutOfOrder || cap(pieces) > tcpMaximumOutOfOrder || retained != tcpMaximumOutOfOrder || connection.outOfOrderUnread.Load() != int64(retained) || pieces[0].sequence != next+2 || pieces[len(pieces)-1].sequence != last-2 {
+				t.Fatalf("pruned queue = len %d cap %d bytes %d first %d last %d", len(pieces), cap(pieces), retained, pieces[0].sequence, pieces[len(pieces)-1].sequence)
+			}
+			var workspace [34]byte
+			for _, block := range parseTCPSACKOptions(tcpSACKOptions(pieces, last, 4, TCPSACKBlock{}, false, &workspace), next, next+capacity) {
+				if tcpSequenceGreater(block.RightEdge, last-1) {
+					t.Fatalf("SACK still reports discarded data: %+v", block)
+				}
+			}
+			for _, incoming := range [][]byte{{'z'}, nil} {
+				if allocations := testing.AllocsPerRun(10, func() {
+					if delivered, closed := connection.receiveTCPData(last+2, incoming, true, capacity, 0, &next, &pieces, &retained); delivered || closed {
+						t.Fatalf("high-sequence insertion = delivered %t closed %t", delivered, closed)
+					}
+				}); allocations != 0 {
+					t.Fatalf("discarding a highest range with %d payload bytes allocated %g objects", len(incoming), allocations)
+				}
+			}
+			if len(pieces) != tcpMaximumOutOfOrder || cap(pieces) > tcpMaximumOutOfOrder || retained != tcpMaximumOutOfOrder || connection.outOfOrderUnread.Load() != int64(retained) || pieces[len(pieces)-1].sequence != last-2 || pieces[len(pieces)-1].fin {
+				t.Fatal("metadata pruning retained the incoming high-sequence range or FIN")
+			}
+			options := tcpSACKOptions(pieces, last+2, 4, TCPSACKBlock{}, false, &workspace)
+			if len(options) != 34 || options[0] != TCPHeaderOptionSACK || options[1] != byte(len(options)) ||
+				binary.BigEndian.Uint32(options[2:6]) != last-2 || binary.BigEndian.Uint32(options[6:10]) != last-1 {
+				t.Fatalf("SACK after discarding the incoming range = %x", options)
+			}
+			for _, block := range parseTCPSACKOptions(options, next, next+capacity) {
+				if tcpSequenceGreater(block.RightEdge, last-1) {
+					t.Fatalf("SACK reports the discarded incoming range: %+v", block)
+				}
+			}
+			payload := bytes.Repeat([]byte{'x'}, 2*tcpMaximumOutOfOrder+4)
+			want := append([]byte(nil), payload...)
+			want[2] = 'y'
+			for index := 0; index < tcpMaximumOutOfOrder-1; index++ {
+				want[4+2*index] = byte(index)
+			}
+			if delivered, closed := connection.receiveTCPData(next, payload, false, capacity, 0, &next, &pieces, &retained); !delivered || closed {
+				t.Fatalf("overlapping gap filling = delivered %t closed %t", delivered, closed)
+			}
+			if next != start+uint32(len(payload)) || pieces != nil || retained != 0 || !bytes.Equal(testTCPReadBufferBytes(&connection.readBuffer), want) {
+				t.Fatalf("overlapping result = next %d pieces %d bytes %d readable %d", next, len(pieces), retained, connection.readBuffer.size)
+			}
+		})
+	}
+}
+
+func TestTCPOutOfOrderFullQueueAcceptsTailFIN(t *testing.T) {
+	for _, start := range []uint32{100, 0xfffffff0} {
+		t.Run(fmt.Sprintf("sequence-%x", start), func(t *testing.T) {
+			const count = tcpMaximumOutOfOrder
+			connection := &TCPConn{receiveCapacity: count + 1, readNotify: make(chan struct{})}
+			pieces := make([]tcpReceivedPiece, count)
+			want := make([]byte, count+1)
+			want[0] = 'g'
+			for index := range pieces {
+				want[index+1] = byte(index)
+				pieces[index] = tcpReceivedPiece{sequence: start + 1 + uint32(index), payload: want[index+1 : index+2 : index+2]}
+			}
+			next, retained := start, count
+			if delivered, closed := connection.receiveTCPData(start+count+1, nil, true, count+2, 0, &next, &pieces, &retained); delivered || closed {
+				t.Fatalf("tail FIN = delivered %t closed %t", delivered, closed)
+			}
+			if next != start || retained != count || len(pieces) != count || !pieces[len(pieces)-1].fin {
+				t.Fatal("full metadata queue failed to attach a FIN to its retained tail")
+			}
+			if delivered, closed := connection.receiveTCPData(start, want[:1:1], false, count+2, 0, &next, &pieces, &retained); !delivered || !closed {
+				t.Fatalf("gap filling = delivered %t closed %t", delivered, closed)
+			}
+			if next != start+count+2 || pieces != nil || retained != 0 || connection.outOfOrderUnread.Load() != 0 || !bytes.Equal(testTCPReadBufferBytes(&connection.readBuffer), want) {
+				t.Fatal("gap filling failed to preserve data and consume the retained FIN")
+			}
+		})
+	}
+}
+
+func TestTCPOutOfOrderFullQueuePromotesContiguousPrefix(t *testing.T) {
+	for _, start := range []uint32{100, 0xfffffff0} {
+		t.Run(fmt.Sprintf("sequence-%x", start), func(t *testing.T) {
+			const count = tcpMaximumOutOfOrder
+			connection := &TCPConn{receiveCapacity: count + 1, readNotify: make(chan struct{})}
+			pieces := make([]tcpReceivedPiece, count)
+			want := make([]byte, count+1)
+			for index := range pieces {
+				want[index] = byte(index)
+				pieces[index] = tcpReceivedPiece{sequence: start + uint32(index), payload: want[index : index+1 : index+1]}
+			}
+			want[count] = 'z'
+			next, retained := start, count
+			if delivered, closed := connection.receiveTCPData(start+count, want[count:], false, count+1, 0, &next, &pieces, &retained); !delivered || closed {
+				t.Fatalf("tail input = delivered %t closed %t", delivered, closed)
+			}
+			if next != start+count+1 || pieces != nil || retained != 0 || connection.outOfOrderUnread.Load() != 0 || !bytes.Equal(testTCPReadBufferBytes(&connection.readBuffer), want) {
+				t.Fatal("tail input failed to promote the retained prefix and new data")
+			}
+		})
+	}
+}
+
+func TestTCPOutOfOrderFullQueuePrunesAfterReadBufferShrink(t *testing.T) {
+	for _, payload := range [][]byte{{'z'}, nil} {
+		t.Run(fmt.Sprintf("payload-%d", len(payload)), func(t *testing.T) {
+			const count = tcpMaximumOutOfOrder
+			connection := &TCPConn{receiveCapacity: count, readNotify: make(chan struct{})}
+			pieces := make([]tcpReceivedPiece, count)
+			next, retained := uint32(100), count
+			for index := range pieces {
+				pieces[index] = tcpReceivedPiece{sequence: next + 1 + uint32(index), payload: []byte{byte(index)}}
+			}
+			if err := connection.SetReadBuffer(count / 2); err != nil {
+				t.Fatal(err)
+			}
+			if delivered, closed := connection.receiveTCPData(next+count+1, payload, true, count+3, 0, &next, &pieces, &retained); delivered || closed {
+				t.Fatalf("tail input = delivered %t closed %t", delivered, closed)
+			}
+			if next != 100 || len(pieces) != count/2 || retained != count/2 || connection.outOfOrderUnread.Load() != count/2 {
+				t.Fatal("tail input bypassed pruning to the smaller byte budget")
+			}
+			for index, piece := range pieces {
+				if piece.sequence != next+1+uint32(index) || len(piece.payload) != 1 || piece.payload[0] != byte(index) || piece.fin {
+					t.Fatal("byte-budget pruning changed the retained prefix")
+				}
+			}
+		})
+	}
+}
+
+// TestTCPOutOfOrderSACKReportsRetainedInput verifies that byte-budget pruning
+// reports only retained data, including when the triggering segment is trimmed
+// or discarded together with its FIN.
+func TestTCPOutOfOrderSACKReportsRetainedInput(t *testing.T) {
+	for _, start := range []uint32{100, 0xfffffff7} {
+		for _, test := range []struct {
+			name string
+			keep int
+		}{
+			{name: "partial", keep: 3},
+			{name: "discarded", keep: 0},
+		} {
+			t.Run(fmt.Sprintf("sequence-%x/%s", start, test.name), func(t *testing.T) {
+				connection := &TCPConn{receiveCapacity: 32, readNotify: make(chan struct{})}
+				next := start
+				var pieces []tcpReceivedPiece
+				retained := 0
+				connection.receiveTCPData(start+4, []byte("ab"), false, 32, 0, &next, &pieces, &retained)
+				if next != start || retained != 2 || len(pieces) != 1 {
+					t.Fatal("initial out-of-order range was not retained")
+				}
+				if err := connection.SetReadBuffer(2 + test.keep); err != nil {
+					t.Fatal(err)
+				}
+				payload := []byte("uvwxyz")
+				if delivered, closed := connection.receiveTCPData(start+8, payload, true, 32, 0, &next, &pieces, &retained); delivered || closed {
+					t.Fatalf("pruned reception = delivered %t closed %t", delivered, closed)
+				}
+				want := []TCPSACKBlock{{LeftEdge: start + 4, RightEdge: start + 6}}
+				if test.keep != 0 {
+					want = []TCPSACKBlock{
+						{LeftEdge: start + 8, RightEdge: start + 8 + uint32(test.keep)},
+						want[0],
+					}
+				}
+				if next != start || connection.readBuffer.size != 0 || retained != 2+test.keep || connection.outOfOrderUnread.Load() != int64(retained) || len(pieces) != len(want) {
+					t.Fatalf("pruned queue = next %d readable %d bytes %d pieces %d", next, connection.readBuffer.size, retained, len(pieces))
+				}
+				if pieces[0].sequence != start+4 || string(pieces[0].payload) != "ab" {
+					t.Fatal("pruning changed the earlier retained range")
+				}
+				if test.keep != 0 && (pieces[1].sequence != start+8 || !bytes.Equal(pieces[1].payload, payload[:test.keep])) {
+					t.Fatal("pruning did not retain the incoming prefix")
+				}
+				for _, piece := range pieces {
+					if piece.fin {
+						t.Fatal("pruning retained the incoming FIN")
+					}
+				}
+				var workspace [34]byte
+				options := tcpSACKOptions(pieces, start+8, 4, TCPSACKBlock{}, false, &workspace)
+				if len(options) != 2+8*len(want) || options[0] != TCPHeaderOptionSACK || options[1] != byte(len(options)) {
+					t.Fatalf("SACK option framing = %x", options)
+				}
+				for index, expected := range want {
+					offset := 2 + 8*index
+					actual := TCPSACKBlock{
+						LeftEdge:  binary.BigEndian.Uint32(options[offset : offset+4]),
+						RightEdge: binary.BigEndian.Uint32(options[offset+4 : offset+8]),
+					}
+					if actual != expected {
+						t.Fatalf("SACK block %d = %+v, want %+v", index, actual, expected)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestTCPOutOfOrderByteLimitPreservesGapAndDefersFIN(t *testing.T) {
+	connection := &TCPConn{receiveCapacity: 5, readNotify: make(chan struct{})}
+	next := uint32(100)
+	owner := []byte("older")
+	pieces := []tcpReceivedPiece{{sequence: 104, payload: owner, fin: true}}
+	retained := len(owner)
+	if delivered, closed := connection.receiveTCPData(100, []byte("ABCDEFGH"), false, 10, 0, &next, &pieces, &retained); !delivered || closed {
+		t.Fatalf("byte-limited gap filling = delivered %t closed %t", delivered, closed)
+	}
+	if got := string(testTCPReadBufferBytes(&connection.readBuffer)); got != "ABCDo" || next != 105 || pieces != nil || retained != 0 {
+		t.Fatalf("byte-limited result = %q next %d pieces %d bytes %d", got, next, len(pieces), retained)
+	}
+	last := connection.readBuffer.chunks[len(connection.readBuffer.chunks)-1]
+	if cap(last) != len(last) || &last[0] == &owner[0] {
+		t.Fatal("trimmed tail retained its original allocation")
+	}
+	connection.readBuffer.reset()
+	if delivered, closed := connection.receiveTCPData(105, []byte("lder"), true, 5, 0, &next, &pieces, &retained); !delivered || !closed || next != 110 || string(testTCPReadBufferBytes(&connection.readBuffer)) != "lder" {
+		t.Fatalf("tail retransmission = delivered %t closed %t next %d", delivered, closed, next)
+	}
+}
+
+func TestTCPOutOfOrderShrinkPreservesGapProgress(t *testing.T) {
+	for _, occupied := range []int{0, 3} {
+		for _, extra := range []uint16{0, 2} {
+			t.Run(fmt.Sprintf("readable-%d/extra-%d", occupied, extra), func(t *testing.T) {
+				connection := &TCPConn{receiveCapacity: 32, readNotify: make(chan struct{})}
+				connection.readBuffer.append(bytes.Repeat([]byte{'x'}, occupied))
+				next := uint32(100)
+				var pieces []tcpReceivedPiece
+				retained := 0
+				connection.receiveTCPData(104, []byte("abcdefghijklmnop"), true, 32, 0, &next, &pieces, &retained)
+				if next != 100 || retained != 16 || len(pieces) != 1 {
+					t.Fatalf("initial queue = next %d bytes %d pieces %d", next, retained, len(pieces))
+				}
+				if err := connection.SetReadBuffer(8); err != nil {
+					t.Fatal(err)
+				}
+				if delivered, closed := connection.receiveTCPData(next, []byte("GAP!"), false, 32, extra, &next, &pieces, &retained); !delivered || closed {
+					t.Fatalf("gap filling after shrink = delivered %t closed %t", delivered, closed)
+				}
+				accepted := 8 + int(extra) - occupied
+				want := strings.Repeat("x", occupied) + "GAP!abcdefghijklmnop"[:accepted]
+				if next != 100+uint32(accepted) || pieces != nil || retained != 0 || connection.outOfOrderUnread.Load() != 0 || string(testTCPReadBufferBytes(&connection.readBuffer)) != want {
+					t.Fatalf("shrunken queue = next %d pieces %d bytes %d readable %q; want %q", next, len(pieces), retained, testTCPReadBufferBytes(&connection.readBuffer), want)
+				}
+			})
+		}
+	}
+}
+
+func TestTCPReceiveProgressAfterReadBufferShrink(t *testing.T) {
+	link, _, connection := newManuallyPumpedTCPConnection(t)
+	if err := connection.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	link.mu.Lock()
+	peer := link.tcp[connection.key.local.Port()]
+	sequence, acknowledgement := peer.serverNext, peer.clientNext
+	link.mu.Unlock()
+	if err := link.deliverTCP(8080, connection.key.local.Port(), sequence+4, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, []byte("abcdefghijklmnop")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.outOfOrderUnread.Load() == 16 })
+	if err := connection.SetReadBuffer(8); err != nil {
+		t.Fatal(err)
+	}
+	if err := link.deliverTCP(8080, connection.key.local.Port(), sequence, acknowledgement, TCPFlagACK, 65535, nil, []byte("GAP!")); err != nil {
+		t.Fatal(err)
+	}
+	var buffer [8]byte
+	if n, err := io.ReadFull(connection, buffer[:]); err != nil || n != len(buffer) || string(buffer[:]) != "GAP!abcd" {
+		t.Fatalf("gap delivery = %d, %v, %q", n, err, buffer)
+	}
+	if connection.outOfOrderUnread.Load() != 0 {
+		t.Fatal("high sequence data survived beyond the shrunken receive budget")
+	}
+	if err := link.deliverTCP(8080, connection.key.local.Port(), sequence+8, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, []byte("efghijklmnop")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.ReadFull(connection, buffer[:]); err != nil || n != len(buffer) || string(buffer[:]) != "efghijkl" {
+		t.Fatalf("partial tail delivery = %d, %v, %q", n, err, buffer)
+	}
+	if err := link.deliverTCP(8080, connection.key.local.Port(), sequence+16, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, []byte("mnop")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.ReadFull(connection, buffer[:4]); err != nil || n != 4 || string(buffer[:4]) != "mnop" {
+		t.Fatalf("final tail delivery = %d, %v, %q", n, err, buffer[:4])
+	}
+	if n, err := connection.Read(buffer[:]); n != 0 || err != io.EOF {
+		t.Fatalf("Read after the complete FIN = %d, %v", n, err)
+	}
+	if info := connection.Info(); info.BytesReceived != 20 || info.State != TCPStateCloseWait {
+		t.Fatalf("completed receive after shrink = %+v", info)
+	}
+}
+
+func TestTCPPromoteAfterReadBufferShrink(t *testing.T) {
+	for _, occupied := range []int{0, 8} {
+		for _, extra := range []uint16{0, 2} {
+			t.Run(fmt.Sprintf("readable-%d/extra-%d", occupied, extra), func(t *testing.T) {
+				connection := &TCPConn{receiveCapacity: 32, readNotify: make(chan struct{})}
+				connection.readBuffer.append(bytes.Repeat([]byte{'x'}, occupied))
+				pieces := []tcpReceivedPiece{
+					{sequence: 100, payload: []byte("abcd")},
+					{sequence: 104, payload: []byte("efgh")},
+					{sequence: 108, payload: []byte("ijkl"), fin: true},
+				}
+				retained, next := 12, uint32(100)
+				if err := connection.SetReadBuffer(8); err != nil {
+					t.Fatal(err)
+				}
+				var received []byte
+				for iteration := 0; iteration < 3; iteration++ {
+					previous := next
+					_, closed := connection.promoteTCPReceived(extra, &next, &pieces, &retained)
+					if connection.readBuffer.size > 8+int(extra) || retained+connection.readBuffer.size > 12+occupied || connection.outOfOrderUnread.Load() != int64(retained) {
+						t.Fatalf("promotion exceeded receive storage: readable %d retained %d", connection.readBuffer.size, retained)
+					}
+					if iteration == 0 && next != 100+uint32(8+int(extra)-occupied) {
+						t.Fatalf("promotion blocked by later ranges: next %d", next)
+					}
+					buffer := make([]byte, connection.readBuffer.size)
+					if len(buffer) != 0 {
+						if n, err := connection.Read(buffer); err != nil || n != len(buffer) {
+							t.Fatalf("Read = %d, %v; want %d, nil", n, err, len(buffer))
+						}
+						received = append(received, buffer...)
+					}
+					if closed {
+						if next != 113 || pieces != nil || retained != 0 || string(received) != strings.Repeat("x", occupied)+"abcdefghijkl" {
+							t.Fatalf("completed promotion = next %d pieces %d bytes %d payload %q", next, len(pieces), retained, received)
+						}
+						return
+					}
+					if next == previous && len(buffer) == 0 {
+						t.Fatal("read-window wake made no receive progress")
+					}
+				}
+				t.Fatal("continuous queued data did not finish after draining the read buffer")
+			})
+		}
 	}
 }
 
@@ -13328,7 +15628,7 @@ func BenchmarkTCPAcknowledgmentCycle(b *testing.B) {
 							if oldACK {
 								segment.acknowledgement--
 								state.sackedRanges, state.sackedBytes = 0, 0
-								outstanding[1].delivery, _ = state.controller.onDataSend(mss, mss, sentAt, stamp, mss, state.congestionWindow, 0, state.rtt.srtt, state.slowStartThreshold)
+								outstanding[1].delivery, _ = state.controller.onDataSend(mss, mss, sentAt, stamp, mss, state.congestionWindow, 0, 0, state.rtt.srtt, state.slowStartThreshold)
 								outstanding[1].congestionPacketState = state.controller.transmissionState()
 							} else if !remainingFlight {
 								outstanding[1].state.set(sentTCPSegmentSACKed, true)
@@ -13336,15 +15636,16 @@ func BenchmarkTCPAcknowledgmentCycle(b *testing.B) {
 							}
 						}
 						if advancing {
-							outstanding[0].delivery, _ = state.controller.onDataSend(mss, mss, sentAt, stamp, 0, state.congestionWindow, 0, state.rtt.srtt, state.slowStartThreshold)
+							outstanding[0].delivery, _ = state.controller.onDataSend(mss, mss, sentAt, stamp, 0, state.congestionWindow, 0, 0, state.rtt.srtt, state.slowStartThreshold)
 							outstanding[0].congestionPacketState = state.controller.transmissionState()
 							segment.acknowledgement = outstanding[0].end
 							if remainingFlight {
-								outstanding[1].delivery, _ = state.controller.onDataSend(mss, mss, sentAt, stamp, mss, state.congestionWindow, mss, state.rtt.srtt, state.slowStartThreshold)
+								outstanding[1].delivery, _ = state.controller.onDataSend(mss, mss, sentAt, stamp, mss, state.congestionWindow, mss, mss, state.rtt.srtt, state.slowStartThreshold)
 								outstanding[1].congestionPacketState = state.controller.transmissionState()
 							}
 						}
 						receivedAt := sentAt.Add(time.Millisecond)
+						segment.receivedAt = monotonicStampAt(start, receivedAt)
 						update := state.processAcknowledgment(&segment, receivedAt, 0)
 						state.updateRetransmissionTimer(update, receivedAt)
 					}
@@ -13353,6 +15654,399 @@ func BenchmarkTCPAcknowledgmentCycle(b *testing.B) {
 						b.Fatal("advancing ACK did not retain the remaining flight's loss timer")
 					}
 				})
+			}
+		})
+	}
+}
+
+// BenchmarkTCPReceiveData measures sequential reception and delivery through an
+// existing out-of-order queue. Packet payloads are immutable owned allocations;
+// packet parsing and application copies are outside this receive-path benchmark.
+func BenchmarkTCPReceiveData(b *testing.B) {
+	for _, size := range []int{1200, 8948} {
+		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
+			for _, count := range []int{0, 32} {
+				b.Run(fmt.Sprintf("queued-%d", count), func(b *testing.B) {
+					payload := make([]byte, size)
+					capacity := (count + 1) * size
+					connection := &TCPConn{receiveCapacity: capacity, readNotify: make(chan struct{})}
+					workspace := make([]tcpReceivedPiece, count, count+1)
+					next := uint32(100)
+					b.ReportAllocs()
+					b.SetBytes(int64(capacity))
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						connection.readBuffer.reset()
+						pieces := workspace[:count]
+						for index := range pieces {
+							pieces[index] = tcpReceivedPiece{sequence: next + uint32((index+1)*size), payload: payload}
+						}
+						retained := count * size
+						progress, closed := connection.receiveTCPData(next, payload, false, uint32(capacity), 0, &next, &pieces, &retained)
+						if !progress || closed || retained != 0 || connection.readBuffer.size != capacity {
+							b.Fatal("receive did not deliver the complete contiguous range")
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// BenchmarkTCPOutOfOrderPressure fills every OFO metadata slot before a segment
+// completes one gap, all interleaved gaps, or is discarded above the full queue.
+// It includes temporary workspaces and read-queue growth, but excludes parsing
+// and application copies.
+func BenchmarkTCPOutOfOrderPressure(b *testing.B) {
+	for _, stride := range []int{1, 2} {
+		b.Run(fmt.Sprintf("stride-%d", stride), func(b *testing.B) {
+			const count = tcpMaximumOutOfOrder
+			size := stride * (count + 1)
+			connection := &TCPConn{receiveCapacity: size, readNotify: make(chan struct{})}
+			payload := bytes.Repeat([]byte{'x'}, size)
+			workspace := make([]tcpReceivedPiece, count)
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				connection.readBuffer.reset()
+				next := uint32(100)
+				pieces := workspace[:]
+				for index := range pieces {
+					pieces[index] = tcpReceivedPiece{sequence: next + uint32(stride*(index+1)), payload: payload[:1:1]}
+				}
+				retained := count
+				incoming := payload[:1:1]
+				if stride == 2 {
+					incoming = payload
+				}
+				progress, closed := connection.receiveTCPData(next, incoming, false, uint32(size), 0, &next, &pieces, &retained)
+				if !progress || closed || pieces != nil || retained != 0 || connection.outOfOrderUnread.Load() != 0 || next != 100+uint32(size) || connection.readBuffer.size != size {
+					b.Fatal("full OFO queue did not deliver its complete gap-filling input")
+				}
+			}
+		})
+	}
+	for _, test := range []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "highest-discard", payload: []byte{'x'}},
+		{name: "highest-FIN-discard"},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			const count = tcpMaximumOutOfOrder
+			const capacity = 2*(count+1) + 2
+			connection := &TCPConn{receiveCapacity: capacity, readNotify: make(chan struct{})}
+			next, retained := uint32(100), count
+			pieces := make([]tcpReceivedPiece, count)
+			for index := range pieces {
+				pieces[index] = tcpReceivedPiece{sequence: next + uint32(2*(index+1)), payload: []byte{byte(index)}}
+			}
+			connection.outOfOrderUnread.Store(count)
+			sequence := next + 2*(count+1)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if delivered, closed := connection.receiveTCPData(sequence, test.payload, true, capacity, 0, &next, &pieces, &retained); delivered || closed {
+					b.Fatal("discarded input advanced receive state")
+				}
+			}
+			b.StopTimer()
+			if next != 100 || len(pieces) != count || retained != count || connection.outOfOrderUnread.Load() != count || connection.readBuffer.size != 0 {
+				b.Fatal("discarded input changed the retained queue")
+			}
+			for index, piece := range pieces {
+				if piece.sequence != next+uint32(2*(index+1)) || piece.fin || len(piece.payload) != 1 || piece.payload[0] != byte(index) {
+					b.Fatal("discarded input changed a retained range")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkTCPSACKRecoveryAccounting measures per-generation loss and Pipe
+// accounting across a retransmission, independently of packet serialization.
+func BenchmarkTCPSACKRecoveryAccounting(b *testing.B) {
+	const mss = 1200
+	for _, count := range []int{2, 32, 512} {
+		b.Run(fmt.Sprintf("ranges-%d", count), func(b *testing.B) {
+			outstanding := make([]sentTCPSegment, count)
+			for index := range outstanding {
+				outstanding[index] = sentTCPSegment{sequence: uint32(index * mss), end: uint32((index + 1) * mss), state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed}
+			}
+			var flight uint32
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				outstanding[0].state = sentTCPSegmentTransmitted | sentTCPSegmentRACKLost
+				flight = recordTestTCPLosses(outstanding, mss)
+				outstanding[0].advanceTransmissionGeneration()
+				outstanding[0].state.set(sentTCPSegmentSACKRetried, true)
+				outstanding[0].state.set(sentTCPSegmentRACKLost, false)
+				flight += sackRecoveryPipe(outstanding, mss)
+			}
+			runtime.KeepAlive(flight)
+		})
+	}
+}
+
+// tcpRecoveryACKFixture retains independent transport and controller templates
+// for one ACK that delivers an old loss while proving new losses.
+type tcpRecoveryACKFixture struct {
+	initial      tcpEstablishedState
+	state        tcpEstablishedState
+	original     []sentTCPSegment
+	segment      tcpSegment
+	ackTime      time.Time
+	restoreModel func()
+}
+
+func newTCPRecoveryACKFixture(tb testing.TB, algorithm string, count int) *tcpRecoveryACKFixture {
+	tb.Helper()
+	const mss = 1000
+	now := time.Unix(100, 0)
+	epoch := now.Add(-time.Second)
+	end := uint32(100 + (count-1)*mss)
+	window := uint32(count * mss)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{
+		writeBuffer: socketOptionOverride[int]{value: int(window), set: true},
+	})
+	connection.stack = &Stack{timestampEpoch: epoch}
+	fixture := &tcpRecoveryACKFixture{
+		initial: tcpEstablishedState{
+			connection: connection, controller: newTCPCongestionController(algorithm),
+			peerMSS: mss, peerSACK: true, peerWindow: 65_535,
+			sendNext: end, recoveryPoint: end, fastRecovery: true,
+			congestionWindow: window, slowStartThreshold: window, prrPriorFlight: window,
+			rtt: newRTTEstimator(time.Second), outstanding: make([]sentTCPSegment, count),
+		},
+		original: make([]sentTCPSegment, count),
+		segment:  tcpSegment{acknowledgement: 100, flags: TCPFlagACK, window: 65_535},
+		ackTime:  now,
+	}
+	state := &fixture.initial
+	state.rebaseOutstanding()
+	state.controller.initialize(CongestionPhaseRecovery, epoch, time.Millisecond, time.Millisecond, window, window, mss, 1)
+	if state.controller.usesDeliveryRate() {
+		state.deliverySample = new(tcpDeliveryRateSample)
+	}
+	// Built-in models contain only value state. Capture each concrete value
+	// once so restoring it needs neither reflection nor allocation in the loop.
+	switch model := state.controller.algorithm.(type) {
+	case *renoCongestionControl:
+		initial := *model
+		fixture.restoreModel = func() { *model = initial }
+	case *cubicCongestionControl:
+		initial := *model
+		fixture.restoreModel = func() { *model = initial }
+	case *bbrCongestionControl:
+		initial := *model
+		fixture.restoreModel = func() { *model = initial }
+	case *bbr3CongestionControl:
+		initial := *model
+		fixture.restoreModel = func() { *model = initial }
+	default:
+		tb.Fatalf("unsupported recovery ACK controller %T", model)
+	}
+	for index := range fixture.original {
+		start := uint32(100 + (index-1)*mss)
+		if index == 0 {
+			start = 0
+		}
+		fixture.original[index] = sentTCPSegment{
+			sequence: start, end: uint32(100 + index*mss), state: sentTCPSegmentTransmitted,
+			hostQueue: testPacketQueueTicketAt(epoch, now.Add(-500*time.Millisecond)),
+			delivery:  tcpDeliverySnapshot{deliveredStamp: 1},
+		}
+	}
+	fixture.original[1].state |= sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost | sentTCPSegmentLossReported | sentTCPSegmentTransmissionLost
+	var options [18]byte
+	options[0], options[1] = TCPHeaderOptionSACK, 18
+	binary.BigEndian.PutUint32(options[2:6], 100)
+	binary.BigEndian.PutUint32(options[6:10], 1100)
+	binary.BigEndian.PutUint32(options[10:14], end-3*mss)
+	binary.BigEndian.PutUint32(options[14:18], end)
+	fixture.segment.setOptions(options[:])
+	return fixture
+}
+
+// reset restores all ACK inputs, including the delivery clock and model.
+// The socket's fixed send capacity keeps auto-tuning out of this fixture.
+func (f *tcpRecoveryACKFixture) reset() {
+	f.state = f.initial
+	f.restoreModel()
+	copy(f.state.outstanding, f.original)
+	if f.state.deliverySample != nil {
+		*f.state.deliverySample = tcpDeliveryRateSample{}
+	}
+}
+
+func TestTCPRecoveryAcknowledgmentFixture(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, count := range []int{6, 64, 512} {
+			t.Run(fmt.Sprintf("%s/ranges-%d", algorithm, count), func(t *testing.T) {
+				fixture := newTCPRecoveryACKFixture(t, algorithm, count)
+				var want tcpEstablishedState
+				for iteration := 0; iteration < 3; iteration++ {
+					fixture.reset()
+					fixture.state.processAcknowledgment(&fixture.segment, fixture.ackTime, 0)
+					state := fixture.state
+					if state.sendUnacknowledged != 100 || state.sackedRanges != 4 || state.sackedBytes != 4000 || !state.fastRecovery || state.prrDelivered != 4100 {
+						t.Fatalf("iteration %d did not deliver the expected ACK/SACK ranges", iteration)
+					}
+					if sample := state.deliverySample; sample != nil {
+						if !sample.valid || sample.acked != 4100 || sample.delivered != 4100 || state.controller.state.DeliveredBytes != 4100 {
+							t.Fatalf("iteration %d rate sample = %+v, delivered total %d", iteration, sample, state.controller.state.DeliveredBytes)
+						}
+						copy := *sample
+						state.deliverySample = &copy
+					}
+					// Detach mutable storage before comparing later iterations, so a
+					// reset cannot also rewrite the previously captured expectation.
+					state.outstanding = append([]sentTCPSegment(nil), state.outstanding...)
+					state.outstandingBase = append([]sentTCPSegment(nil), state.outstandingBase...)
+					model := reflect.ValueOf(state.controller.algorithm).Elem()
+					copy := reflect.New(model.Type())
+					copy.Elem().Set(model)
+					state.controller.algorithm = copy.Interface().(CongestionController)
+					if iteration == 0 {
+						want = state
+					} else if !reflect.DeepEqual(state, want) {
+						t.Fatalf("iteration %d changed the recovery ACK result", iteration)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkTCPRecoveryAcknowledgment measures ACK-driven SACK/RACK loss
+// reporting and PRR from identical transport and controller state each time.
+// One advancing ACK delivers an old lost range and the last three ranges
+// while proving new losses. Timing includes restoring preallocated state.
+func BenchmarkTCPRecoveryAcknowledgment(b *testing.B) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		b.Run(algorithm, func(b *testing.B) {
+			for _, count := range []int{6, 64, 512} {
+				b.Run(fmt.Sprintf("ranges-%d", count), func(b *testing.B) {
+					fixture := newTCPRecoveryACKFixture(b, algorithm, count)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for iteration := 0; iteration < b.N; iteration++ {
+						fixture.reset()
+						fixture.state.processAcknowledgment(&fixture.segment, fixture.ackTime, 0)
+					}
+				})
+			}
+		})
+	}
+}
+
+// BenchmarkTCPRTOAccounting measures copy-level flight, repeated loss evidence,
+// and timeout marking across scoreboard sizes. Timeout cases distinguish entry
+// into recovery from a retry, with all storage preallocated, using both wall-only
+// timestamps and the monotonic clock retained by a live stack.
+func BenchmarkTCPRTOAccounting(b *testing.B) {
+	const mss = 1000
+	for _, count := range []int{16, 128, 1024, 8192} {
+		b.Run(fmt.Sprintf("ranges-%d", count), func(b *testing.B) {
+			b.Run("known-loss", func(b *testing.B) {
+				outstanding := make([]sentTCPSegment, count)
+				for index := range outstanding {
+					outstanding[index] = sentTCPSegment{
+						sequence: uint32(index * mss), end: uint32((index + 1) * mss),
+						state: sentTCPSegmentTransmitted | sentTCPSegmentRACKLost | sentTCPSegmentOriginalLost | sentTCPSegmentTransmissionLost,
+					}
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				var newlyLost, replacementLost bool
+				for iteration := 0; iteration < b.N; iteration++ {
+					newlyLost, replacementLost = markProvenTCPLosses(outstanding, mss, false)
+				}
+				b.StopTimer()
+				if newlyLost || replacementLost {
+					b.Fatal("known losses became new evidence")
+				}
+			})
+			for _, pattern := range []struct {
+				name          string
+				flags         sentTCPSegmentState
+				alternateLoss bool
+			}{
+				{name: "flight", flags: sentTCPSegmentOriginalLost | sentTCPSegmentRetransmitted, alternateLoss: true},
+				{name: "flight-live"},
+				{name: "flight-lost", flags: sentTCPSegmentOriginalLost | sentTCPSegmentTransmissionLost},
+				{name: "flight-sacked", flags: sentTCPSegmentSACKed},
+				{name: "flight-speculative", flags: sentTCPSegmentRetransmitted},
+			} {
+				b.Run(pattern.name, func(b *testing.B) {
+					state := tcpEstablishedState{outstanding: make([]sentTCPSegment, count)}
+					for index := range state.outstanding {
+						segment := &state.outstanding[index]
+						segment.sequence, segment.end = uint32(index*mss), uint32((index+1)*mss)
+						segment.state = sentTCPSegmentTransmitted | pattern.flags
+						if pattern.alternateLoss && index%2 == 0 {
+							segment.state |= sentTCPSegmentTransmissionLost
+						}
+					}
+					var flight uint32
+					b.ReportAllocs()
+					b.ResetTimer()
+					for iteration := 0; iteration < b.N; iteration++ {
+						flight = state.rtoTransmissionFlight()
+					}
+					runtime.KeepAlive(flight)
+				})
+			}
+			for _, clock := range []struct {
+				suffix string
+				now    time.Time
+			}{{now: time.Unix(100, 0)}, {suffix: "-monotonic", now: time.Now()}} {
+				for _, repeated := range []bool{false, true} {
+					name := "timeout-first"
+					if repeated {
+						name = "timeout-repeated"
+					}
+					b.Run(name+clock.suffix, func(b *testing.B) {
+						now := clock.now
+						state := tcpEstablishedState{
+							connection: &TCPConn{stack: &Stack{timestampEpoch: now.Add(-time.Second)}},
+							controller: newTCPCongestionController(CongestionControlBBR3),
+							peerMSS:    mss, peerSACK: true, rtt: newRTTEstimator(time.Second),
+							sendNext: uint32(count * mss), congestionWindow: 10 * mss, slowStartThreshold: 20 * mss,
+							outstanding: make([]sentTCPSegment, count),
+							undo:        new(tcpRecoveryUndo),
+						}
+						for index := range state.outstanding {
+							state.outstanding[index] = sentTCPSegment{sequence: uint32(index * mss), end: uint32((index + 1) * mss), state: sentTCPSegmentTransmitted, hostQueue: packetQueueTicket{queuedAt: 1}}
+						}
+						state.controller.initialize(CongestionPhaseOpen, now, time.Millisecond, time.Millisecond, state.congestionWindow, state.slowStartThreshold, mss, 1)
+						if repeated {
+							state.prepareRetransmission(0, true, false, true, false, 0, now)
+							state.outstanding[0].advanceTransmissionGeneration()
+						}
+						initial := state
+						model := state.controller.algorithm.(*bbr3CongestionControl)
+						initialModel := *model
+						initialSegments := append([]sentTCPSegment(nil), state.outstanding...)
+						// Reset transport and controller state together so every iteration
+						// measures the same episode, including its checkpoint when first.
+						b.ReportAllocs()
+						b.ResetTimer()
+						for iteration := 0; iteration < b.N; iteration++ {
+							state = initial
+							*model = initialModel
+							copy(state.outstanding, initialSegments)
+							state.prepareRetransmission(0, true, false, true, false, 0, now)
+						}
+						b.StopTimer()
+						if !state.rtoRecovery || !state.undo.active {
+							b.Fatal("timeout did not enter recoverable RTO state")
+						}
+					})
+				}
 			}
 		})
 	}
@@ -15852,7 +18546,7 @@ func FuzzTCPSACKScoreboard(f *testing.F) {
 			var highest uint32
 			var present, fresh bool
 			var newlySACKed []sentTCPSegment
-			outstanding, highest, present, fresh, _, newlySACKed = applyTCPSACK(outstanding, []TCPSACKBlock{block}, epoch)
+			outstanding, highest, present, fresh, newlySACKed = applyTCPSACK(outstanding, []TCPSACKBlock{block})
 			if !present || highest != block.RightEdge {
 				t.Fatalf("SACK apply metadata = present %t highest %#x, want true/%#x", present, highest, block.RightEdge)
 			}
@@ -15907,7 +18601,7 @@ func FuzzTCPOutOfOrderRanges(f *testing.F) {
 				previousEnd = end
 				bytes += len(piece.payload)
 			}
-			if finCount > 1 || len(pieces) > tcpMaximumOutOfOrder || bytes != outOfOrderBytes || bytes > capacity {
+			if finCount > 1 || cap(pieces) > tcpMaximumOutOfOrder || bytes != outOfOrderBytes || bytes+connection.readBuffer.size > capacity {
 				t.Fatalf("receive scoreboard = %d FINs, %d pieces, %d/%d bytes", finCount, len(pieces), bytes, outOfOrderBytes)
 			}
 			if got := connection.outOfOrderUnread.Load(); got != int64(outOfOrderBytes) {
@@ -15921,11 +18615,11 @@ func FuzzTCPOutOfOrderRanges(f *testing.F) {
 			for index := range payload {
 				payload[index] = events[offset+3] + byte(index)
 			}
-			connection.storeTCPOutOfOrder(
-				receiveNext, uint32(capacity), 0, receiveNext+distance, payload, payload,
-				events[offset+4]&1 != 0, &pieces, &outOfOrderBytes,
-			)
+			_, closed := connection.receiveTCPData(receiveNext+distance, payload, events[offset+4]&1 != 0, uint32(capacity), 0, &receiveNext, &pieces, &outOfOrderBytes)
 			check()
+			if closed {
+				break
+			}
 		}
 		normalized := normalizeTCPReceivedPieces(receiveNext, append([]tcpReceivedPiece(nil), pieces...))
 		if len(normalized) != len(pieces) {

@@ -29,7 +29,7 @@ func TestBBRCongestionControl(t *testing.T) {
 	if bbrState(t, &controller).bandwidth != 20000 {
 		t.Fatalf("BBR initial bandwidth = %v, want 20000", bbrState(t, &controller).bandwidth)
 	}
-	_, _ = controller.onDataSend(mss, mss, start, 1, 0, window, 0, 0, 0)
+	_, _ = controller.onDataSend(mss, mss, start, 1, 0, window, 0, 0, 0, 0)
 	if delay := controller.pacingDelay(start, mss, window, 0, mss, 100*time.Millisecond, ^uint32(0)); delay >= 100*time.Millisecond {
 		t.Fatalf("BBR startup pacing delay = %v, want less than 100ms", delay)
 	}
@@ -335,7 +335,7 @@ func TestBBRInitialPacingQuantumAllowsTenSegments(t *testing.T) {
 			t.Fatalf("initial segment %d pacing delay = %v", segment+1, delay)
 		}
 		flight := uint32(segment * mss)
-		_, _ = controller.onDataSend(mss, mss, start, monotonicStamp(segment+1), flight, 10*mss, flight, 0, 0)
+		_, _ = controller.onDataSend(mss, mss, start, monotonicStamp(segment+1), flight, 10*mss, flight, flight, 0, 0)
 	}
 	if delay := controller.pacingDelay(start, mss, 10*mss, 10*mss, mss, 100*time.Millisecond, ^uint32(0)); delay <= 0 {
 		t.Fatalf("post-initial-quantum pacing delay = %v", delay)
@@ -358,7 +358,7 @@ func TestBBRPacedBatchBoundsFutureCredit(t *testing.T) {
 			t.Fatalf("paced byte %d delayed by %v before credit exhaustion", sent, delay)
 		}
 		flight := uint32(sent + mss)
-		_, _ = controller.onDataSend(mss, mss, start, monotonicStamp(sent+1), flight, 100*mss, flight, 0, 0)
+		_, _ = controller.onDataSend(mss, mss, start, monotonicStamp(sent+1), flight, 100*mss, flight, flight, 0, 0)
 	}
 	if delay := controller.pacingDelay(start, mss, 100*mss, uint32(2*budget), mss, time.Millisecond, 100*mss); delay <= 0 {
 		t.Fatalf("sender released more than one future %d-byte pacing group", budget)
@@ -708,7 +708,7 @@ func TestBBRIdleRestartResetsSamplingInterval(t *testing.T) {
 	controller.delivery.deliveredStamp = 10
 	bbrState(t, &controller).nextSend = time.Unix(200, 0)
 	stamp := monotonicStamp(20*time.Microsecond) + 1
-	snapshot, _ := controller.onDataSend(1000, 1000, now, stamp, 0, 10_000, 0, 0, 0)
+	snapshot, _ := controller.onDataSend(1000, 1000, now, stamp, 0, 10_000, 0, 0, 0, 0)
 	if snapshot.firstSent != tcpDeliveryTimestampAt(stamp) || snapshot.deliveredStamp != tcpDeliveryTimestampAt(stamp) || bbrState(t, &controller).nextSend.Before(now) || !bbrState(t, &controller).idleRestart {
 		t.Fatalf("BBR idle restart state = first %d delivered %d next %v", snapshot.firstSent, snapshot.deliveredStamp, bbrState(t, &controller).nextSend)
 	}
@@ -728,7 +728,7 @@ func TestBBRIdleRestartUsesNeutralPacingAndSkipsProbeRTT(t *testing.T) {
 	bbrState(t, &controller).pacingRate = 100000
 	bbrState(t, &controller).minimumRTT = 10 * time.Millisecond
 	bbrState(t, &controller).minimumRTTStamp = start.Add(-bbrMinRTTWindow)
-	_, _ = controller.onDataSend(mss, mss, start, 1, 0, 10*mss, 0, 0, 0)
+	_, _ = controller.onDataSend(mss, mss, start, 1, 0, 10*mss, 0, 0, 0, 0)
 	if gain := bbrState(t, &controller).pacingGain(); gain != bbrProbeBandwidthGains[0] {
 		t.Fatalf("BBR idle restart saved pacing gain = %v, want %v", gain, bbrProbeBandwidthGains[0])
 	}

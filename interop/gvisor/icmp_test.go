@@ -158,6 +158,97 @@ func TestICMPErrorRXChecksumOffloadInterop(t *testing.T) {
 	}
 }
 
+// TestICMPv6ErrorAdmissionInterop sends an actual UDP datagram to gVisor, then
+// quotes it through a native gVisor raw endpoint. The receiving socket observes
+// the error and remains usable for subsequent gVisor UDP traffic.
+func TestICMPv6ErrorAdmissionInterop(t *testing.T) {
+	family := interopFamilies[1]
+	for _, input := range []struct{ messageType, code byte }{{2, 0}, {2, 1}, {2, 255}, {100, 0}, {100, 255}} {
+		t.Run(fmt.Sprintf("type-%d/code-%d", input.messageType, input.code), func(t *testing.T) {
+			captured := make(chan []byte, 1)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				mipstackToGVisor: func(packet []byte) bool {
+					if len(packet) >= header.IPv6MinimumSize && packet[6] == byte(header.UDPProtocolNumber) {
+						select {
+						case captured <- append([]byte(nil), packet...):
+						default:
+						}
+					}
+					return true
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			opened, peer := openUDPPair(t, ctx, network, family, true)
+			defer opened.Close()
+			defer peer.Close()
+			connection := opened.(*mipstack.UDPConn)
+			if err := connection.SetReceiveErrors(true); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			_ = connection.SetDeadline(deadline)
+			_ = peer.SetDeadline(deadline)
+			request := []byte("ICMPv6 error quote")
+			if n, err := connection.Write(request); err != nil || n != len(request) {
+				t.Fatalf("UDP request = %d, %v", n, err)
+			}
+			buffer := make([]byte, 1500)
+			if n, _, err := peer.ReadFrom(buffer); err != nil || !bytes.Equal(buffer[:n], request) {
+				t.Fatalf("gVisor UDP receive = %d, %v", n, err)
+			}
+			quote := <-captured
+			var queue waiter.Queue
+			endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatal(tcpipErr.String())
+			}
+			defer endpoint.Close()
+			if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+				t.Fatal(tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+				t.Fatal(tcpipErr.String())
+			}
+			message := make([]byte, 8+len(quote))
+			copy(message[8:], quote)
+			h := header.ICMPv6(message[:8])
+			h.SetType(header.ICMPv6Type(input.messageType))
+			h.SetCode(header.ICMPv6Code(input.code))
+			binary.BigEndian.PutUint32(message[4:8], 1280)
+			h.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+				Header: h, Src: gvisorAddress(family.gvisorAddress), Dst: gvisorAddress(family.mipstackAddress),
+				PayloadCsum: checksum.Checksum(message[8:], 0), PayloadLen: len(quote),
+			}))
+			if n, writeErr := endpoint.Write(bytes.NewReader(message), tcpip.WriteOptions{}); writeErr != nil || n != int64(len(message)) {
+				t.Fatalf("gVisor ICMPv6 write = %d, %s", n, tcpipErrorString(writeErr))
+			}
+			var networkError mipstack.ICMPError
+			if n, err := connection.Read(buffer); n != 0 || !errors.As(err, &networkError) || networkError.Type != input.messageType || networkError.Code != input.code {
+				t.Fatalf("pending error = %d, %v; ICMP %+v", n, err, networkError)
+			}
+			reported, err := connection.ReadError()
+			if err != nil || !errors.As(reported, &networkError) || !bytes.Equal(networkError.QuotedPacket, quote) {
+				t.Fatalf("extended error = %v, %v", reported, err)
+			}
+			wantMTU := 1500
+			if input.messageType == byte(header.ICMPv6PacketTooBig) {
+				wantMTU = 1280
+			}
+			if mtu, err := network.mipstack.PathMTU(family.gvisorAddress); err != nil || mtu != wantMTU {
+				t.Fatalf("PathMTU = %d, %v, want %d", mtu, err, wantMTU)
+			}
+			if n, err := peer.WriteTo(request, connection.LocalAddr()); err != nil || n != len(request) {
+				t.Fatalf("gVisor UDP reply = %d, %v", n, err)
+			}
+			if n, err := connection.Read(buffer); err != nil || !bytes.Equal(buffer[:n], request) {
+				t.Fatalf("UDP receive after error = %d, %v", n, err)
+			}
+		})
+	}
+}
+
 // TestReassemblyTimeoutSocketPolicyInterop sends first-fragment quotations
 // through gVisor's native raw endpoint. UDP replies provide a delivery barrier
 // before testing mipstack's IPv4 exception and unchanged IPv6 error reporting.

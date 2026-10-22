@@ -176,6 +176,7 @@ type testPacketLink struct {
 	sendTCPECE            bool
 	partialTCPACK         int
 	delayTCPACK           time.Duration
+	delayTCPResponse      time.Duration
 
 	mu                     sync.Mutex
 	tcp                    map[uint16]*testTCPPeer
@@ -1043,7 +1044,11 @@ func (l *testPacketLink) deliverTCP(sourcePort, targetPort uint16, sequence, ack
 	if l.sendTCPECE && flags&TCPFlagACK != 0 {
 		flags |= TCPFlagECE
 	}
+	delay := l.delayTCPResponse
 	l.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	packet := buildTestTCP(l.remote, l.local, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload)
 	if markCE {
 		setPacketECN(packet, 3)
