@@ -1302,6 +1302,17 @@ func (w *tcpReceiveWindow) size(receiveNext uint32) uint32 {
 
 // tcpReceiveWindowIncrease is the RFC 1122 receiver SWS threshold:
 // min(one half of the receive buffer, one expected segment).
+// tcpWindowReopenImmediate reports whether a window update after the
+// application read must be sent now rather than with the delayed ACK. Linux
+// tcp_cleanup_rbuf sends it at once when the new window is at least twice the
+// one last advertised (RFC 1122 4.2.3.3: a window that opened significantly is
+// announced promptly). Waiting only for a fully zero window let a window
+// shrunk to one scaled unit sit for the delayed-ACK timeout: with 64 KiB
+// segments the sender stalled 25 ms per receive buffer.
+func tcpWindowReopenImmediate(window, lastAdvertised uint16) bool {
+	return uint32(window) >= 2*uint32(lastAdvertised)
+}
+
 func tcpReceiveWindowIncrease(capacity, mss int) int {
 	if capacity < 1 {
 		return 0
@@ -9471,7 +9482,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				available, capacity := c.receiveSpace(state.outOfOrderBytes)
 				window, _, _ := state.receiveWindowState.next(state.receiveNext, available, tcpReceiveWindowIncrease(capacity, state.receiveMSS))
 				if window > state.lastAdvertisedWindow {
-					ackNow = state.scheduleACK(state.lastAdvertisedWindow == 0, false, now) || ackNow
+					ackNow = state.scheduleACK(tcpWindowReopenImmediate(window, state.lastAdvertisedWindow), false, now) || ackNow
 				}
 			}
 			if ackNow {
