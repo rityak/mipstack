@@ -3869,6 +3869,28 @@ func TestTCPWindowUpdateOrdering(t *testing.T) {
 	}
 }
 
+// TestTCPWindowReopenImmediate verifies Linux's prompt window update: twice the
+// last advertisement or more goes now, a smaller growth waits for the delayed ACK.
+func TestTCPWindowReopenImmediate(t *testing.T) {
+	tests := []struct {
+		window, last uint16
+		want         bool
+	}{
+		{window: 1, last: 0, want: true},
+		{window: 2048, last: 1, want: true}, // one scaled unit left: the 64 KiB-segment stall
+		{window: 2048, last: 1024, want: true},
+		{window: 2047, last: 1024},
+		{window: 32750, last: 32733},
+		{window: 65535, last: 40000},
+		{window: 65535, last: 32767, want: true},
+	}
+	for _, test := range tests {
+		if got := tcpWindowReopenImmediate(test.window, test.last); got != test.want {
+			t.Errorf("tcpWindowReopenImmediate(%d, %d) = %v, want %v", test.window, test.last, got, test.want)
+		}
+	}
+}
+
 func TestTCPDuplicateACKEvidence(t *testing.T) {
 	pure := tcpSegment{acknowledgement: 100, flags: TCPFlagACK, window: 200}
 	tests := []struct {
